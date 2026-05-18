@@ -66,6 +66,20 @@ Automatically extract keyframes, detect scene cuts, analyze camera motion, and g
 <tr>
 <td width="50%">
 
+### 🕺 姿态提取 / Pose Extraction
+基于 MediaPipe 的视频姿态提取，内置时序平滑和帧间插值
+
+</td>
+<td width="50%">
+
+### 🎭 模仿提示词 / Mimic Prompt
+根据运镜分析自动生成优化的视频生成提示词
+
+</td>
+</tr>
+<tr>
+<td width="50%">
+
 ### 📤 视频上传 / Video Upload
 前端一键上传视频到 ComfyUI input 目录
 
@@ -226,6 +240,70 @@ All nodes are under the **`Yunjii/Video`** category.
 |------|------|------|
 | 关键帧 | IMAGE | 透传关键帧图像，可连接到 PreviewImage 等节点 |
 | 帧信息 | STRING | 透传帧信息文本 |
+
+---
+
+### 4️⃣ 姿态提取 🕺 (Yunjii) — `VideoPoseExtractor`
+
+> 从参考视频中逐帧提取人体姿态，输出 OpenPose 格式姿态图序列。基于 MediaPipe 自研实现，内置时序平滑和帧间插值。
+>
+> Extract body poses frame-by-frame from a reference video, outputting OpenPose-format pose image sequences. Self-developed based on MediaPipe with built-in temporal smoothing and frame interpolation.
+
+#### 输入 / Inputs
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| 视频文件 | COMBO | — | 选择参考视频文件 |
+| 目标帧数 | INT | 81 | 输出帧数（4k+1格式，如81, 85, 89），匹配视频生成模型 |
+| 检测身体 | BOOLEAN | True | 检测身体骨架 |
+| 检测手部 | BOOLEAN | True | 检测手部关键点 |
+| 检测面部 | BOOLEAN | True | 检测面部关键点 |
+| 时序平滑 | BOOLEAN | True | 对关键点进行时序平滑，减少帧间抖动 |
+| 平滑窗口 | INT | 5 | 平滑窗口大小（3-15），越大越平滑 |
+| 输出分辨率 | INT | 512 | 姿态图分辨率 |
+| 视频路径 | STRING | "" | 可选，直接指定视频完整路径 |
+
+#### 输出 / Outputs
+
+| 输出 | 类型 | 说明 |
+|------|------|------|
+| 姿态图 | IMAGE | OpenPose 格式姿态图序列 (T, H, W, 3) |
+| 姿态数据 | STRING | 每帧关键点 JSON 数据 |
+| 帧数 | INT | 实际输出帧数 |
+
+#### 自研优势 / Self-Developed Advantages
+
+| 优化 | 说明 |
+|------|------|
+| 🎯 **时序平滑** | 加权置信度平滑算法，消除逐帧检测抖动 |
+| 🔗 **帧间插值** | 采样帧之间自动线性插值，生成流畅姿态序列 |
+| 🎨 **OpenPose 渲染** | 标准 OpenPose 配色方案，兼容 Wan2.1 ControlNet |
+| ⚡ **速度优势** | MediaPipe 比 DWPose 快 5-10 倍 |
+
+---
+
+### 5️⃣ 模仿提示词 🎭 (Yunjii) — `MimicPromptGenerator`
+
+> 根据运镜分析结果和人物描述，生成优化的视频生成提示词（正面+负面）。
+>
+> Generate optimized video generation prompts (positive + negative) based on motion analysis and character description.
+
+#### 输入 / Inputs
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| 运动提示词 | STRING | "" | 由运动分析节点生成的提示词，用 \|\|\| 分隔 |
+| 人物描述 | STRING | "a person" | 目标人物的外貌描述（英文） |
+| 风格关键词 | STRING | "cinematic, high quality, 4k" | 视频风格关键词 |
+| 质量增强 | BOOLEAN | True | 自动追加质量增强关键词 |
+| 自定义负面提示词 | STRING | "" | 追加到默认负面词后 |
+
+#### 输出 / Outputs
+
+| 输出 | 类型 | 说明 |
+|------|------|------|
+| 正面提示词 | STRING | 组合后的正面提示词 |
+| 负面提示词 | STRING | 组合后的负面提示词 |
 
 ---
 
