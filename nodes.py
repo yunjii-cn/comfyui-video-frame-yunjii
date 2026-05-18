@@ -575,13 +575,378 @@ def _analyze_motion(video_path, scenes, fps=30):
     return prompts
 
 
+_MEDIAPIPE_AVAILABLE = False
+try:
+    import mediapipe as _mp
+    _MEDIAPIPE_AVAILABLE = True
+except ImportError:
+    pass
+
+_MP_TO_OPENPOSE = {
+    0: 0, 12: 2, 11: 5, 14: 3, 13: 6, 16: 4, 15: 7,
+    24: 9, 23: 12, 26: 10, 25: 13, 28: 11, 27: 14,
+    5: 16, 2: 15, 7: 18, 8: 17,
+}
+
+_OPENPOSE_LIMBS = [
+    (0, 1, (255, 128, 0)), (1, 2, (255, 128, 0)), (2, 3, (255, 128, 0)), (3, 4, (255, 128, 0)),
+    (1, 5, (0, 128, 255)), (5, 6, (0, 128, 255)), (6, 7, (0, 128, 255)),
+    (1, 8, (255, 153, 255)), (8, 9, (255, 128, 0)), (9, 10, (255, 128, 0)), (10, 11, (255, 128, 0)),
+    (8, 12, (0, 128, 255)), (12, 13, (0, 128, 255)), (13, 14, (0, 128, 255)),
+]
+
+_OPENPOSE_HAND_CONNECTIONS = [
+    (0,1),(1,2),(2,3),(3,4),(0,5),(5,6),(6,7),(7,8),
+    (5,9),(9,10),(10,11),(11,12),(9,13),(13,14),(14,15),(15,16),
+    (13,17),(17,18),(18,19),(19,20),(0,17),
+]
+
+
+def _mp_to_openpose_kps(pose_landmarks, w, h):
+    kps = [None] * 19
+    if pose_landmarks is None:
+        return kps
+    for mp_idx, op_idx in _MP_TO_OPENPOSE.items():
+        lm = pose_landmarks[mp_idx]
+        if lm.visibility > 0.3:
+            kps[op_idx] = (lm.x * w, lm.y * h, lm.visibility)
+    if kps[2] is not None and kps[5] is not None:
+        kps[1] = ((kps[2][0]+kps[5][0])/2, (kps[2][1]+kps[5][1])/2, min(kps[2][2], kps[5][2]))
+    if kps[9] is not None and kps[12] is not None:
+        kps[8] = ((kps[9][0]+kps[12][0])/2, (kps[9][1]+kps[12][1])/2, min(kps[9][2], kps[12][2]))
+    return kps
+
+
+def _draw_openpose(canvas, body_kps, hand_lms_list, face_lms, draw_body, draw_hands, draw_face, stick_width=3, kp_size=4):
+    h, w = canvas.shape[:2]
+    if draw_body and body_kps:
+        for i, j, color in _OPENPOSE_LIMBS:
+            if i < len(body_kps) and j < len(body_kps) and body_kps[i] is not None and body_kps[j] is not None:
+                pt1 = (int(body_kps[i][0]), int(body_kps[i][1]))
+                pt2 = (int(body_kps[j][0]), int(body_kps[j][1]))
+                cv2.line(canvas, pt1, pt2, color, stick_width, cv2.LINE_AA)
+        for kp in body_kps:
+            if kp is not None:
+                cv2.circle(canvas, (int(kp[0]), int(kp[1])), kp_size, (255, 255, 255), -1, cv2.LINE_AA)
+                cv2.circle(canvas, (int(kp[0]), int(kp[1])), max(1, kp_size-1), (0, 0, 0), -1, cv2.LINE_AA)
+    if draw_hands and hand_lms_list:
+        hand_color_l = (0, 128, 255)
+        hand_color_r = (255, 128, 0)
+        for hand_idx, hand_lms in enumerate(hand_lms_list):
+            color = hand_color_l if hand_idx == 0 else hand_color_r
+            pts = [(int(lm.x * w), int(lm.y * h)) for lm in hand_lms.landmark if lm.visibility > 0.3]
+            for i, j in _OPENPOSE_HAND_CONNECTIONS:
+                if i < len(hand_lms.landmark) and j < len(hand_lms.landmark):
+                    p1 = hand_lms.landmark[i]
+                    p2 = hand_lms.landmark[j]
+                    if p1.visibility > 0.3 and p2.visibility > 0.3:
+                        cv2.line(canvas, (int(p1.x*w), int(p1.y*h)), (int(p2.x*w), int(p2.y*h)), color, 2, cv2.LINE_AA)
+            for pt in pts:
+                cv2.circle(canvas, pt, 3, color, -1, cv2.LINE_AA)
+    if draw_face and face_lms:
+        face_pts = [(int(lm.x * w), int(lm.y * h)) for lm in face_lms.landmark if lm.visibility > 0.3]
+        for pt in face_pts:
+            cv2.circle(canvas, pt, 2, (0, 255, 0), -1, cv2.LINE_AA)
+    return canvas
+
+
+def _smooth_kps_sequence(kps_seq, window=5):
+    if len(kps_seq) < 3 or window < 2:
+        return kps_seq
+    smoothed = []
+    half = window // 2
+    for t in range(len(kps_seq)):
+        frame = kps_seq[t]
+        new_frame = []
+        for kp_idx in range(len(frame)):
+            vals = []
+            for dt in range(-half, half + 1):
+                t2 = t + dt
+                if 0 <= t2 < len(kps_seq) and kps_seq[t2][kp_idx] is not None:
+                    vals.append(kps_seq[t2][kp_idx])
+            if vals:
+                weight_sum = sum(v[2] for v in vals)
+                if weight_sum > 0:
+                    ax = sum(v[0]*v[2] for v in vals) / weight_sum
+                    ay = sum(v[1]*v[2] for v in vals) / weight_sum
+                    ac = weight_sum / len(vals)
+                    new_frame.append((ax, ay, ac))
+                else:
+                    new_frame.append(None)
+            else:
+                new_frame.append(None)
+        smoothed.append(new_frame)
+    return smoothed
+
+
+def _interpolate_kps(kps_seq, target_count):
+    src_count = len(kps_seq)
+    if src_count == 0 or target_count <= 0:
+        return kps_seq
+    if src_count == 1:
+        return [kps_seq[0]] * target_count
+    result = []
+    for t in range(target_count):
+        src_t = t * (src_count - 1) / max(1, target_count - 1)
+        idx0 = int(src_t)
+        idx1 = min(idx0 + 1, src_count - 1)
+        frac = src_t - idx0
+        frame = []
+        for kp_idx in range(len(kps_seq[0])):
+            kp0 = kps_seq[idx0][kp_idx]
+            kp1 = kps_seq[idx1][kp_idx]
+            if kp0 is not None and kp1 is not None:
+                ix = kp0[0] * (1-frac) + kp1[0] * frac
+                iy = kp0[1] * (1-frac) + kp1[1] * frac
+                ic = kp0[2] * (1-frac) + kp1[2] * frac
+                frame.append((ix, iy, ic))
+            elif kp0 is not None:
+                frame.append(kp0)
+            elif kp1 is not None:
+                frame.append(kp1)
+            else:
+                frame.append(None)
+        result.append(frame)
+    return result
+
+
+class VideoPoseExtractor:
+    CATEGORY = "Yunjii/Video/Pose"
+    FUNCTION = "extract_poses"
+    RETURN_TYPES = ("IMAGE", "STRING", "INT")
+    RETURN_NAMES = ("姿态图", "姿态数据", "帧数")
+    OUTPUT_NODE = True
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        input_dir = folder_paths.get_input_directory()
+        video_files = []
+        for f in os.listdir(input_dir) if os.path.isdir(input_dir) else []:
+            if f.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.webm')):
+                video_files.append(f)
+        return {
+            "required": {
+                "视频文件": (sorted(video_files) if video_files else ["(无视频文件)"],
+                    {"tooltip": "选择参考视频文件"}),
+                "目标帧数": ("INT", {"default": 81, "min": 9, "max": 161, "step": 4,
+                    "tooltip": "输出帧数，需为4k+1（如81,85,89），匹配视频生成模型"}),
+                "检测身体": ("BOOLEAN", {"default": True}),
+                "检测手部": ("BOOLEAN", {"default": True}),
+                "检测面部": ("BOOLEAN", {"default": True}),
+                "时序平滑": ("BOOLEAN", {"default": True,
+                    "tooltip": "对姿态关键点进行时序平滑，减少帧间抖动"}),
+                "平滑窗口": ("INT", {"default": 5, "min": 3, "max": 15, "step": 2,
+                    "tooltip": "平滑窗口大小，越大越平滑但可能丢失细节"}),
+                "输出分辨率": ("INT", {"default": 512, "min": 256, "max": 1024, "step": 64}),
+            },
+            "optional": {
+                "视频路径": ("STRING", {"default": ""}),
+            }
+        }
+
+    def extract_poses(self, 视频文件, 目标帧数=81, 检测身体=True, 检测手部=True, 检测面部=True,
+                      时序平滑=True, 平滑窗口=5, 输出分辨率=512, 视频路径=""):
+        if 视频路径 and os.path.isfile(视频路径):
+            video_path = 视频路径
+        else:
+            video_path = os.path.join(folder_paths.get_input_directory(), 视频文件)
+
+        if not os.path.isfile(video_path):
+            return (torch.zeros((1, 输出分辨率, 输出分辨率, 3)), "⚠ 找不到视频文件", 0)
+
+        if not _MEDIAPIPE_AVAILABLE:
+            return (torch.zeros((1, 输出分辨率, 输出分辨率, 3)),
+                "⚠ 需要安装 mediapipe: pip install mediapipe", 0)
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return (torch.zeros((1, 输出分辨率, 输出分辨率, 3)), "⚠ 无法打开视频", 0)
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        目标帧数 = max(9, ((目标帧数 - 1) // 4) * 4 + 1)
+
+        mp_pose = _mp.solutions.pose.Pose(
+            static_image_mode=False,
+            model_complexity=2,
+            min_detection_confidence=0.3,
+            min_tracking_confidence=0.3,
+        )
+        mp_hands = _mp.solutions.hands.Hands(
+            static_image_mode=False,
+            max_num_hands=2,
+            min_detection_confidence=0.3,
+            min_tracking_confidence=0.3,
+        )
+        mp_face = _mp.solutions.face_mesh.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=1,
+            min_detection_confidence=0.3,
+            min_tracking_confidence=0.3,
+        ) if 检测面部 else None
+
+        if total_frames <= 目标帧数:
+            sample_indices = list(range(total_frames))
+        else:
+            step = total_frames / 目标帧数
+            sample_indices = [min(int(i * step), total_frames - 1) for i in range(目标帧数)]
+
+        all_body_kps = []
+        all_hand_lms = []
+        all_face_lms = []
+        raw_frames = []
+
+        for target_idx in sample_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, target_idx)
+            ret, frame = cap.read()
+            if not ret:
+                all_body_kps.append([None]*19)
+                all_hand_lms.append([])
+                all_face_lms.append(None)
+                raw_frames.append(None)
+                continue
+
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            h, w = rgb.shape[:2]
+            raw_frames.append(rgb.copy())
+
+            pose_result = mp_pose.process(rgb) if 检测身体 else None
+            body_kps = _mp_to_openpose_kps(
+                pose_result.pose_landmarks.landmark if pose_result and pose_result.pose_landmarks else None,
+                w, h
+            ) if 检测身体 else [None]*19
+            all_body_kps.append(body_kps)
+
+            if 检测手部:
+                hands_result = mp_hands.process(rgb)
+                hand_lms = []
+                if hands_result and hands_result.multi_hand_landmarks:
+                    hand_lms = list(hands_result.multi_hand_landmarks)
+                all_hand_lms.append(hand_lms)
+            else:
+                all_hand_lms.append([])
+
+            if 检测面部 and mp_face is not None:
+                face_result = mp_face.process(rgb)
+                face_lms = face_result.multi_face_landmarks[0] if face_result and face_result.multi_face_landmarks else None
+                all_face_lms.append(face_lms)
+            else:
+                all_face_lms.append(None)
+
+        cap.release()
+        mp_pose.close()
+        mp_hands.close()
+        if mp_face is not None:
+            mp_face.close()
+
+        if 时序平滑 and len(all_body_kps) > 2:
+            all_body_kps = _smooth_kps_sequence(all_body_kps, 平滑窗口)
+
+        if len(all_body_kps) < 目标帧数:
+            all_body_kps = _interpolate_kps(all_body_kps, 目标帧数)
+            while len(all_hand_lms) < 目标帧数:
+                all_hand_lms.append(all_hand_lms[-1] if all_hand_lms else [])
+            while len(all_face_lms) < 目标帧数:
+                all_face_lms.append(all_face_lms[-1] if all_face_lms else None)
+
+        pose_images = []
+        pose_data_list = []
+        out_h, out_w = 输出分辨率, 输出分辨率
+
+        for i in range(min(len(all_body_kps), 目标帧数)):
+            canvas = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+            body_kps = all_body_kps[i]
+            hand_lms = all_hand_lms[i] if i < len(all_hand_lms) else []
+            face_lms = all_face_lms[i] if i < len(all_face_lms) else None
+            _draw_openpose(canvas, body_kps, hand_lms, face_lms, 检测身体, 检测手部, 检测面部)
+            tensor = torch.from_numpy(canvas.astype(np.float32) / 255.0).unsqueeze(0)
+            pose_images.append(tensor)
+
+            kp_data = {}
+            for idx, kp in enumerate(body_kps):
+                if kp is not None:
+                    kp_data[str(idx)] = {"x": round(kp[0], 2), "y": round(kp[1], 2), "score": round(kp[2], 3)}
+            pose_data_list.append(json.dumps(kp_data))
+
+        if not pose_images:
+            return (torch.zeros((1, out_h, out_w, 3)), "⚠ 未检测到姿态", 0)
+
+        all_poses = torch.cat(pose_images, dim=0)
+        all_pose_data = "\n".join(pose_data_list)
+        frame_count = len(pose_images)
+
+        ui_data = {
+            "total_frames": total_frames,
+            "sampled_frames": frame_count,
+            "fps": round(fps, 1),
+            "duration": round(total_frames / fps, 1) if fps > 0 else 0,
+        }
+        return {"ui": ui_data, "result": (all_poses, all_pose_data, frame_count)}
+
+
+class MimicPromptGenerator:
+    CATEGORY = "Yunjii/Video/Mimic"
+    FUNCTION = "generate"
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("正面提示词", "负面提示词")
+    OUTPUT_NODE = True
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "运动提示词": ("STRING", {"default": "", "multiline": True,
+                    "tooltip": "由运动分析节点生成的提示词，用 ||| 分隔"}),
+                "人物描述": ("STRING", {"default": "a person", "multiline": True,
+                    "tooltip": "目标人物的外貌描述（英文）"}),
+                "风格关键词": ("STRING", {"default": "cinematic, high quality, 4k",
+                    "tooltip": "视频风格关键词"}),
+                "质量增强": ("BOOLEAN", {"default": True,
+                    "tooltip": "自动追加质量增强关键词"}),
+            },
+            "optional": {
+                "自定义负面提示词": ("STRING", {"default": "",
+                    "tooltip": "自定义负面提示词，追加到默认负面词后"}),
+            }
+        }
+
+    def generate(self, 运动提示词="", 人物描述="a person", 风格关键词="cinematic, high quality, 4k",
+                 质量增强=True, 自定义负面提示词=""):
+        motion_parts = [p.strip() for p in 运动提示词.split("|||") if p.strip()] if 运动提示词 else []
+        if motion_parts:
+            unique_motions = list(dict.fromkeys(motion_parts))
+            motion_desc = ", ".join(unique_motions)
+            prompt = f"{人物描述}, {motion_desc}, {风格关键词}"
+        else:
+            prompt = f"{人物描述}, {风格关键词}"
+
+        if 质量增强:
+            prompt += ", masterpiece, best quality, highly detailed, sharp focus, smooth motion"
+
+        default_neg = "low quality, worst quality, blurry, distorted, deformed, ugly, bad anatomy, bad hands, missing fingers, extra digits, watermark, text, logo, static, jittery"
+        negative = f"{default_neg}, {自定义负面提示词}" if 自定义负面提示词.strip() else default_neg
+        return (prompt, negative)
+
+
 NODE_CLASS_MAPPINGS = {
     "MotionAnalysisNode": MotionAnalysisNode,
     "PromptControlNode": PromptControlNode,
     "KeyframePreviewNode": KeyframePreviewNode,
+    "VideoPoseExtractor": VideoPoseExtractor,
+    "MimicPromptGenerator": MimicPromptGenerator,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "MotionAnalysisNode": "运动分析 🔍 (Yunjii)",
     "PromptControlNode": "提示词控制 📝 (Yunjii)",
     "KeyframePreviewNode": "关键帧预览 🖼 (Yunjii)",
+    "VideoPoseExtractor": "姿态提取 🕺 (Yunjii)",
+    "MimicPromptGenerator": "模仿提示词 🎭 (Yunjii)",
 }
