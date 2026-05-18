@@ -1,0 +1,274 @@
+{
+  "last_node_id": 13,
+  "last_link_id": 14,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "MotionAnalysisNode",
+      "pos": [0, 0],
+      "size": [320, 400],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {"name": "运动提示词", "type": "STRING", "links": [1], "slot_index": 0},
+        {"name": "分段信息", "type": "STRING", "links": null, "slot_index": 1},
+        {"name": "镜头数", "type": "INT", "links": null, "slot_index": 2},
+        {"name": "关键帧", "type": "IMAGE", "links": null, "slot_index": 3},
+        {"name": "帧信息", "type": "STRING", "links": null, "slot_index": 4}
+      ],
+      "properties": {"Node name for S&R": "MotionAnalysisNode"},
+      "widgets_values": ["", "自然镜头", true, 10.0, true, 2.0, 5, 0.3, true, "", "", "", "", "eyes open, clear face, sharp focus", ""]
+    },
+    {
+      "id": 2,
+      "type": "VideoPoseExtractor",
+      "pos": [0, 500],
+      "size": [320, 350],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {"name": "姿态图", "type": "IMAGE", "links": [2], "slot_index": 0},
+        {"name": "姿态数据", "type": "STRING", "links": null, "slot_index": 1},
+        {"name": "帧数", "type": "INT", "links": null, "slot_index": 2}
+      ],
+      "properties": {"Node name for S&R": "VideoPoseExtractor"},
+      "widgets_values": ["", 81, true, true, true, true, 5, 512, ""]
+    },
+    {
+      "id": 3,
+      "type": "MimicPromptGenerator",
+      "pos": [400, 0],
+      "size": [320, 250],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {"name": "运动提示词", "type": "STRING", "link": 1, "slot_index": 0}
+      ],
+      "outputs": [
+        {"name": "正面提示词", "type": "STRING", "links": [], "slot_index": 0},
+        {"name": "负面提示词", "type": "STRING", "links": [], "slot_index": 1}
+      ],
+      "properties": {"Node name for S&R": "MimicPromptGenerator"},
+      "widgets_values": ["", "a person", "cinematic, high quality, 4k", true, ""]
+    },
+    {
+      "id": 4,
+      "type": "LoadWanVideoT5TextEncoder",
+      "pos": [400, 400],
+      "size": [320, 100],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {"name": "wan_t5_model", "type": "WANTEXTENCODER", "links": [3], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "LoadWanVideoT5TextEncoder"},
+      "widgets_values": ["umt5_xxl_fp8_e4m3fn_scaled.safetensors", "bf16", "offload_device", "disabled"]
+    },
+    {
+      "id": 5,
+      "type": "LoadWanVideoClipTextEncoder",
+      "pos": [400, 580],
+      "size": [320, 100],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {"name": "wan_clip_vision", "type": "CLIP_VISION", "links": [4], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "LoadWanVideoClipTextEncoder"},
+      "widgets_values": ["clip_vision_h.safetensors", "fp16", "offload_device"]
+    },
+    {
+      "id": 6,
+      "type": "WanVideoVAELoader",
+      "pos": [400, 740],
+      "size": [320, 100],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {"name": "vae", "type": "WANVAE", "links": [5, 6], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "WanVideoVAELoader"},
+      "widgets_values": ["Wan2_1_VAE_bf16.safetensors", "bf16"]
+    },
+    {
+      "id": 7,
+      "type": "WanVideoTextEncode",
+      "pos": [800, 0],
+      "size": [320, 200],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {"name": "t5", "type": "WANTEXTENCODER", "link": 3, "slot_index": 0}
+      ],
+      "outputs": [
+        {"name": "text_embeds", "type": "WANVIDEOTEXTEMBEDS", "links": [7], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "WanVideoTextEncode"},
+      "widgets_values": ["a person, cinematic, high quality, 4k, masterpiece, best quality, highly detailed, sharp focus, smooth motion", "low quality, worst quality, blurry, distorted, deformed, ugly, bad anatomy, bad hands, missing fingers, extra digits, watermark, text, logo, static, jittery", true, null, false, "gpu"]
+    },
+    {
+      "id": 8,
+      "type": "WanVideoClipVisionEncode",
+      "pos": [800, 300],
+      "size": [320, 200],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {"name": "clip_vision", "type": "CLIP_VISION", "link": 4, "slot_index": 0},
+        {"name": "image_1", "type": "IMAGE", "link": 8, "slot_index": 0}
+      ],
+      "outputs": [
+        {"name": "image_embeds", "type": "WANVIDIMAGE_CLIPEMBEDS", "links": [9], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "WanVideoClipVisionEncode"},
+      "widgets_values": [1.0, 1.0, "center", "average", true]
+    },
+    {
+      "id": 9,
+      "type": "LoadImage",
+      "pos": [400, 900],
+      "size": [320, 300],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {"name": "IMAGE", "type": "IMAGE", "links": [8, 10], "slot_index": 0},
+        {"name": "MASK", "type": "MASK", "links": null, "slot_index": 1}
+      ],
+      "properties": {"Node name for S&R": "LoadImage"},
+      "widgets_values": ["example.png", "image"]
+    },
+    {
+      "id": 10,
+      "type": "WanVideoAnimateEmbeds",
+      "pos": [1200, 300],
+      "size": [320, 350],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {"name": "vae", "type": "WANVAE", "link": 5, "slot_index": 0},
+        {"name": "clip_embeds", "type": "WANVIDIMAGE_CLIPEMBEDS", "link": 9, "slot_index": 0},
+        {"name": "ref_images", "type": "IMAGE", "link": 10, "slot_index": 0},
+        {"name": "pose_images", "type": "IMAGE", "link": 2, "slot_index": 0}
+      ],
+      "outputs": [
+        {"name": "image_embeds", "type": "WANVIDIMAGE_EMBEDS", "links": [11], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "WanVideoAnimateEmbeds"},
+      "widgets_values": [832, 480, 81, true, 77, "disabled", 1.0, 1.0, false]
+    },
+    {
+      "id": 11,
+      "type": "WanVideoModelLoader",
+      "pos": [800, 600],
+      "size": [320, 200],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {"name": "model", "type": "WANVIDEOMODEL", "links": [12], "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "WanVideoModelLoader"},
+      "widgets_values": ["Wan2_2-Animate-14B_fp8_scaled_e4m3fn_KJ_v2.safetensors", "bf16", "disabled", "offload_device", "sdpa"]
+    },
+    {
+      "id": 12,
+      "type": "WanVideoSampler",
+      "pos": [1600, 300],
+      "size": [320, 350],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {"name": "model", "type": "WANVIDEOMODEL", "link": 12, "slot_index": 0},
+        {"name": "image_embeds", "type": "WANVIDIMAGE_EMBEDS", "link": 11, "slot_index": 0},
+        {"name": "text_embeds", "type": "WANVIDEOTEXTEMBEDS", "link": 7, "slot_index": 0}
+      ],
+      "outputs": [
+        {"name": "samples", "type": "LATENT", "links": [13], "slot_index": 0},
+        {"name": "denoised_samples", "type": "LATENT", "links": null, "slot_index": 1}
+      ],
+      "properties": {"Node name for S&R": "WanVideoSampler"},
+      "widgets_values": [30, 6.0, 5.0, 0, true, "unipc", 0, 1.0, false, "comfy"]
+    },
+    {
+      "id": 13,
+      "type": "WanVideoDecode",
+      "pos": [2000, 300],
+      "size": [320, 250],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [
+        {"name": "vae", "type": "WANVAE", "link": 6, "slot_index": 0},
+        {"name": "samples", "type": "LATENT", "link": 13, "slot_index": 0}
+      ],
+      "outputs": [
+        {"name": "images", "type": "IMAGE", "links": null, "slot_index": 0}
+      ],
+      "properties": {"Node name for S&R": "WanVideoDecode"},
+      "widgets_values": [false, 272, 272, 144, 128]
+    }
+  ],
+  "links": [
+    [1, 1, 0, 3, 0, "STRING"],
+    [2, 2, 0, 10, 3, "IMAGE"],
+    [3, 4, 0, 7, 0, "WANTEXTENCODER"],
+    [4, 5, 0, 8, 0, "CLIP_VISION"],
+    [5, 6, 0, 10, 0, "WANVAE"],
+    [6, 6, 0, 13, 0, "WANVAE"],
+    [7, 7, 0, 12, 2, "WANVIDEOTEXTEMBEDS"],
+    [8, 9, 0, 8, 1, "IMAGE"],
+    [9, 8, 0, 10, 1, "WANVIDIMAGE_CLIPEMBEDS"],
+    [10, 9, 0, 10, 2, "IMAGE"],
+    [11, 10, 0, 12, 1, "WANVIDIMAGE_EMBEDS"],
+    [12, 11, 0, 12, 0, "WANVIDEOMODEL"],
+    [13, 12, 0, 13, 1, "LATENT"]
+  ],
+  "groups": [
+    {
+      "title": "🎬 云集智能 - 视频模仿分析层（自研）",
+      "bounding": [-30, -30, 780, 930],
+      "color": "#3f789e"
+    },
+    {
+      "title": "🎥 WanVideo 生成层（外接）",
+      "bounding": [770, -30, 800, 930],
+      "color": "#8e44ad"
+    },
+    {
+      "title": "📹 视频解码输出",
+      "bounding": [1970, 270, 370, 310],
+      "color": "#2ecc71"
+    }
+  ],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.6,
+      "offset": [0, 0]
+    },
+    "info": {
+      "name": "云集智能视频模仿",
+      "description": "上传参考视频+人物图片，自动提取姿态和运镜，生成模仿视频",
+      "version": "20260518_2100"
+    }
+  },
+  "version": 0.4
+}
