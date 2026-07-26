@@ -3,18 +3,25 @@ import { app } from "../../scripts/app.js";
 app.registerExtension({
     name: "yunjii.video.preprocess",
 
+    async setup() {
+        _addDevToolbar();
+    },
+
     async beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData.name === "MotionAnalysisNode") {
             const origCreated = nodeType.prototype.onNodeCreated;
             nodeType.prototype.onNodeCreated = function() {
                 const r = origCreated ? origCreated.apply(this, arguments) : undefined;
 
-                if (nodeData.name === "KeyframePreviewNode") return r;
+                const uploadBtn = this.addWidget("button", "📤 上传视频", null, () => {
+                    _uploadVideo(this);
+                });
+                uploadBtn.serialize = false;
 
-                const browseBtn = this.addWidget("button", "\u{1F3AC} \u624B\u52A8\u9009\u5E27", null, () => {
-                    const vidWidget = this.widgets.find(w => w.name === "\u89C6\u9891\u6587\u4EF6");
+                const browseBtn = this.addWidget("button", "🎬 手动选帧", null, () => {
+                    const vidWidget = this.widgets.find(w => w.name === "视频文件");
                     const videoName = vidWidget ? vidWidget.value : "";
-                    if (!videoName || videoName === "(\u65E0\u89C6\u9891\u6587\u4EF6)") { alert("\u8BF7\u5148\u9009\u62E9\u6216\u4E0A\u4F20\u89C6\u9891\u6587\u4EF6"); return; }
+                    if (!videoName || videoName === "(无视频文件)") { alert("请先选择或上传视频文件"); return; }
                     _openFrameBrowser(videoName, this);
                 });
                 browseBtn.serialize = false;
@@ -28,10 +35,21 @@ app.registerExtension({
                             this._yunjiiScenes = scenes;
                             const browser = window._yunjiiFrameBrowser;
                             if (browser && browser._setSceneData) browser._setSceneData(scenes);
-                            _showFrameInfo(this, scenes);
                         } catch(e) {}
                     }
                 };
+
+                return r;
+            };
+        }
+
+        if (nodeData.name === "VideoPoseExtractor") {
+            const origCreated = nodeType.prototype.onNodeCreated;
+            nodeType.prototype.onNodeCreated = function() {
+                const r = origCreated ? origCreated.apply(this, arguments) : undefined;
+
+                const hintWidget = this.addWidget("text", "ℹ️ 视频由运动分析节点传入", "", () => {});
+                hintWidget.serialize = false;
 
                 return r;
             };
@@ -482,4 +500,239 @@ function _updateMarkers(container, scenes, selectedFrames, duration) {
 function _fmtTime(s) {
     const m = Math.floor(s/60), sec = Math.floor(s%60), ms = Math.floor((s%1)*100);
     return `${m<10?'0'+m:m}:${sec<10?'0'+sec:sec}.${ms<10?'0'+ms:ms}`;
+}
+
+
+function _uploadVideo(node) {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "video/*,.mp4,.avi,.mov,.mkv,.webm";
+    input.onchange = async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+
+        const btn = node.widgets.find(w => w.name === "📤 上传视频");
+        if (btn) btn.name = "⏳ 上传中...";
+
+        try {
+            const formData = new FormData();
+            formData.append("file", file);
+
+            const resp = await fetch("/yunjii/upload_video", {
+                method: "POST",
+                body: formData,
+            });
+
+            const data = await resp.json();
+            if (data.saved) {
+                const vidWidget = node.widgets.find(w => w.name === "视频文件");
+                if (vidWidget) {
+                    vidWidget.value = data.saved;
+                    node.setDirtyCanvas(true, true);
+                }
+                if (btn) btn.name = "✅ 上传成功";
+                setTimeout(() => { if (btn) btn.name = "📤 上传视频"; }, 2000);
+            } else {
+                alert("上传失败: " + (data.error || "未知错误"));
+                if (btn) btn.name = "📤 上传视频";
+            }
+        } catch (err) {
+            alert("上传失败: " + err.message);
+            if (btn) btn.name = "📤 上传视频";
+        }
+    };
+    input.click();
+}
+
+
+function _addDevToolbar() {
+    const existing = document.getElementById("yunjii-dev-toolbar");
+    if (existing) return;
+
+    const toolbar = document.createElement("div");
+    toolbar.id = "yunjii-dev-toolbar";
+    Object.assign(toolbar.style, {
+        position: "fixed", bottom: "10px", right: "10px", zIndex: "10000",
+        display: "flex", gap: "6px", alignItems: "center",
+        background: "rgba(20,20,30,0.9)", padding: "6px 10px",
+        borderRadius: "8px", boxShadow: "0 2px 12px rgba(0,0,0,0.5)",
+        fontFamily: "monospace", fontSize: "11px",
+    });
+
+    const label = document.createElement("span");
+    label.style.cssText = "color:#4cf;font-weight:600;font-size:11px;";
+    label.textContent = "Yunjii";
+    toolbar.appendChild(label);
+
+    const reloadBtn = document.createElement("button");
+    reloadBtn.textContent = "🔄 热重载";
+    Object.assign(reloadBtn.style, {
+        background: "linear-gradient(135deg,#3498db,#2980b9)", color: "#fff",
+        border: "none", padding: "4px 10px", borderRadius: "4px",
+        cursor: "pointer", fontSize: "11px", fontWeight: "600",
+    });
+    reloadBtn.onclick = async () => {
+        reloadBtn.textContent = "⏳ 重载中...";
+        reloadBtn.style.opacity = "0.6";
+        try {
+            const resp = await fetch("/yunjii/reload", { method: "POST" });
+            const data = await resp.json();
+            if (data.status === "ok" || data.status === "partial") {
+                const info = `${data.reloaded_modules}模块, ${data.node_count}节点`;
+                reloadBtn.textContent = `✅ ${info}`;
+                if (data.errors && data.errors.length > 0) {
+                    console.warn("[Yunjii] Reload errors:", data.errors);
+                }
+                setTimeout(() => { reloadBtn.textContent = "🔄 热重载"; reloadBtn.style.opacity = "1"; }, 3000);
+            } else {
+                reloadBtn.textContent = "❌ 失败";
+                setTimeout(() => { reloadBtn.textContent = "🔄 热重载"; reloadBtn.style.opacity = "1"; }, 3000);
+            }
+        } catch (err) {
+            reloadBtn.textContent = "❌ 连接失败";
+            setTimeout(() => { reloadBtn.textContent = "🔄 热重载"; reloadBtn.style.opacity = "1"; }, 3000);
+        }
+    };
+    toolbar.appendChild(reloadBtn);
+
+    const logBtn = document.createElement("button");
+    logBtn.textContent = "📋 日志";
+    Object.assign(logBtn.style, {
+        background: "linear-gradient(135deg,#27ae60,#219a52)", color: "#fff",
+        border: "none", padding: "4px 10px", borderRadius: "4px",
+        cursor: "pointer", fontSize: "11px", fontWeight: "600",
+    });
+    logBtn.onclick = () => _openLogPanel();
+    toolbar.appendChild(logBtn);
+
+    document.body.appendChild(toolbar);
+}
+
+
+function _openLogPanel() {
+    const existing = document.getElementById("yunjii-log-overlay");
+    if (existing) { existing.remove(); return; }
+
+    const overlay = document.createElement("div");
+    Object.assign(overlay.style, {
+        position: "fixed", inset: "0", zIndex: "15000",
+        background: "rgba(0,0,0,0.85)", display: "flex",
+        flexDirection: "column", alignItems: "center", justifyContent: "center",
+    });
+
+    const container = document.createElement("div");
+    Object.assign(container.style, {
+        width: "80vw", maxWidth: "900px", height: "75vh",
+        background: "#1e1e1e", borderRadius: "12px",
+        display: "flex", flexDirection: "column", overflow: "hidden",
+        boxShadow: "0 10px 50px rgba(0,0,0,0.8)",
+    });
+
+    const header = document.createElement("div");
+    Object.assign(header.style, {
+        display: "flex", justifyContent: "space-between", alignItems: "center",
+        padding: "10px 20px", borderBottom: "1px solid #333",
+        color: "#fff", fontSize: "14px", fontWeight: "600",
+    });
+    header.innerHTML = "<span>📋 云集智能调试日志</span>";
+
+    const closeBtn = document.createElement("button");
+    closeBtn.textContent = "✕ 关闭";
+    Object.assign(closeBtn.style, { background: "#444", color: "#fff", border: "none", padding: "5px 14px", borderRadius: "6px", cursor: "pointer", fontSize: "12px" });
+    closeBtn.onclick = () => overlay.remove();
+    header.appendChild(closeBtn);
+
+    const controls = document.createElement("div");
+    Object.assign(controls.style, {
+        display: "flex", gap: "8px", padding: "8px 16px", borderBottom: "1px solid #333", alignItems: "center",
+    });
+
+    const fileSelect = document.createElement("select");
+    Object.assign(fileSelect.style, {
+        background: "#2a2a2a", color: "#ccc", border: "1px solid #444",
+        padding: "4px 8px", borderRadius: "4px", fontSize: "11px", fontFamily: "monospace",
+    });
+    controls.appendChild(fileSelect);
+
+    const refreshBtn = document.createElement("button");
+    refreshBtn.textContent = "🔄 刷新";
+    Object.assign(refreshBtn.style, { background: "#3498db", color: "#fff", border: "none", padding: "4px 10px", borderRadius: "4px", cursor: "pointer", fontSize: "11px" });
+    controls.appendChild(refreshBtn);
+
+    const tailInput = document.createElement("input");
+    tailInput.type = "number"; tailInput.value = "100"; tailInput.min = "10"; tailInput.max = "5000";
+    Object.assign(tailInput.style, { background: "#2a2a2a", color: "#ccc", border: "1px solid #444", padding: "4px 6px", borderRadius: "4px", fontSize: "11px", width: "60px" });
+    controls.appendChild(tailInput);
+
+    const tailLabel = document.createElement("span");
+    tailLabel.style.cssText = "color:#888;font-size:11px;";
+    tailLabel.textContent = "行";
+    controls.appendChild(tailLabel);
+
+    const logContent = document.createElement("pre");
+    Object.assign(logContent.style, {
+        flex: "1", overflow: "auto", padding: "12px 16px",
+        color: "#c9d1d9", fontFamily: "monospace", fontSize: "11px",
+        lineHeight: "1.5", margin: "0", whiteSpace: "pre-wrap", wordBreak: "break-all",
+    });
+
+    container.appendChild(header);
+    container.appendChild(controls);
+    container.appendChild(logContent);
+    overlay.appendChild(container);
+    document.body.appendChild(overlay);
+
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.remove(); });
+
+    async function loadLogs() {
+        try {
+            const resp = await fetch("/yunjii/logs");
+            const data = await resp.json();
+            fileSelect.innerHTML = "";
+            if (data.recent_logs) {
+                for (const f of data.recent_logs) {
+                    const opt = document.createElement("option");
+                    opt.value = f; opt.textContent = f;
+                    if (f === data.current) opt.selected = true;
+                    fileSelect.appendChild(opt);
+                }
+            }
+        } catch (err) {
+            fileSelect.innerHTML = "<option>加载失败</option>";
+        }
+    }
+
+    async function loadLogContent() {
+        const file = fileSelect.value;
+        const tail = tailInput.value || "100";
+        if (!file) return;
+        logContent.textContent = "加载中...";
+        try {
+            const resp = await fetch(`/yunjii/logs?file=${encodeURIComponent(file)}&tail=${tail}`);
+            const data = await resp.json();
+            let text = data.content || "(空)";
+            text = text.replace(/\[DEBUG\]/g, "%c[DEBUG]").replace(/\[INFO\]/g, "%c[INFO]").replace(/\[WARNING\]/g, "%c[WARNING]").replace(/\[ERROR\]/g, "%c[ERROR]");
+
+            const lines = (data.content || "").split("\n");
+            const colored = lines.map(line => {
+                if (line.includes("[ERROR]")) return `<span style="color:#f85149">${line}</span>`;
+                if (line.includes("[WARNING]")) return `<span style="color:#f0883e">${line}</span>`;
+                if (line.includes("[INFO]")) return `<span style="color:#58a6ff">${line}</span>`;
+                if (line.includes("[DEBUG]")) return `<span style="color:#8b949e">${line}</span>`;
+                if (line.includes("节点开始执行")) return `<span style="color:#7ee787;font-weight:600">${line}</span>`;
+                if (line.includes("节点执行完成")) return `<span style="color:#3fb950;font-weight:600">${line}</span>`;
+                if (line.includes("节点执行失败")) return `<span style="color:#f85149;font-weight:600">${line}</span>`;
+                return line;
+            }).join("\n");
+            logContent.innerHTML = colored;
+            logContent.scrollTop = logContent.scrollHeight;
+        } catch (err) {
+            logContent.textContent = "加载失败: " + err.message;
+        }
+    }
+
+    refreshBtn.onclick = () => { loadLogs(); loadLogContent(); };
+    fileSelect.onchange = loadLogContent;
+
+    loadLogs().then(() => loadLogContent());
 }

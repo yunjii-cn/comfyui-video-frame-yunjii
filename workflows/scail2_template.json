@@ -1,0 +1,65 @@
+{
+  "_README": "SCAIL-2 动作迁移工作流模板（ComfyUI API 格式）。节点 class_type 与 engine/adapters/scail.py 的 SCAIL_* 常量一一对应。适配器运行时自动设置：LoadImage.image（角色参考图，每段都注入）、VHS_LoadVideo.skip_first_frames（驱动视频分段偏移）、WanSCAILToVideo.segment_index/frame_count/width/height/prompt/replace_mode/previous_frames（后续段串联）、VHS_VideoCombine.filename_prefix。模型路径/权重名需在你安装 SCAIL-2 节点后按实际 widget 名核对——官方节点可能用不同 input 名，届时只改 scail.py 顶部常量或本模板即可。",
+  "1": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "character_reference.png",
+      "upload": "image"
+    }
+  },
+  "2": {
+    "class_type": "VHS_LoadVideo",
+    "inputs": {
+      "video": "driving_video.mp4",
+      "force_rate": 0,
+      "custom_width": 832,
+      "custom_height": 480,
+      "frame_load_cap": 0,
+      "skip_first_frames": 0,
+      "select_every_nth": 1
+    }
+  },
+  "3": {
+    "class_type": "SAM3_VideoTrack",
+    "inputs": {
+      "video": ["2", 0],
+      "threshold": 0.5,
+      "max_objects": 1
+    }
+  },
+  "4": {
+    "class_type": "SCAIL2ColoredMask",
+    "inputs": {
+      "driving_mask": ["3", 0],
+      "ref_image": ["1", 0]
+    }
+  },
+  "5": {
+    "class_type": "WanSCAILToVideo",
+    "inputs": {
+      "ref_image": ["1", 0],
+      "driving_video": ["2", 0],
+      "mask": ["4", 0],
+      "previous_frames": [],
+      "segment_index": 1,
+      "frame_count": 81,
+      "width": 832,
+      "height": 480,
+      "prompt": "",
+      "replace_mode": false,
+      "model": "scail2_14b.safetensors",
+      "ckpt_name": "wan14b.safetensors"
+    }
+  },
+  "6": {
+    "class_type": "VHS_VideoCombine",
+    "inputs": {
+      "images": ["5", 0],
+      "frame_rate": 16,
+      "filename_prefix": "yunjii_scail",
+      "format": "video/h264-mp4",
+      "pingpong": false,
+      "save_output": true
+    }
+  }
+}

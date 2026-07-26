@@ -1,0 +1,503 @@
+import os
+import uuid
+import json
+import time
+import logging
+import traceback
+import urllib.request
+import urllib.error
+import cv2
+import numpy as np
+import folder_paths
+
+from .types import (
+    SegmentPlan, SegmentResult, SegmentContext,
+    SEGMENT_MODE_ONE_SHOT, REF_STRATEGY_PREV_LAST_FRAME,
+)
+from .adapters.comfyui import ComfyUIAdapter
+from .adapters.direct import DirectAdapter
+from .adapters.scail import SCAILAdapter
+from .checkpoint import CheckpointManager
+from .debug_log import node_start, node_end, node_error, debug, info, warn, error
+
+logger = logging.getLogger(__name__)
+
+
+class YunjiiSegmentRunner:
+    CATEGORY = "Yunjii/Video/Engine"
+    FUNCTION = "run"
+    RETURN_TYPES = ("STRING", "STRING", "BOOLEAN")
+    RETURN_NAMES = ("执行结果", "执行日志", "完成状态")
+    OUTPUT_NODE = True
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, **kwargs):
+        return True
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "段落计划": ("STRING", {"default": "", "tooltip": "来自分段规划器的段落计划JSON"}),
+                "工作流模板": ("STRING", {"default": "", "multiline": True,
+                    "tooltip": "ComfyUI工作流JSON模板，可直接粘贴JSON或输入.json文件路径"}),
+                "执行模式": (
+                    ["执行", "仅规划", "续跑"],
+                    {"default": "执行", "tooltip": "执行=完整运行; 仅规划=只输出计划; 续跑=从断点继续"},
+                ),
+                "生成后端": (
+                    ["骨骼路线(WanVideo)", "SCAIL-2 路线"],
+                    {"default": "骨骼路线(WanVideo)", "tooltip": "骨骼路线=现有WanVideo分段链式; SCAIL-2路线=无骨架端到端动作迁移(需SCAIL-2节点与14B权重)"},
+                ),
+                "最大重试": ("INT", {"default": 3, "min": 0, "max": 10}),
+            },
+            "optional": {
+                "视频路径": ("STRING", {"default": "", "tooltip": "参考视频路径（从运动分析节点连线传入）"}),
+                "参考图": ("IMAGE", {"tooltip": "参考图（从LoadImage节点连线传入），优先使用"}),
+                "姿态图": ("IMAGE", {"tooltip": "姿态引导图（从VideoPoseExtractor节点连线传入）"}),
+                "人物参考图": ("STRING", {"default": "", "tooltip": "参考图文件名（input目录下），连线传入参考图时此项可忽略"}),
+                "起始段": ("INT", {"default": 0, "min": 0, "max": 100}),
+                "ComfyUI地址": ("STRING", {"default": "127.0.0.1:8188"}),
+            },
+        }
+
+    def run(self, 段落计划, 工作流模板, 执行模式, 最大重试, 生成后端="骨骼路线(WanVideo)", 视频路径="", 参考图=None, 姿态图=None, 人物参考图="", 起始段=0, ComfyUI地址="127.0.0.1:8188"):
+        node_start("Runner", 执行模式=执行模式, 最大重试=最大重试, ComfyUI地址=ComfyUI地址)
+        info("Runner", "参数诊断: 段落计划类型=%s, 工作流模板类型=%s, 视频路径='%s', 参考图类型=%s, 姿态图类型=%s, 人物参考图='%s', 起始段=%s, ComfyUI地址='%s'",
+             type(段落计划).__name__, type(工作流模板).__name__,
+             视频路径,
+             type(参考图).__name__ if 参考图 is not None else "None",
+             type(姿态图).__name__ if 姿态图 is not None else "None",
+             人物参考图, 起始段, ComfyUI地址)
+
+        if not 段落计划.strip():
+            node_error("Runner", "未提供段落计划")
+            return ("", "⚠ 未提供段落计划", False)
+
+        try:
+            plan = SegmentPlan.from_json(段落计划)
+        except Exception as e:
+            return ("", f"⚠ 解析段落计划失败: {e}", False)
+
+        if 执行模式 == "仅规划":
+            summary = f"📋 仅规划模式，共 {plan.total_segments} 段\n"
+            for seg in plan.segments:
+                summary += f"  段{seg.index}: 帧{seg.start_frame}-{seg.end_frame}, {seg.target_frames}帧, 参考={seg.ref_strategy}\n"
+            return (段落计划, summary, True)
+
+        if not 工作流模板.strip():
+            return ("", "⚠ 未提供工作流模板，请粘贴ComfyUI工作流JSON或输入JSON文件路径", False)
+
+        template_text = 工作流模板.strip()
+        if os.path.isfile(template_text):
+            try:
+                with open(template_text, "r", encoding="utf-8") as f:
+                    template_text = f.read()
+                info("Runner", "从文件加载工作流模板: %s", 工作流模板.strip())
+            except Exception as e:
+                return ("", f"⚠ 无法读取模板文件 {template_text}: {e}", False)
+
+        try:
+            workflow_raw = json.loads(template_text)
+        except json.JSONDecodeError as e:
+            return ("", f"⚠ 工作流模板JSON格式错误: {e}", False)
+
+        workflow = self._ensure_api_format(workflow_raw)
+        if not workflow:
+            return ("", "⚠ 工作流模板格式无法识别，请提供API格式或完整工作流格式", False)
+
+        info("Runner", "工作流格式: API格式, %d个节点", len(workflow))
+
+        if 生成后端 == "SCAIL-2 路线":
+            gen_adapter = SCAILAdapter(folder_paths.get_output_directory())
+            backend_name = "SCAIL-2 路线"
+        else:
+            gen_adapter = DirectAdapter(folder_paths.get_output_directory())
+            backend_name = "骨骼路线(WanVideo)"
+        info("Runner", "使用生成后端: %s（内联PromptExecutor）", backend_name)
+        node_map = gen_adapter.discover_nodes(workflow)
+        info("Runner", "节点发现结果: %s", node_map.to_dict())
+        info("Runner", "工作流节点列表: %s", list(workflow.keys()))
+
+        if not node_map.is_valid():
+            return ("", f"⚠ 工作流中缺少后端【{backend_name}】所需的必要节点。已发现: {node_map.to_dict()}", False)
+
+        log_lines = []
+        run_id = time.strftime("%Y%m%d_%H%M%S")
+        log_lines.append(f"🚀 开始链式执行: {plan.total_segments}段, 模式={plan.mode}, run_id={run_id}")
+        log_lines.append(f"📍 发现节点: {node_map.to_dict()}")
+        log_lines.append(f"📥 输入诊断: 视频路径='{视频路径}', 参考图={'已连接(IMAGE)' if 参考图 is not None else '未连接'}, 姿态图={'已连接(IMAGE)' if 姿态图 is not None else '未连接'}, 人物参考图='{人物参考图}'")
+        info("Runner", "run_id=%s, 视频路径='%s', 参考图=%s, 姿态图=%s, 人物参考图='%s'", run_id,
+             视频路径,
+             "IMAGE已连接" if 参考图 is not None else "None",
+             "IMAGE已连接" if 姿态图 is not None else "None",
+             人物参考图)
+        log_lines.append("")
+
+        if 人物参考图 and 人物参考图.strip() and not any(c in 人物参考图 for c in '.-_'):
+            try:
+                int(人物参考图.strip())
+                info("Runner", "检测到widgets_values映射错位: 人物参考图='%s' (应为文件名), 自动修正为空", 人物参考图)
+                人物参考图 = ""
+            except ValueError:
+                pass
+
+        ref_image_path = ""
+        if 参考图 is not None:
+            ref_image_path = self._save_ref_image(参考图)
+            if ref_image_path:
+                log_lines.append(f"👤 参考图（从连线获取）: {os.path.basename(ref_image_path)}")
+                info("Runner", "参考图（从连线获取）: %s", os.path.basename(ref_image_path))
+        else:
+            warn("Runner", "参考图未通过IMAGE链接传入(=None)，请检查工作流中Node30(LoadImage)→Node21(Runner)的连线是否正确")
+
+        if not ref_image_path and 人物参考图.strip():
+            input_dir = folder_paths.get_input_directory()
+            candidate = os.path.join(input_dir, 人物参考图.strip())
+            if os.path.isfile(candidate):
+                ref_image_path = candidate
+                log_lines.append(f"👤 用户参考图: {人物参考图}")
+                info("Runner", "用户参考图: %s", 人物参考图)
+
+        if not ref_image_path:
+            log_lines.append("⚠️ 未提供参考图，将使用模板默认图片")
+            warn("Runner", "未提供参考图，将使用模板默认图片")
+
+        pose_dir = ""
+        if 姿态图 is not None:
+            pose_dir = self._save_pose_images(姿态图)
+            if pose_dir:
+                log_lines.append(f"🕺 姿态图（从连线获取）: {os.path.basename(pose_dir)}")
+                info("Runner", "姿态图（从连线获取）: %s", pose_dir)
+        else:
+            warn("Runner", "姿态图未通过IMAGE链接传入(=None)，请检查工作流中Node2(PoseExtractor)→Node21(Runner)的连线是否正确")
+
+        cp = CheckpointManager(plan.mode)
+        if 执行模式 == "续跑":
+            cp_data = cp.load()
+            if cp_data:
+                起始段 = cp_data.get("current_segment", 起始段)
+                prev_frame = cp_data.get("prev_last_frame", "")
+                if prev_frame and os.path.isfile(prev_frame):
+                    ref_image_path = prev_frame
+                log_lines.append(f"🔄 续跑模式: 从段{起始段}继续")
+
+        results = []
+        prev_context = SegmentContext(last_frame_path=ref_image_path)
+        all_success = True
+
+        start_from = 起始段 if 起始段 > 0 else 0
+
+        info("Runner", "开始链式执行: %d段, 节点映射=%s", plan.total_segments, node_map.to_dict())
+
+        gen_adapter.init_executor()
+        try:
+            for seg in plan.segments:
+                if seg.index < start_from:
+                    continue
+
+                seg_start_time = time.time()
+                log_lines.append(f"▶ 段{seg.index}/{plan.total_segments - 1}: 帧{seg.start_frame}-{seg.end_frame}, {seg.target_frames}帧")
+                info("Runner", "▶ 开始段%d/%d: 帧%d-%d, %d帧", seg.index, plan.total_segments - 1,
+                     seg.start_frame, seg.end_frame, seg.target_frames)
+
+                current_ref = ""
+                if seg.ref_strategy == REF_STRATEGY_PREV_LAST_FRAME and prev_context.last_frame_path:
+                    current_ref = prev_context.last_frame_path
+                    log_lines.append(f"  🔗 使用前段末帧作为参考图")
+                elif ref_image_path and os.path.isfile(ref_image_path):
+                    current_ref = ref_image_path
+                    log_lines.append(f"  👤 使用用户参考图")
+
+                wf = gen_adapter.modify_workflow_for_segment(workflow, node_map, seg, current_ref, pose_dir, run_id, user_ref_path=ref_image_path)
+
+                success = False
+                last_error = ""
+
+                for attempt in range(最大重试 + 1):
+                    try:
+                        info("Runner", "段%d: 内联执行 (尝试%d/%d)", seg.index, attempt + 1, 最大重试 + 1)
+
+                        result = gen_adapter.execute_inline(wf, timeout=3600)
+                        status = result.get("status", "")
+
+                        if status == "success":
+                            output_path = result.get("video_path", "")
+                            last_frame = ""
+                            if output_path and os.path.isfile(output_path):
+                                last_frame = self._extract_last_frame(output_path, run_id)
+
+                            seg_duration = time.time() - seg_start_time
+                            seg_result = SegmentResult(
+                                segment_index=seg.index,
+                                video_path=output_path,
+                                last_frame_path=last_frame,
+                                status="success",
+                                prompt_id=result.get("prompt_id", ""),
+                                duration_sec=seg_duration,
+                            )
+                            results.append(seg_result)
+
+                            if last_frame:
+                                prev_context = SegmentContext(last_frame_path=last_frame)
+                                cp.save(seg.index, last_frame, [r.to_dict() for r in results])
+
+                            log_lines.append(f"  ✅ 完成! 耗时{seg_duration:.1f}s, 输出={output_path}")
+                            info("Runner", "段%d: ✅ 完成! 耗时%.1fs", seg.index, seg_duration)
+                            success = True
+                            break
+                        elif status == "timeout":
+                            last_error = f"超时(>{1800}s)"
+                            log_lines.append(f"  ⏰ 超时(尝试{attempt + 1}/{最大重试 + 1})")
+                            warn("Runner", "段%d: 超时!", seg.index)
+                        else:
+                            last_error = result.get("error", "unknown error")
+                            log_lines.append(f"  ❌ 失败(尝试{attempt + 1}/{最大重试 + 1}): {last_error[:200]}")
+                            warn("Runner", "段%d: 失败 - %s", seg.index, last_error[:300])
+
+                    except Exception as e:
+                        last_error = str(e)
+                        log_lines.append(f"  ❌ 异常(尝试{attempt + 1}/{最大重试 + 1}): {last_error[:100]}")
+                        warn("Runner", "段%d: 异常 - %s", seg.index, last_error[:100])
+
+                if not success:
+                    all_success = False
+                    results.append(SegmentResult(
+                        segment_index=seg.index,
+                        status="failed",
+                        error=last_error,
+                    ))
+                    log_lines.append(f"  🛑 段{seg.index}最终失败: {last_error[:200]}")
+                    error("Runner", "段%d: 最终失败 - %s", seg.index, last_error[:200])
+
+                    if prev_context.last_frame_path and os.path.isfile(prev_context.last_frame_path):
+                        log_lines.append(f"  ⏭ 跳过此段，继续使用上一段末帧")
+
+                log_lines.append("")
+        finally:
+            gen_adapter.cleanup_executor()
+
+        results_json = json.dumps(
+            {"run_id": run_id, "segments": [r.to_dict() for r in results]},
+            ensure_ascii=False, indent=2
+        )
+
+        total = len(results)
+        ok = sum(1 for r in results if r.status == "success")
+        log_lines.append(f"{'✅' if all_success else '⚠️'} 执行完毕: {ok}/{total}段成功")
+
+        info("Runner", "执行完毕: %d/%d段成功", ok, total)
+        node_end("Runner", f"{ok}/{total}段成功")
+
+        return (results_json, "\n".join(log_lines), all_success)
+
+    @staticmethod
+    def _ensure_api_format(workflow_raw):
+        if not isinstance(workflow_raw, dict):
+            return None
+
+        first_key = next(iter(workflow_raw), None)
+        if first_key is not None and isinstance(workflow_raw[first_key], dict):
+            if "class_type" in workflow_raw[first_key] or "type" in workflow_raw[first_key]:
+                return workflow_raw
+
+        if "nodes" in workflow_raw and "links" in workflow_raw:
+            converted = YunjiiSegmentRunner._convert_full_to_api(workflow_raw)
+            info("Runner", "工作流从完整格式转换为API格式: %d个节点", len(converted))
+            return converted
+
+        return None
+
+    @staticmethod
+    def _convert_full_to_api(full_workflow):
+        nodes_list = full_workflow.get("nodes", [])
+        links_list = full_workflow.get("links", [])
+
+        link_map = {}
+        for link in links_list:
+            if len(link) >= 5:
+                link_id = link[0]
+                src_node = str(link[1])
+                src_slot = link[2]
+                dst_node = str(link[3])
+                dst_slot = link[4]
+                link_map[link_id] = {
+                    "src_node": src_node,
+                    "src_slot": src_slot,
+                    "dst_node": dst_node,
+                    "dst_slot": dst_slot,
+                }
+
+        node_class_mappings = YunjiiSegmentRunner._get_node_class_mappings()
+
+        api_workflow = {}
+        for node in nodes_list:
+            node_id = str(node.get("id", ""))
+            class_type = node.get("type", "")
+            mode = node.get("mode", 0)
+            if mode == 4:
+                continue
+
+            inputs_def = node.get("inputs", [])
+            widgets_values = node.get("widgets_values", [])
+
+            linked_inputs = set()
+            api_inputs = {}
+
+            for inp in inputs_def:
+                inp_name = inp.get("name", "")
+                inp_type = inp.get("type", "")
+                link_id = inp.get("link")
+                if link_id is not None and link_id in link_map:
+                    link_info = link_map[link_id]
+                    api_inputs[inp_name] = [link_info["src_node"], link_info["src_slot"]]
+                    linked_inputs.add(inp_name)
+
+            widget_names = YunjiiSegmentRunner._get_widget_names(class_type, node_class_mappings)
+
+            widget_idx = 0
+            for wval in widgets_values:
+                if widget_idx < len(widget_names):
+                    wname = widget_names[widget_idx]
+                    if wname not in linked_inputs:
+                        api_inputs[wname] = wval
+                widget_idx += 1
+
+            api_workflow[node_id] = {
+                "class_type": class_type,
+                "inputs": api_inputs,
+            }
+
+        return api_workflow
+
+    @staticmethod
+    def _get_node_class_mappings():
+        try:
+            import nodes
+            return nodes.NODE_CLASS_MAPPINGS
+        except Exception:
+            pass
+        return {}
+
+    @staticmethod
+    def _get_widget_names(class_type, node_class_mappings):
+        node_cls = node_class_mappings.get(class_type)
+        if node_cls is None:
+            return []
+
+        try:
+            input_types = node_cls.INPUT_TYPES()
+            widget_names = []
+
+            for category in ["required", "optional"]:
+                cat_inputs = input_types.get(category, {})
+                for name, config in cat_inputs.items():
+                    if isinstance(config, (list, tuple)) and len(config) > 0:
+                        typ = config[0]
+                        if isinstance(typ, str) and typ in [
+                            "STRING", "INT", "FLOAT", "BOOLEAN",
+                            "COMBO", "ENUM",
+                        ]:
+                            widget_names.append(name)
+
+            return widget_names
+        except Exception:
+            return []
+
+    @staticmethod
+    def _save_ref_image(image_tensor, suffix="ref"):
+        try:
+            import folder_paths
+            input_dir = folder_paths.get_input_directory()
+            os.makedirs(input_dir, exist_ok=True)
+
+            img = image_tensor[0].cpu().numpy()
+            img = (img * 255).clip(0, 255).astype(np.uint8)
+            img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+            fname = f"yunjii_{suffix}_{int(time.time())}.png"
+            fpath = os.path.join(input_dir, fname)
+            cv2.imwrite(fpath, img_bgr)
+
+            info("Runner", "参考图已保存: %s", fpath)
+            return fpath
+        except Exception as e:
+            logger.error("保存参考图失败: %s", e)
+            return ""
+
+    @staticmethod
+    def _save_pose_images(pose_tensor):
+        try:
+            import folder_paths
+            input_dir = folder_paths.get_input_directory()
+            pose_dir = os.path.join(input_dir, f"yunjii_poses_{int(time.time())}")
+            os.makedirs(pose_dir, exist_ok=True)
+
+            num_frames = pose_tensor.shape[0]
+            h, w = pose_tensor.shape[1], pose_tensor.shape[2]
+
+            for i in range(num_frames):
+                img = pose_tensor[i].cpu().numpy()
+                img = (img * 255).clip(0, 255).astype(np.uint8)
+                img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                fname = f"pose_{i:05d}.png"
+                cv2.imwrite(os.path.join(pose_dir, fname), img_bgr)
+
+            video_path = os.path.join(pose_dir, "poses.mp4")
+            fourcc = 0
+            for codec in ["mp4v", "avc1", "H264", "XVID"]:
+                c = cv2.VideoWriter_fourcc(*codec)
+                test_writer = cv2.VideoWriter(os.path.join(pose_dir, "_test.mp4"), c, 16.0, (w, h))
+                if test_writer.isOpened():
+                    test_writer.release()
+                    fourcc = c
+                    os.remove(os.path.join(pose_dir, "_test.mp4"))
+                    break
+            if fourcc == 0:
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(video_path, fourcc, 16.0, (w, h))
+            for i in range(num_frames):
+                img = pose_tensor[i].cpu().numpy()
+                img = (img * 255).clip(0, 255).astype(np.uint8)
+                img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                writer.write(img_bgr)
+            writer.release()
+
+            info("Runner", "姿态图已保存: %s (%d帧), 视频: %s", pose_dir, num_frames, video_path)
+            return pose_dir
+        except Exception as e:
+            logger.error("保存姿态图失败: %s", e)
+            return ""
+
+    def _extract_last_frame(self, video_path, run_id=""):
+        try:
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                return ""
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if total <= 0:
+                cap.release()
+                return ""
+            cap.set(cv2.CAP_PROP_POS_FRAMES, total - 1)
+            ret, frame = cap.read()
+            cap.release()
+            if not ret:
+                return ""
+
+            output_dir = folder_paths.get_output_directory()
+            sub_dir = run_id if run_id else time.strftime("%Y%m%d_%H%M%S")
+            chain_dir = os.path.join(output_dir, "yunjii_v2v", sub_dir, "chain")
+            os.makedirs(chain_dir, exist_ok=True)
+
+            fname = f"seg_lastframe_{int(time.time())}.png"
+            path = os.path.join(chain_dir, fname)
+            cv2.imwrite(path, frame)
+            logger.info("Extracted last frame: %s", path)
+            return path
+        except Exception as e:
+            logger.error("Failed to extract last frame: %s", e)
+            return ""

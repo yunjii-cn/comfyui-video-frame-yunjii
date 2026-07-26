@@ -7,17 +7,20 @@ Copyright 2026
 import os
 import json
 import random
+import time
 import folder_paths
 import cv2
 import numpy as np
 import torch
 
+from .engine.debug_log import node_start, node_end, node_error, debug, info, warn, data_flow
+
 
 class MotionAnalysisNode:
     CATEGORY = "Yunjii/Video"
     FUNCTION = "analyze"
-    RETURN_TYPES = ("STRING", "STRING", "INT", "IMAGE", "STRING")
-    RETURN_NAMES = ("运动提示词", "分段信息", "镜头数", "关键帧", "帧信息")
+    RETURN_TYPES = ("STRING", "STRING", "INT", "IMAGE", "STRING", "STRING")
+    RETURN_NAMES = ("运动提示词", "分段信息", "镜头数", "关键帧", "帧信息", "视频路径")
     OUTPUT_NODE = True
 
     @classmethod
@@ -68,27 +71,35 @@ class MotionAnalysisNode:
                 保存关键帧=True, 视频路径="", 合并指令="", 拆分指令="", 帧偏移="",
                 人物质量词="eyes open, clear face, sharp focus", 手动选帧=""):
 
+        node_start("MotionAnalysis", 视频文件=视频文件, 分段模式=分段模式, 灵敏度=灵敏度,
+                   视频路径=视频路径, 合并指令=合并指令, 拆分指令=拆分指令, 帧偏移=帧偏移, 手动选帧=手动选帧)
+
         if 视频路径 and os.path.isfile(视频路径):
             video_path = 视频路径
         else:
             video_path = os.path.join(folder_paths.get_input_directory(), 视频文件)
 
         if not os.path.isfile(video_path):
-            return ("", f"⚠ 找不到视频文件: {video_path}", 0, torch.zeros((1, 512, 512, 3)), "")
+            node_error("MotionAnalysis", f"找不到视频文件: {video_path}")
+            return ("", f"⚠ 找不到视频文件: {video_path}", 0, torch.zeros((1, 512, 512, 3)), "", "")
 
         try:
             cap = cv2.VideoCapture(video_path)
             if not cap.isOpened():
-                return ("", "⚠ 无法打开视频", 0, torch.zeros((1, 512, 512, 3)), "")
+                node_error("MotionAnalysis", "无法打开视频")
+                return ("", "⚠ 无法打开视频", 0, torch.zeros((1, 512, 512, 3)), "", "")
 
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             fps = cap.get(cv2.CAP_PROP_FPS) or 30
             cap.release()
 
+            info("MotionAnalysis", "视频信息: %d帧, %.1ffps, %.1f秒", total_frames, fps, total_frames / fps)
+
             max_dur_frames = int(每段最大秒数 * fps) if 限制最长秒数 else total_frames
             min_dur_frames = int(每段最小秒数 * fps) if 限制最短秒数 else 0
 
             scene_boundaries = _detect_scene_boundaries(video_path, sensitivity=灵敏度, sample_step=2)
+            debug("MotionAnalysis", "检测到 %d 个镜头边界", len(scene_boundaries))
 
             if 分段模式 == "自然镜头":
                 scenes = _split_natural(total_frames, fps, max_dur_frames, min_dur_frames, scene_boundaries)
@@ -142,13 +153,13 @@ class MotionAnalysisNode:
                     except ValueError:
                         pass
 
-            all_frame_numbers = sorted(set(list(auto_frame_map.keys()) | manual_frame_set))
+            all_frame_numbers = sorted(set(auto_frame_map.keys()) | manual_frame_set)
 
             keyframes_dir = ""
             if 保存关键帧:
                 safe_name = os.path.splitext(os.path.basename(video_path))[0]
                 output_dir = folder_paths.get_output_directory()
-                keyframes_dir = os.path.join(output_dir, f"keyframes_{safe_name}")
+                keyframes_dir = os.path.join(output_dir, "yunjii_v2v", "keyframes", f"{safe_name}_{time.strftime('%Y%m%d_%H%M%S')}")
                 os.makedirs(keyframes_dir, exist_ok=True)
 
             cap = cv2.VideoCapture(video_path)
@@ -188,30 +199,21 @@ class MotionAnalysisNode:
 
             lines = []
             total_sec = total_frames / fps
-            lines.append(f"📹 视频分析: {total_frames}帧, {fps:.1f}fps, {total_sec:.1f}秒")
-            lines.append(f"🎬 {mode_desc}\n")
+            lines.append(f"📹 {total_frames}帧, {fps:.1f}fps, {total_sec:.1f}秒")
+            lines.append(f"🎬 {mode_desc}")
 
             if 保存关键帧:
-                lines.append(f"💾 已保存 {saved_count} 个关键帧到: {keyframes_dir}\n")
+                lines.append(f"💾 已保存 {saved_count} 个关键帧到: {keyframes_dir}")
 
             for i, (start, end, duration) in enumerate(scenes):
                 person = has_person[i] if i < len(has_person) else True
-                start_sec = start / fps
-                end_sec = end / fps
-                dur_sec = duration / fps
                 tag = "👤" if person else "🌅"
-                motion = motion_prompts[i] if i < len(motion_prompts) else ""
-                lines.append(f"  镜头{i+1}: {start_sec:.1f}s-{end_sec:.1f}s ({dur_sec:.1f}秒) {tag}")
-                lines.append(f"         ✅ 需要参考图 ({'人物+场景' if person else '场景'})")
-                if motion:
-                    lines.append(f"         🎬 {motion}")
+                lines.append(f"镜头{i+1}: 帧{start}-{end} {tag}")
 
             if manual_frame_set:
-                lines.append(f"\n📌 手动选帧: {len(manual_frame_set)}个额外帧")
+                lines.append(f"📌 手动选帧: {len(manual_frame_set)}个")
 
-            lines.append(f"\n📋 共 {len(all_frame_numbers)} 个关键帧 (自动{len(auto_frame_map)}+手动{len(manual_frame_set - set(auto_frame_map.keys()))})")
-            lines.append(f"\n📝 提示词 (||| 分隔):")
-            lines.append(" ||| ".join(motion_prompts))
+            lines.append(f"📋 {len(all_frame_numbers)}关键帧 (自动{len(auto_frame_map)}+手动{len(manual_frame_set - set(auto_frame_map.keys()))})")
 
             keyframe_tensor = torch.cat(keyframe_images, dim=0) if keyframe_images else torch.zeros((1, 512, 512, 3))
             frame_info = "\n".join(frame_info_lines)
@@ -222,17 +224,22 @@ class MotionAnalysisNode:
                 "prompt": motion_prompts[i] if i < len(motion_prompts) else ""
             } for i, (s, e, d) in enumerate(scenes)])
 
-            return {"ui": {"scenes": scene_json}, "result": (
+            info("MotionAnalysis", "分析完成: %d段, %d关键帧, 视频路径=%s", len(scenes), len(all_frame_numbers), video_path)
+            node_end("MotionAnalysis", f"{len(scenes)}段, {len(all_frame_numbers)}关键帧")
+
+            return {"ui": {"scenes": [scene_json]}, "result": (
                 " ||| ".join(motion_prompts),
                 "\n".join(lines),
                 len(scenes),
                 keyframe_tensor,
-                frame_info
+                frame_info,
+                video_path
             )}
 
         except Exception as e:
             import traceback
-            return ("", f"⚠ 分析失败: {e}\n{traceback.format_exc()}", 0, torch.zeros((1, 512, 512, 3)), "")
+            node_error("MotionAnalysis", f"分析失败: {e}\n{traceback.format_exc()}")
+            return ("", f"⚠ 分析失败: {e}\n{traceback.format_exc()}", 0, torch.zeros((1, 512, 512, 3)), "", "")
 
 
 class PromptControlNode:
@@ -302,6 +309,10 @@ class KeyframePreviewNode:
     RETURN_TYPES = ("IMAGE", "STRING")
     RETURN_NAMES = ("关键帧", "帧信息")
     OUTPUT_NODE = True
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -578,9 +589,29 @@ def _analyze_motion(video_path, scenes, fps=30):
 _MEDIAPIPE_AVAILABLE = False
 try:
     import mediapipe as _mp
+    from mediapipe.tasks.python.vision import PoseLandmarker, HandLandmarker, FaceLandmarker
+    from mediapipe.tasks.python.vision.core.vision_task_running_mode import VisionTaskRunningMode
+    from mediapipe.tasks.python import BaseOptions
     _MEDIAPIPE_AVAILABLE = True
 except ImportError:
     pass
+
+_MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+_MODEL_URLS = {
+    "pose_landmarker_heavy.task": "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task",
+    "hand_landmarker.task": "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task",
+    "face_landmarker.task": "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task",
+}
+
+
+def _ensure_models():
+    os.makedirs(_MODEL_DIR, exist_ok=True)
+    for name, url in _MODEL_URLS.items():
+        dest = os.path.join(_MODEL_DIR, name)
+        if not os.path.isfile(dest) or os.path.getsize(dest) < 1000:
+            import urllib.request
+            urllib.request.urlretrieve(url, dest)
+    return _MODEL_DIR
 
 _MP_TO_OPENPOSE = {
     0: 0, 12: 2, 11: 5, 14: 3, 13: 6, 16: 4, 15: 7,
@@ -634,17 +665,22 @@ def _draw_openpose(canvas, body_kps, hand_lms_list, face_lms, draw_body, draw_ha
         hand_color_r = (255, 128, 0)
         for hand_idx, hand_lms in enumerate(hand_lms_list):
             color = hand_color_l if hand_idx == 0 else hand_color_r
-            pts = [(int(lm.x * w), int(lm.y * h)) for lm in hand_lms.landmark if lm.visibility > 0.3]
+            landmarks = hand_lms.landmark if hasattr(hand_lms, "landmark") else hand_lms
+            pts = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks
+                   if lm.visibility is not None and lm.visibility > 0.3]
             for i, j in _OPENPOSE_HAND_CONNECTIONS:
-                if i < len(hand_lms.landmark) and j < len(hand_lms.landmark):
-                    p1 = hand_lms.landmark[i]
-                    p2 = hand_lms.landmark[j]
-                    if p1.visibility > 0.3 and p2.visibility > 0.3:
+                if i < len(landmarks) and j < len(landmarks):
+                    p1 = landmarks[i]
+                    p2 = landmarks[j]
+                    if (p1.visibility is not None and p1.visibility > 0.3 and
+                        p2.visibility is not None and p2.visibility > 0.3):
                         cv2.line(canvas, (int(p1.x*w), int(p1.y*h)), (int(p2.x*w), int(p2.y*h)), color, 2, cv2.LINE_AA)
             for pt in pts:
                 cv2.circle(canvas, pt, 3, color, -1, cv2.LINE_AA)
     if draw_face and face_lms:
-        face_pts = [(int(lm.x * w), int(lm.y * h)) for lm in face_lms.landmark if lm.visibility > 0.3]
+        landmarks = face_lms.landmark if hasattr(face_lms, "landmark") else face_lms
+        face_pts = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks
+                    if lm.visibility is not None and lm.visibility > 0.3]
         for pt in face_pts:
             cv2.circle(canvas, pt, 2, (0, 255, 0), -1, cv2.LINE_AA)
     return canvas
@@ -723,17 +759,12 @@ class VideoPoseExtractor:
 
     @classmethod
     def INPUT_TYPES(cls):
-        input_dir = folder_paths.get_input_directory()
-        video_files = []
-        for f in os.listdir(input_dir) if os.path.isdir(input_dir) else []:
-            if f.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.webm')):
-                video_files.append(f)
         return {
             "required": {
-                "视频文件": (sorted(video_files) if video_files else ["(无视频文件)"],
-                    {"tooltip": "选择参考视频文件"}),
-                "目标帧数": ("INT", {"default": 81, "min": 9, "max": 161, "step": 4,
-                    "tooltip": "输出帧数，需为4k+1（如81,85,89），匹配视频生成模型"}),
+                "视频文件": ("STRING", {"default": "(从连线获取)",
+                    "tooltip": "从连线获取=由运动分析节点传入视频路径；也可手动输入文件名"}),
+                "目标帧数": ("INT", {"default": 0, "min": 0, "max": 1000, "step": 4,
+                    "tooltip": "输出帧数，需为4k+1（如81,85,89）；0=自动匹配视频原始帧数"}),
                 "检测身体": ("BOOLEAN", {"default": True}),
                 "检测手部": ("BOOLEAN", {"default": True}),
                 "检测面部": ("BOOLEAN", {"default": True}),
@@ -741,53 +772,264 @@ class VideoPoseExtractor:
                     "tooltip": "对姿态关键点进行时序平滑，减少帧间抖动"}),
                 "平滑窗口": ("INT", {"default": 5, "min": 3, "max": 15, "step": 2,
                     "tooltip": "平滑窗口大小，越大越平滑但可能丢失细节"}),
-                "输出分辨率": ("INT", {"default": 512, "min": 256, "max": 1024, "step": 64}),
+                "输出分辨率": ("INT", {"default": 480, "min": 256, "max": 1024, "step": 64,
+                    "tooltip": "输出高度，宽度自动按832:480比例计算，匹配WanVideo Animate模型"}),
+                "检测引擎": ("STRING", {"default": "SDPose(高精度)",
+                    "tooltip": "SDPose(高精度)=ViTPose+YOLO；MediaPipe(快速)=快速但精度低；留空默认SDPose"}),
             },
             "optional": {
                 "视频路径": ("STRING", {"default": ""}),
             }
         }
 
-    def extract_poses(self, 视频文件, 目标帧数=81, 检测身体=True, 检测手部=True, 检测面部=True,
-                      时序平滑=True, 平滑窗口=5, 输出分辨率=512, 视频路径=""):
-        if 视频路径 and os.path.isfile(视频路径):
-            video_path = 视频路径
+    def extract_poses(self, 视频文件, 目标帧数=0, 检测身体=True, 检测手部=True, 检测面部=True,
+                      时序平滑=True, 平滑窗口=5, 输出分辨率=480, 检测引擎="SDPose(高精度)", 视频路径=""):
+        if not isinstance(视频文件, str) or not 视频文件.strip():
+            warn("PoseExtractor", "视频文件参数无效(%s=%s)，自动修正为(从连线获取)", type(视频文件).__name__, 视频文件)
+            视频文件 = "(从连线获取)"
+        if not isinstance(检测引擎, str) or 检测引擎.strip() not in ("SDPose(高精度)", "MediaPipe(快速)"):
+            warn("PoseExtractor", "检测引擎参数无效(%s=%s)，自动修正为SDPose(高精度)", type(检测引擎).__name__, 检测引擎)
+            检测引擎 = "SDPose(高精度)"
+        if not isinstance(输出分辨率, (int, float)) or 输出分辨率 < 256:
+            warn("PoseExtractor", "输出分辨率参数类型错误(%s=%s)，自动修正为480", type(输出分辨率).__name__, 输出分辨率)
+            输出分辨率 = 480
+        if not isinstance(平滑窗口, (int, float)) or 平滑窗口 < 3 or 平滑窗口 > 15:
+            warn("PoseExtractor", "平滑窗口参数类型错误(%s=%s)，自动修正为5", type(平滑窗口).__name__, 平滑窗口)
+            平滑窗口 = 5
+        if not isinstance(目标帧数, (int, float)):
+            目标帧数 = 0
+        检测身体 = bool(检测身体)
+        检测手部 = bool(检测手部)
+        检测面部 = bool(检测面部)
+        时序平滑 = bool(时序平滑)
+        输出分辨率 = int(输出分辨率)
+        平滑窗口 = int(平滑窗口)
+        目标帧数 = int(目标帧数)
+
+        node_start("PoseExtractor", 视频文件=视频文件, 目标帧数=目标帧数, 检测引擎=检测引擎, 视频路径=视频路径)
+
+        if 目标帧数 > 0:
+            目标帧数 = max(9, ((目标帧数 - 1) // 4) * 4 + 1)
+
+        out_h = 输出分辨率
+        out_w = int(输出分辨率 * 832 / 480)
+        if out_w % 64 != 0:
+            out_w = (out_w // 64) * 64
+
+        use_sdpose = "SDPose" in 检测引擎
+
+        if use_sdpose:
+            try:
+                return self._extract_poses_sdpose(
+                    视频文件, 目标帧数, 检测身体, 检测手部, 检测面部,
+                    时序平滑, 平滑窗口, out_w, out_h, 视频路径)
+            except ImportError as e:
+                warn("PoseExtractor", "SDPose不可用(%s)，回退到MediaPipe", e)
+            except FileNotFoundError as e:
+                warn("PoseExtractor", "ONNX模型未找到(%s)，回退到MediaPipe", e)
+            except Exception as e:
+                warn("PoseExtractor", "SDPose失败(%s)，回退到MediaPipe", e)
+
+        try:
+            return self._extract_poses_mediapipe(
+                视频文件, 目标帧数, 检测身体, 检测手部, 检测面部,
+                时序平滑, 平滑窗口, 输出分辨率, 视频路径)
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            node_error("PoseExtractor", f"姿态提取失败: {e}\n{tb}")
+            return (torch.zeros((目标帧数 or 9, 输出分辨率, 输出分辨率, 3)),
+                f"⚠ 姿态提取失败: {e}", 0)
+
+    def _extract_poses_sdpose(self, 视频文件, 目标帧数, 检测身体, 检测手部, 检测面部,
+                               时序平滑, 平滑窗口, out_w, out_h, 视频路径):
+        from .engine.sdpose_backend import SDPoseBackend
+
+        if 视频路径 and 视频路径.strip() and 视频路径 != "(无视频文件)":
+            candidate = os.path.join(folder_paths.get_input_directory(), 视频路径)
+            if os.path.isfile(candidate):
+                video_path = candidate
+            elif os.path.isfile(视频路径):
+                video_path = 视频路径
+            else:
+                video_path = os.path.join(folder_paths.get_input_directory(), 视频文件)
+        elif 视频文件 == "(从连线获取)" or 视频文件 == "(无视频文件)":
+            input_dir = folder_paths.get_input_directory()
+            video_exts = ('.mp4', '.avi', '.mov', '.mkv', '.webm')
+            candidates = []
+            if os.path.isdir(input_dir):
+                for f in os.listdir(input_dir):
+                    if f.lower().endswith(video_exts):
+                        fp = os.path.join(input_dir, f)
+                        candidates.append((os.path.getmtime(fp), fp))
+            if candidates:
+                candidates.sort(reverse=True)
+                video_path = candidates[0][1]
+                info("PoseExtractor", "自动选择最新视频: %s", os.path.basename(video_path))
+            else:
+                video_path = ""
         else:
             video_path = os.path.join(folder_paths.get_input_directory(), 视频文件)
 
         if not os.path.isfile(video_path):
-            return (torch.zeros((1, 输出分辨率, 输出分辨率, 3)), "⚠ 找不到视频文件", 0)
-
-        if not _MEDIAPIPE_AVAILABLE:
-            return (torch.zeros((1, 输出分辨率, 输出分辨率, 3)),
-                "⚠ 需要安装 mediapipe: pip install mediapipe", 0)
+            node_error("PoseExtractor", f"找不到视频文件: {video_path}")
+            return (torch.zeros((目标帧数 or 9, out_h, out_w, 3)),
+                f"⚠ 找不到视频文件: {video_path}", 0)
 
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
-            return (torch.zeros((1, 输出分辨率, 输出分辨率, 3)), "⚠ 无法打开视频", 0)
+            return (torch.zeros((目标帧数 or 9, out_h, out_w, 3)), "⚠ 无法打开视频", 0)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        cap.release()
+
+        if 目标帧数 <= 0:
+            目标帧数 = max(9, ((total_frames - 1) // 4) * 4 + 1)
+            info("PoseExtractor", "SDPose自动帧数: 视频原始%d帧 → 目标%d帧", total_frames, 目标帧数)
+
+        detection_files = []
+        try:
+            detection_files = folder_paths.get_filename_list("detection")
+        except (KeyError, Exception):
+            pass
+        vitpose_model = None
+        yolo_model = None
+        for f in detection_files:
+            if 'vitpose' in f.lower() and f.endswith('.onnx') and vitpose_model is None:
+                vitpose_model = f
+            if 'yolo' in f.lower() and f.endswith('.onnx') and yolo_model is None:
+                yolo_model = f
+
+        if not vitpose_model or not yolo_model:
+            missing = []
+            if not vitpose_model:
+                missing.append("ViTPose ONNX")
+            if not yolo_model:
+                missing.append("YOLO ONNX")
+            raise FileNotFoundError(f"缺少ONNX模型: {', '.join(missing)}，请下载到models/detection/目录")
+
+        vitpose_path = folder_paths.get_full_path_or_empty("detection", vitpose_model) if hasattr(folder_paths, 'get_full_path_or_empty') else None
+        yolo_path = folder_paths.get_full_path_or_empty("detection", yolo_model) if hasattr(folder_paths, 'get_full_path_or_empty') else None
+        if not vitpose_path:
+            try:
+                vitpose_path = folder_paths.get_full_path("detection", vitpose_model)
+            except (KeyError, Exception):
+                pass
+        if not yolo_path:
+            try:
+                yolo_path = folder_paths.get_full_path("detection", yolo_model)
+            except (KeyError, Exception):
+                pass
+
+        info("PoseExtractor", "SDPose引擎: ViTPose=%s, YOLO=%s", vitpose_model, yolo_model)
+
+        backend = SDPoseBackend(vitpose_path, yolo_path)
+        try:
+            pose_tensor, pose_data_str, frame_count = backend.extract_poses_from_video(
+                video_path, 目标帧数, out_w, out_h,
+                detect_body=检测身体, detect_hands=检测手部, detect_face=检测面部,
+                smooth=时序平滑, smooth_window=平滑窗口,
+            )
+        finally:
+            backend.cleanup()
+
+        if pose_tensor is None:
+            return (torch.zeros((目标帧数 or 9, out_h, out_w, 3)), "⚠ SDPose提取失败", 0)
+
+        info("PoseExtractor", "SDPose完成: %d帧, 分辨率=%dx%d", frame_count, out_w, out_h)
+        node_end("PoseExtractor", f"SDPose {frame_count}帧")
+
+        ui_data = {
+            "total_frames": [total_frames],
+            "sampled_frames": [frame_count],
+            "fps": [round(fps, 1)],
+            "duration": [round(total_frames / fps, 1) if fps > 0 else 0],
+        }
+        return {"ui": ui_data, "result": (pose_tensor, pose_data_str, frame_count)}
+
+    def _extract_poses_mediapipe(self, 视频文件, 目标帧数, 检测身体, 检测手部, 检测面部,
+                             时序平滑, 平滑窗口, 输出分辨率, 视频路径):
+
+        if 视频路径 and 视频路径.strip() and 视频路径 != "(无视频文件)":
+            candidate = os.path.join(folder_paths.get_input_directory(), 视频路径)
+            if os.path.isfile(candidate):
+                video_path = candidate
+            elif os.path.isfile(视频路径):
+                video_path = 视频路径
+            else:
+                video_path = os.path.join(folder_paths.get_input_directory(), 视频文件)
+        elif 视频文件 == "(从连线获取)" or 视频文件 == "(无视频文件)":
+            input_dir = folder_paths.get_input_directory()
+            video_exts = ('.mp4', '.avi', '.mov', '.mkv', '.webm')
+            candidates = []
+            if os.path.isdir(input_dir):
+                for f in os.listdir(input_dir):
+                    if f.lower().endswith(video_exts):
+                        fp = os.path.join(input_dir, f)
+                        candidates.append((os.path.getmtime(fp), fp))
+            if candidates:
+                candidates.sort(reverse=True)
+                video_path = candidates[0][1]
+                info("PoseExtractor", "自动选择最新视频: %s", os.path.basename(video_path))
+            else:
+                video_path = ""
+        else:
+            video_path = os.path.join(folder_paths.get_input_directory(), 视频文件)
+
+        if not os.path.isfile(video_path):
+            node_error("PoseExtractor", f"找不到视频文件: {video_path} (视频路径={视频路径}, 视频文件={视频文件})")
+            return (torch.zeros((目标帧数, 输出分辨率, 输出分辨率, 3)),
+                f"⚠ 找不到视频文件: {video_path}", 0)
+
+        if not _MEDIAPIPE_AVAILABLE:
+            return (torch.zeros((目标帧数, 输出分辨率, 输出分辨率, 3)),
+                "⚠ 需要安装 mediapipe>=0.10.15: pip install mediapipe", 0)
+
+        try:
+            model_dir = _ensure_models()
+        except Exception as e:
+            return (torch.zeros((目标帧数, 输出分辨率, 输出分辨率, 3)),
+                f"⚠ 模型下载失败: {e}", 0)
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return (torch.zeros((目标帧数, 输出分辨率, 输出分辨率, 3)), "⚠ 无法打开视频", 0)
 
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
-        目标帧数 = max(9, ((目标帧数 - 1) // 4) * 4 + 1)
 
-        mp_pose = _mp.solutions.pose.Pose(
-            static_image_mode=False,
-            model_complexity=2,
-            min_detection_confidence=0.3,
+        if 目标帧数 <= 0:
+            目标帧数 = max(9, ((total_frames - 1) // 4) * 4 + 1)
+            info("PoseExtractor", "自动帧数: 视频原始%d帧 → 目标%d帧", total_frames, 目标帧数)
+
+        info("PoseExtractor", "视频: %d帧, %.1ffps, 目标=%d帧, 路径=%s", total_frames, fps, 目标帧数, video_path)
+
+        from mediapipe.tasks.python.vision import PoseLandmarkerOptions, HandLandmarkerOptions, FaceLandmarkerOptions
+
+        pose_landmarker = PoseLandmarker.create_from_options(PoseLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=os.path.join(model_dir, "pose_landmarker_heavy.task")),
+            running_mode=VisionTaskRunningMode.VIDEO,
+            num_poses=1,
+            min_pose_detection_confidence=0.3,
+            min_pose_presence_confidence=0.3,
             min_tracking_confidence=0.3,
-        )
-        mp_hands = _mp.solutions.hands.Hands(
-            static_image_mode=False,
-            max_num_hands=2,
-            min_detection_confidence=0.3,
+        )) if 检测身体 else None
+        hand_landmarker = HandLandmarker.create_from_options(HandLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=os.path.join(model_dir, "hand_landmarker.task")),
+            running_mode=VisionTaskRunningMode.VIDEO,
+            num_hands=2,
+            min_hand_detection_confidence=0.3,
+            min_hand_presence_confidence=0.3,
             min_tracking_confidence=0.3,
-        )
-        mp_face = _mp.solutions.face_mesh.FaceMesh(
-            static_image_mode=False,
-            max_num_faces=1,
-            min_detection_confidence=0.3,
+        )) if 检测手部 else None
+        face_landmarker = FaceLandmarker.create_from_options(FaceLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=os.path.join(model_dir, "face_landmarker.task")),
+            running_mode=VisionTaskRunningMode.VIDEO,
+            num_faces=1,
+            min_face_detection_confidence=0.3,
+            min_face_presence_confidence=0.3,
             min_tracking_confidence=0.3,
-        ) if 检测面部 else None
+        )) if 检测面部 else None
 
         if total_frames <= 目标帧数:
             sample_indices = list(range(total_frames))
@@ -799,8 +1041,13 @@ class VideoPoseExtractor:
         all_hand_lms = []
         all_face_lms = []
         raw_frames = []
+        process_start = time.time()
 
-        for target_idx in sample_indices:
+        for proc_idx, target_idx in enumerate(sample_indices):
+            if proc_idx % 20 == 0:
+                elapsed = time.time() - process_start
+                info("PoseExtractor", "处理进度: %d/%d帧 (%.1fs)", proc_idx, len(sample_indices), elapsed)
+
             cap.set(cv2.CAP_PROP_POS_FRAMES, target_idx)
             ret, frame = cap.read()
             if not ret:
@@ -814,34 +1061,38 @@ class VideoPoseExtractor:
             h, w = rgb.shape[:2]
             raw_frames.append(rgb.copy())
 
-            pose_result = mp_pose.process(rgb) if 检测身体 else None
-            body_kps = _mp_to_openpose_kps(
-                pose_result.pose_landmarks.landmark if pose_result and pose_result.pose_landmarks else None,
-                w, h
-            ) if 检测身体 else [None]*19
+            ts_ms = int(target_idx / fps * 1000) if fps > 0 else target_idx * 33
+            mp_image = _mp.Image(image_format=_mp.ImageFormat.SRGB, data=rgb)
+
+            if pose_landmarker is not None:
+                pose_result = pose_landmarker.detect_for_video(mp_image, ts_ms)
+                pose_lms = pose_result.pose_landmarks[0] if pose_result.pose_landmarks else None
+                body_kps = _mp_to_openpose_kps(pose_lms, w, h)
+            else:
+                body_kps = [None]*19
             all_body_kps.append(body_kps)
 
-            if 检测手部:
-                hands_result = mp_hands.process(rgb)
-                hand_lms = []
-                if hands_result and hands_result.multi_hand_landmarks:
-                    hand_lms = list(hands_result.multi_hand_landmarks)
+            if hand_landmarker is not None:
+                hand_result = hand_landmarker.detect_for_video(mp_image, ts_ms)
+                hand_lms = list(hand_result.hand_landmarks) if hand_result.hand_landmarks else []
                 all_hand_lms.append(hand_lms)
             else:
                 all_hand_lms.append([])
 
-            if 检测面部 and mp_face is not None:
-                face_result = mp_face.process(rgb)
-                face_lms = face_result.multi_face_landmarks[0] if face_result and face_result.multi_face_landmarks else None
+            if face_landmarker is not None:
+                face_result = face_landmarker.detect_for_video(mp_image, ts_ms)
+                face_lms = face_result.face_landmarks[0] if face_result.face_landmarks else None
                 all_face_lms.append(face_lms)
             else:
                 all_face_lms.append(None)
 
         cap.release()
-        mp_pose.close()
-        mp_hands.close()
-        if mp_face is not None:
-            mp_face.close()
+        if pose_landmarker is not None:
+            pose_landmarker.close()
+        if hand_landmarker is not None:
+            hand_landmarker.close()
+        if face_landmarker is not None:
+            face_landmarker.close()
 
         if 时序平滑 and len(all_body_kps) > 2:
             all_body_kps = _smooth_kps_sequence(all_body_kps, 平滑窗口)
@@ -855,7 +1106,10 @@ class VideoPoseExtractor:
 
         pose_images = []
         pose_data_list = []
-        out_h, out_w = 输出分辨率, 输出分辨率
+        out_h = 输出分辨率
+        out_w = int(输出分辨率 * 832 / 480)
+        if out_w % 64 != 0:
+            out_w = (out_w // 64) * 64
 
         for i in range(min(len(all_body_kps), 目标帧数)):
             canvas = np.zeros((out_h, out_w, 3), dtype=np.uint8)
@@ -873,17 +1127,21 @@ class VideoPoseExtractor:
             pose_data_list.append(json.dumps(kp_data))
 
         if not pose_images:
-            return (torch.zeros((1, out_h, out_w, 3)), "⚠ 未检测到姿态", 0)
+            node_error("PoseExtractor", "未检测到姿态")
+            return (torch.zeros((目标帧数, out_h, out_w, 3)), "⚠ 未检测到姿态", 0)
 
         all_poses = torch.cat(pose_images, dim=0)
         all_pose_data = "\n".join(pose_data_list)
         frame_count = len(pose_images)
 
+        info("PoseExtractor", "姿态提取完成: %d帧, 分辨率=%d", frame_count, 输出分辨率)
+        node_end("PoseExtractor", f"{frame_count}帧")
+
         ui_data = {
-            "total_frames": total_frames,
-            "sampled_frames": frame_count,
-            "fps": round(fps, 1),
-            "duration": round(total_frames / fps, 1) if fps > 0 else 0,
+            "total_frames": [total_frames],
+            "sampled_frames": [frame_count],
+            "fps": [round(fps, 1)],
+            "duration": [round(total_frames / fps, 1) if fps > 0 else 0],
         }
         return {"ui": ui_data, "result": (all_poses, all_pose_data, frame_count)}
 
@@ -920,6 +1178,7 @@ class MimicPromptGenerator:
 
     def generate(self, 运动提示词="", 人物描述="a person", 风格关键词="cinematic, high quality, 4k",
                  质量增强=True, 自定义负面提示词=""):
+        node_start("MimicPrompt", 人物描述=人物描述, 风格关键词=风格关键词, 质量增强=质量增强)
         motion_parts = [p.strip() for p in 运动提示词.split("|||") if p.strip()] if 运动提示词 else []
         if motion_parts:
             unique_motions = list(dict.fromkeys(motion_parts))
@@ -933,7 +1192,68 @@ class MimicPromptGenerator:
 
         default_neg = "low quality, worst quality, blurry, distorted, deformed, ugly, bad anatomy, bad hands, missing fingers, extra digits, watermark, text, logo, static, jittery"
         negative = f"{default_neg}, {自定义负面提示词}" if 自定义负面提示词.strip() else default_neg
+        info("MimicPrompt", "正面提示词: %s", prompt[:100])
+        node_end("MimicPrompt")
         return (prompt, negative)
+
+
+class YunjiiLoadPoseImages:
+    CATEGORY = "Yunjii/Video/Pose"
+    FUNCTION = "load"
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("姿态图",)
+    OUTPUT_NODE = False
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "目录路径": ("STRING", {"default": "",
+                    "tooltip": "姿态PNG图片所在目录的路径"}),
+                "目标帧数": ("INT", {"default": 81, "min": 9, "max": 257, "step": 4,
+                    "tooltip": "需要输出的帧数(4k+1格式)"}),
+            }
+        }
+
+    def load(self, 目录路径="", 目标帧数=81):
+        if not 目录路径 or not os.path.isdir(目录路径):
+            warn("LoadPoseImages", "目录不存在: %s", 目录路径)
+            return (torch.zeros((目标帧数, 480, 832, 3)),)
+
+        pose_files = sorted([
+            f for f in os.listdir(目录路径)
+            if f.startswith("pose_") and f.endswith(".png")
+        ])
+
+        if not pose_files:
+            warn("LoadPoseImages", "目录中无姿态图片: %s", 目录路径)
+            return (torch.zeros((目标帧数, 480, 832, 3)),)
+
+        images = []
+        for pf in pose_files:
+            img_path = os.path.join(目录路径, pf)
+            img_bgr = cv2.imread(img_path)
+            if img_bgr is None:
+                continue
+            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            tensor = torch.from_numpy(img_rgb.astype(np.float32) / 255.0).unsqueeze(0)
+            images.append(tensor)
+
+        if not images:
+            return (torch.zeros((目标帧数, 480, 832, 3)),)
+
+        all_images = torch.cat(images, dim=0)
+        total = all_images.shape[0]
+
+        if total < 目标帧数:
+            last_frame = all_images[-1:].expand(目标帧数 - total, -1, -1, -1)
+            all_images = torch.cat([all_images, last_frame], dim=0)
+        elif total > 目标帧数:
+            indices = torch.linspace(0, total - 1, 目标帧数).long()
+            all_images = all_images[indices]
+
+        info("LoadPoseImages", "加载姿态图: %d张 → %d帧, 目录=%s", len(pose_files), all_images.shape[0], 目录路径)
+        return (all_images,)
 
 
 NODE_CLASS_MAPPINGS = {
@@ -942,6 +1262,7 @@ NODE_CLASS_MAPPINGS = {
     "KeyframePreviewNode": KeyframePreviewNode,
     "VideoPoseExtractor": VideoPoseExtractor,
     "MimicPromptGenerator": MimicPromptGenerator,
+    "YunjiiLoadPoseImages": YunjiiLoadPoseImages,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "MotionAnalysisNode": "运动分析 🔍 (Yunjii)",
@@ -949,4 +1270,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "KeyframePreviewNode": "关键帧预览 🖼 (Yunjii)",
     "VideoPoseExtractor": "姿态提取 🕺 (Yunjii)",
     "MimicPromptGenerator": "模仿提示词 🎭 (Yunjii)",
+    "YunjiiLoadPoseImages": "加载姿态图 📂 (Yunjii)",
 }
