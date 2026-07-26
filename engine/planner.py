@@ -7,6 +7,7 @@ from .types import (
     SegmentPlan, SegmentInfo,
     SEGMENT_MODE_ONE_SHOT, SEGMENT_MODE_SMART_SPLIT, SEGMENT_MODE_SLIDING_WINDOW,
     REF_STRATEGY_USER_IMAGE, REF_STRATEGY_PREV_LAST_FRAME, REF_STRATEGY_AUTO_SELECT,
+    BACKEND_WANVIDEO, BACKEND_SCAIL2,
 )
 from .debug_log import node_start, node_end, node_error, debug, info, warn
 
@@ -48,14 +49,29 @@ class YunjiiSegmentPlanner:
             "optional": {
                 "姿态数据": ("STRING", {"default": ""}),
                 "负面提示词": ("STRING", {"default": ""}),
+                "生成后端": (
+                    ["骨骼路线(WanVideo)", "SCAIL-2 路线"],
+                    {"default": "骨骼路线(WanVideo)",
+                     "tooltip": "SCAIL-2 路线自动改用「每段81帧/重叠5/步进76」的官方分块规则；需与执行节点的后端选择一致"},
+                ),
             },
         }
 
     def plan(self, 分段信息, 运动提示词, 生成模式, 每段最大帧数, 重叠帧数, 目标分辨率,
-             目标帧率, 自适应参数, 姿态数据="", 负面提示词=""):
+             目标帧率, 自适应参数, 姿态数据="", 负面提示词="", 生成后端="骨骼路线(WanVideo)"):
+
+        backend = BACKEND_SCAIL2 if 生成后端 == "SCAIL-2 路线" else BACKEND_WANVIDEO
+        if backend == BACKEND_SCAIL2:
+            # SCAIL-2 官方分块规则：每段 81 帧、段间重叠 5、有效步进 76。
+            # 覆盖用户的帧数/重叠设置，避免段边界跳帧/重影。
+            if 每段最大帧数 != 81 or 重叠帧数 != 5:
+                info("Planner", "SCAIL-2 路线：分段参数已对齐官方规则（81帧/重叠5/步进76），"
+                     "忽略用户设置 每段最大帧数=%d 重叠帧数=%d", 每段最大帧数, 重叠帧数)
+            每段最大帧数 = 81
+            重叠帧数 = 5
 
         node_start("Planner", 生成模式=生成模式, 每段最大帧数=每段最大帧数, 重叠帧数=重叠帧数,
-                   目标分辨率=目标分辨率, 目标帧率=目标帧率)
+                   目标分辨率=目标分辨率, 目标帧率=目标帧率, 生成后端=backend)
 
         if not 分段信息.strip():
             node_error("Planner", "未提供分段信息")
@@ -89,6 +105,10 @@ class YunjiiSegmentPlanner:
                 seg_frames, steps, cfg = self._adaptive_params(complexity, 每段最大帧数)
             else:
                 seg_frames, steps, cfg = 每段最大帧数, 30, 6.0
+
+            # SCAIL-2 路线：段长必须固定 81（官方分块），自适应只调 steps/cfg 不调帧数
+            if backend == BACKEND_SCAIL2:
+                seg_frames = 每段最大帧数
 
             if duration <= 每段最大帧数:
                 seg_frames = 每段最大帧数
@@ -159,6 +179,7 @@ class YunjiiSegmentPlanner:
             resolution=[width, height],
             target_fps=目标帧率,
             segments=segments,
+            backend=backend,
         )
 
         plan_json = plan.to_json()

@@ -10,6 +10,8 @@ from .types import (
     SegmentResult,
     STITCH_HARD_CUT, STITCH_CROSS_DISSOLVE, STITCH_AUTO,
 )
+from .pipeline import build_pipeline
+from .effects.base import EffectContext
 from .debug_log import node_start, node_end, node_error, debug, info, warn
 
 logger = logging.getLogger(__name__)
@@ -41,10 +43,12 @@ class YunjiiSegmentStitcher:
             },
             "optional": {
                 "音频源": ("STRING", {"default": "", "tooltip": "原始参考视频路径，用于提取音频"}),
+                "效果模块": ("STRING", {"default": "", "multiline": True,
+                    "tooltip": "可选效果管线模块列表(JSON数组或逗号分隔)，如 [\"mimic\"]。为空=不启用，行为与现状完全一致。支持: mimic"}),
             },
         }
 
-    def stitch(self, 执行结果, 拼接模式, 淡化帧数, 输出文件名, 音频源=""):
+    def stitch(self, 执行结果, 拼接模式, 淡化帧数, 输出文件名, 音频源="", 效果模块=""):
         node_start("Stitcher", 拼接模式=拼接模式, 淡化帧数=淡化帧数, 输出文件名=输出文件名)
 
         if not 执行结果.strip():
@@ -85,6 +89,15 @@ class YunjiiSegmentStitcher:
         report_lines.append(f"🎬 开始拼接 {len(videos)} 个视频片段")
         report_lines.append(f"📋 拼接模式: {拼接模式}")
 
+        # 效果管线：拼接侧 transform_stitch。空「效果模块」→ 空管线 → 透传，零回归。
+        effect_pipeline = build_pipeline(效果模块)
+        if not effect_pipeline.is_empty:
+            sp = {"mode": 拼接模式, "fade_frames": 淡化帧数, "add_audio": bool(音频源)}
+            sp = effect_pipeline.transform_stitch(sp, EffectContext(metadata={"audio": 音频源}))
+            拼接模式 = sp.get("mode", 拼接模式)
+            淡化帧数 = int(sp.get("fade_frames", 淡化帧数))
+            info("Stitcher", "已应用效果模块: %s", effect_pipeline.describe())
+
         try:
             output_path = self._stitch_videos(videos, 拼接模式, 淡化帧数, 输出文件名, report_lines, run_id)
         except Exception as e:
@@ -97,6 +110,14 @@ class YunjiiSegmentStitcher:
                 report_lines.append(f"🎵 已添加原始音频")
             except Exception as e:
                 report_lines.append(f"⚠ 音频添加失败: {e}")
+
+        # 效果管线：拼接后 transform_output（增强模块插帧/超分作用于最终成片）。空管线透传。
+        if not effect_pipeline.is_empty and output_path and os.path.isfile(output_path):
+            enhanced = effect_pipeline.transform_output(output_path, EffectContext(metadata={"audio": 音频源}))
+            if enhanced and enhanced != output_path:
+                output_path = enhanced
+                report_lines.append(f"✨ 已应用增强后处理: {os.path.basename(output_path)}")
+                info("Stitcher", "增强后输出: %s", output_path)
 
         report_lines.append(f"\n✅ 最终输出: {output_path}")
         info("Stitcher", "拼接完成: %s", output_path)

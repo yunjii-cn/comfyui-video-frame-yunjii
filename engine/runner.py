@@ -13,10 +13,13 @@ import folder_paths
 from .types import (
     SegmentPlan, SegmentResult, SegmentContext,
     SEGMENT_MODE_ONE_SHOT, REF_STRATEGY_PREV_LAST_FRAME,
+    BACKEND_WANVIDEO, BACKEND_SCAIL2,
 )
 from .adapters.direct import DirectAdapter
 from .adapters.scail import SCAILAdapter
 from .checkpoint import CheckpointManager
+from .pipeline import build_pipeline, EffectPipeline
+from .effects.base import EffectContext
 from .debug_log import node_start, node_end, node_error, debug, info, warn, error
 
 logger = logging.getLogger(__name__)
@@ -60,10 +63,12 @@ class YunjiiSegmentRunner:
                 "姿态图": ("IMAGE", {"tooltip": "姿态引导图（从VideoPoseExtractor节点连线传入）"}),
                 "人物参考图": ("STRING", {"default": "", "tooltip": "参考图文件名（input目录下），连线传入参考图时此项可忽略"}),
                 "起始段": ("INT", {"default": 0, "min": 0, "max": 100}),
+                "效果模块": ("STRING", {"default": "", "multiline": True,
+                    "tooltip": "可选效果管线模块列表(JSON数组或逗号分隔)，如 [\"mimic\"]。为空=不启用任何效果，行为与现状完全一致。支持: mimic"}),
             },
         }
 
-    def run(self, 段落计划, 工作流模板, 执行模式, 最大重试, 生成后端="骨骼路线(WanVideo)", 视频路径="", 参考图=None, 姿态图=None, 人物参考图="", 起始段=0, ComfyUI地址="127.0.0.1:8188"):
+    def run(self, 段落计划, 工作流模板, 执行模式, 最大重试, 生成后端="骨骼路线(WanVideo)", 视频路径="", 参考图=None, 姿态图=None, 人物参考图="", 起始段=0, 效果模块="", ComfyUI地址="127.0.0.1:8188"):
         node_start("Runner", 执行模式=执行模式, 最大重试=最大重试, ComfyUI地址=ComfyUI地址)
         info("Runner", "参数诊断: 段落计划类型=%s, 工作流模板类型=%s, 视频路径='%s', 参考图类型=%s, 姿态图类型=%s, 人物参考图='%s', 起始段=%s, ComfyUI地址='%s'",
              type(段落计划).__name__, type(工作流模板).__name__,
@@ -80,6 +85,37 @@ class YunjiiSegmentRunner:
             plan = SegmentPlan.from_json(段落计划)
         except Exception as e:
             return ("", f"⚠ 解析段落计划失败: {e}", False)
+
+        # 后端一致性校验：plan 中记录的 backend 必须与本次执行选择的后端一致，
+        # 否则分段规则（骨骼路线 4k+1 vs SCAIL-2 81/5/76）不匹配会导致画面崩溃。
+        plan_backend = getattr(plan, "backend", BACKEND_WANVIDEO)
+        exec_backend = BACKEND_SCAIL2 if 生成后端 == "SCAIL-2 路线" else BACKEND_WANVIDEO
+        if plan_backend != exec_backend:
+            plan_label = "SCAIL-2 路线" if plan_backend == BACKEND_SCAIL2 else "骨骼路线(WanVideo)"
+            exec_label = "SCAIL-2 路线" if exec_backend == BACKEND_SCAIL2 else "骨骼路线(WanVideo)"
+            node_error("Runner", "后端不匹配: 段落计划由[%s]生成，但本次执行选择了[%s]", plan_label, exec_label)
+            return ("", f"⚠ 后端不匹配：段落计划是按【{plan_label}】规划的，"
+                        f"但本次执行选择了【{exec_label}】。\n"
+                        f"两种路线的分段规则不同（骨骼 4k+1 / SCAIL-2 81帧·重叠5），混用会崩。\n"
+                        f"请重新规划，或将执行后端改回与规划一致。", False)
+
+        # 效果管线：生成前对每段 prompt / params 应用已启用模块。
+        # 空「效果模块」→ 空管线 → 透传，输出与现状完全一致（零回归）。
+        effect_pipeline = build_pipeline(效果模块)
+        if not effect_pipeline.is_empty:
+            ctx = EffectContext(
+                prompts=[s.prompt for s in plan.segments],
+                params=[s.params for s in plan.segments],
+                metadata={"backend": plan.backend},
+            )
+            new_prompts = effect_pipeline.transform_prompts([s.prompt for s in plan.segments], ctx)
+            new_params = effect_pipeline.transform_params([s.params for s in plan.segments], ctx)
+            for i, seg in enumerate(plan.segments):
+                if i < len(new_prompts):
+                    seg.prompt = new_prompts[i]
+                if i < len(new_params):
+                    seg.params = new_params[i]
+            info("Runner", "已应用效果模块: %s", effect_pipeline.describe())
 
         if 执行模式 == "仅规划":
             summary = f"📋 仅规划模式，共 {plan.total_segments} 段\n"

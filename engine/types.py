@@ -46,6 +46,7 @@ class SegmentPlan:
     target_fps: int = 16
     segments: list = field(default_factory=list)
     effects: list = field(default_factory=list)
+    backend: str = "wanvideo"  # BACKEND_WANVIDEO / BACKEND_SCAIL2
 
     def to_json(self):
         return json.dumps({
@@ -53,6 +54,7 @@ class SegmentPlan:
             "total_segments": self.total_segments,
             "resolution": self.resolution,
             "target_fps": self.target_fps,
+            "backend": self.backend,
             "segments": [s.to_dict() if isinstance(s, SegmentInfo) else s for s in self.segments],
         }, ensure_ascii=False, indent=2)
 
@@ -71,6 +73,7 @@ class SegmentPlan:
             resolution=data.get("resolution", [832, 480]),
             target_fps=data.get("target_fps", 16),
             segments=segments,
+            backend=data.get("backend", "wanvideo"),
         )
 
 
@@ -129,6 +132,10 @@ STITCH_AUTO = "auto"
 SEGMENT_MODE_ONE_SHOT = "one_shot"
 SEGMENT_MODE_SMART_SPLIT = "smart_split"
 SEGMENT_MODE_SLIDING_WINDOW = "sliding_window"
+
+# 生成后端标识（SegmentPlan.backend）
+BACKEND_WANVIDEO = "wanvideo"   # 骨骼路线：4k+1 帧规则
+BACKEND_SCAIL2 = "scail2"       # SCAIL-2 路线：每段 81 帧、重叠 5、有效步进 76
 
 REF_STRATEGY_USER_IMAGE = "user_image"
 REF_STRATEGY_PREV_LAST_FRAME = "prev_last_frame"
