@@ -14,7 +14,6 @@ from .types import (
     SegmentPlan, SegmentResult, SegmentContext,
     SEGMENT_MODE_ONE_SHOT, REF_STRATEGY_PREV_LAST_FRAME,
 )
-from .adapters.comfyui import ComfyUIAdapter
 from .adapters.direct import DirectAdapter
 from .adapters.scail import SCAILAdapter
 from .checkpoint import CheckpointManager
@@ -61,7 +60,6 @@ class YunjiiSegmentRunner:
                 "姿态图": ("IMAGE", {"tooltip": "姿态引导图（从VideoPoseExtractor节点连线传入）"}),
                 "人物参考图": ("STRING", {"default": "", "tooltip": "参考图文件名（input目录下），连线传入参考图时此项可忽略"}),
                 "起始段": ("INT", {"default": 0, "min": 0, "max": 100}),
-                "ComfyUI地址": ("STRING", {"default": "127.0.0.1:8188"}),
             },
         }
 
