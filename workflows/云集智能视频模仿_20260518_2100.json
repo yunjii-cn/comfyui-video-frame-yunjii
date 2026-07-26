@@ -69,7 +69,7 @@
         {"name": "wan_t5_model", "type": "WANTEXTENCODER", "links": [3], "slot_index": 0}
       ],
       "properties": {"Node name for S&R": "LoadWanVideoT5TextEncoder"},
-      "widgets_values": ["umt5_xxl_fp8_e4m3fn_scaled.safetensors", "bf16", "offload_device", "disabled"]
+      "widgets_values": ["Wan\\umt5_xxl_fp16.safetensors", "bf16", "offload_device", "disabled"]
     },
     {
       "id": 5,
@@ -185,7 +185,7 @@
         {"name": "model", "type": "WANVIDEOMODEL", "links": [12], "slot_index": 0}
       ],
       "properties": {"Node name for S&R": "WanVideoModelLoader"},
-      "widgets_values": ["Wan2_2-Animate-14B_fp8_scaled_e4m3fn_KJ_v2.safetensors", "bf16", "disabled", "offload_device", "sdpa"]
+      "widgets_values": ["Wan\\Wan2_2_Animate_14B_Q8_0.gguf", "bf16", "disabled", "offload_device", "sdpa"]
     },
     {
       "id": 12,
