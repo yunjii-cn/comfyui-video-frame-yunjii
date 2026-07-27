@@ -38,6 +38,46 @@ TRANSITION_PRESETS = {
     "轻叠化": (STITCH_CROSS_DISSOLVE, 10),
 }
 
+# ffmpeg xfade 高级转场：中文友好名 → ffmpeg xfade transition 名。
+# 选「无(旧转场)」("") 表示禁用 xfade、沿用旧 cv2 fade（默认，零回归）。
+# 选了具体值后，transform_stitch 输出 xfade=<ffmpeg名> + xfade_duration，
+# 由 stitcher 在 ffmpeg 可用时走 xfade 真交叉溶解（更稳更好看），失败自动回退旧 fade。
+# 也接受直接传原始 ffmpeg xfade 名（如 "circlecrop"），便于 JSON 配置精确控制。
+XFADE_PRESETS = {
+    "无(旧转场)": "",
+    "叠化 fade": "fade",
+    "溶解 dissolve": "dissolve",
+    "光圈展开 circlecrop": "circlecrop",
+    "光圈收拢 circleclose": "circleclose",
+    "左擦除 wipeleft": "wipeleft",
+    "右擦除 wiperight": "wiperight",
+    "上擦除 wipeup": "wipeup",
+    "下擦除 wipedown": "wipedown",
+    "左滑 slideleft": "slideleft",
+    "右滑 slideright": "slideright",
+    "上滑 slideup": "slideup",
+    "下滑 slidedown": "slidedown",
+    "像素化 pixelize": "pixelize",
+    "径向 radial": "radial",
+    "闪白 fadewhite": "fadewhite",
+    "渐灰 fadegrays": "fadegrays",
+    "对角↘ diagbr": "diagbr",
+    "对角↖ diagtl": "diagtl",
+}
+_XFADE_NAMES = {v for v in XFADE_PRESETS.values() if v}
+
+
+def _normalize_xfade(x):
+    """中文友好键 → ffmpeg 名；原始 ffmpeg 名原样接受；其余（含空）→ 禁用。"""
+    if not x:
+        return ""
+    if x in XFADE_PRESETS:
+        return XFADE_PRESETS[x]
+    if x in _XFADE_NAMES:
+        return x
+    return ""
+
+
 # 电影调色预设：ffmpeg libavfilter 标准滤镜链（缺滤镜/失败则跳过，返回原片）。
 # 仅用 eq / colorbalance / vignette / hue 这些几乎所有 ffmpeg 构建都带的基础滤镜，降低环境依赖风险。
 CINEMATIC_GRADES = {
@@ -62,6 +102,8 @@ class CinematicModule(EffectModule):
     - 运镜预设 → transform_prompts：给每段 prompt 追加相机运动描述（与 mimic 的身份后缀叠加，
       且带「已存在则不重复追加」保护，可反复跑不叠加）；
     - 转场预设 → transform_stitch：映射为 (mode, fade_frames)，扩展 stitcher 的交叉淡化为转场模板库；
+      另新增 xfade 高级转场（光圈/闪白/像素化/擦除等，走 ffmpeg xfade，更稳更好看，失败自动回退旧 fade），
+      默认关闭、不影响旧行为；
     - 电影调色 → transform_output：对最终成片经 ffmpeg 做色彩分级（缺 ffmpeg / 失败返回原片，零回归）。
 
     默认不含调色（grade="none"），需显式开启；transform_params 默认透传，
@@ -74,10 +116,13 @@ class CinematicModule(EffectModule):
     stage = 15
     name = "cinematic"
 
-    def __init__(self, preset="电影感", transition="叠化", grade="none",
+    def __init__(self, preset="电影感", transition="叠化", xfade="无(旧转场)",
+                 xfade_duration=0.5, grade="none",
                  stabilize=False, ffmpeg="ffmpeg", timeout=300):
         self.preset = preset if preset in CAMERA_MOTION_PRESETS else "电影感"
         self.transition = transition if transition in TRANSITION_PRESETS else "叠化"
+        self.xfade = _normalize_xfade(xfade)  # 空串=禁用(旧 fade)；否则 ffmpeg xfade 名
+        self.xfade_duration = max(0.1, float(xfade_duration))
         self.grade = grade if grade in CINEMATIC_GRADES else "none"
         self.stabilize = bool(stabilize)
         self.ffmpeg = ffmpeg
@@ -118,10 +163,18 @@ class CinematicModule(EffectModule):
     def transform_stitch(self, stitch_plan, context: EffectContext):
         if not stitch_plan:
             return stitch_plan
-        mode, fade = TRANSITION_PRESETS.get(self.transition, TRANSITION_PRESETS["叠化"])
         sp = dict(stitch_plan)
-        sp["mode"] = mode
-        sp["fade_frames"] = fade
+        if self.xfade:
+            # 新路径：xfade 真交叉溶解。强制把 mode/fade_frames 设为交叉淡化作为失败回退
+            # （避免上游传入 hard_cut 时 xfade 失败却无任何过渡）。
+            sp["xfade"] = self.xfade
+            sp["xfade_duration"] = self.xfade_duration
+            sp["mode"] = STITCH_CROSS_DISSOLVE
+            sp["fade_frames"] = 12
+        else:
+            mode, fade = TRANSITION_PRESETS.get(self.transition, TRANSITION_PRESETS["叠化"])
+            sp["mode"] = mode
+            sp["fade_frames"] = fade
         return sp
 
     # ---------- 调色：transform_output（ffmpeg，安全降级）----------

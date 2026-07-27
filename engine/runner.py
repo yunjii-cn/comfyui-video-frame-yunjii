@@ -64,7 +64,7 @@ class YunjiiSegmentRunner:
                 "人物参考图": ("STRING", {"default": "", "tooltip": "参考图文件名（input目录下），连线传入参考图时此项可忽略"}),
                 "起始段": ("INT", {"default": 0, "min": 0, "max": 100}),
                 "效果模块": ("STRING", {"default": "", "multiline": True,
-                    "tooltip": "可选效果管线模块列表(JSON数组或逗号分隔)，如 [\"mimic\"]。为空=不启用任何效果，行为与现状完全一致。支持: mimic"}),
+                    "tooltip": "可选效果管线模块列表(JSON数组或逗号分隔)，如 [\"mimic\"]。为空=不启用任何效果，行为与现状完全一致。支持: mimic, cinematic, enhance, creative（cinematic 可设 xfade 高级转场）"}),
             },
         }
 

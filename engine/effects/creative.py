@@ -1,9 +1,35 @@
+import importlib.util
 import logging
+import sys
 
 from .base import EffectModule, EffectContext
 from ..types import STITCH_HARD_CUT, STITCH_CROSS_DISSOLVE
 
 logger = logging.getLogger(__name__)
+
+
+def _detect_librosa() -> bool:
+    """仅探测、不导入：判断 librosa 是否可 import。
+
+    与 ``import librosa`` 语义一致——已在 sys.modules 中、或 find_spec 能解析都算可用。
+    刻意不顶层 import librosa——它拉 numpy/scipy/numba 等大依赖，
+    未安装时本模块照常可导入/可组合；装好后重启 ComfyUI 即生效。
+    """
+    try:
+        if sys.modules.get("librosa") is not None:
+            return True
+        return importlib.util.find_spec("librosa") is not None
+    except Exception:
+        return False
+
+
+def rhythm_reconstruction_available() -> bool:
+    """供节点 / 贯穿节点展示：本环境是否已安装 librosa（音频驱动节奏重建可用）。
+
+    每次调用都重新探测，装好 librosa 并重启后即为 True（无需改代码）。
+    启用命令（在 ComfyUI 的 Python 环境里）：pip install librosa
+    """
+    return _detect_librosa()
 
 
 # 创意节奏预设：映射为 stitcher 的 (mode, fade_frames)。
@@ -51,6 +77,10 @@ class CreativeModule(EffectModule):
 
     依赖评估：librosa 本身几 MB，但会拉 numpy/scipy/numba/soundfile/resampy 等，在已有 torch/numpy 的
     ComfyUI 环境里边际增量约 100–200MB。是否安装由你决定；不装也能用 PACING 预设。
+
+    启用真实节奏重建：在 ComfyUI 的 Python 环境执行 ``pip install librosa`` 并重启 ComfyUI 即可，
+    无需改任何代码（``rhythm_reconstruction_available()`` 会变为 True）。模块导入时不触碰 librosa，
+    未安装不影响导入与组合。
     """
 
     stage = 30
@@ -67,10 +97,16 @@ class CreativeModule(EffectModule):
         """返回长度=num_segments 的逐段运动描述列表；任何失败返回 None。"""
         if not audio_path or num_segments <= 0:
             return None
+        if not _detect_librosa():  # 先探测，避免每次都抛异常刷 warning
+            logger.info(
+                "CreativeModule: 未安装 librosa，跳过音频节奏分析（仅应用 pacing 预设）。"
+                "启用真实节奏重建：在 ComfyUI 的 Python 环境执行 `pip install librosa` 后重启。"
+            )
+            return None
         try:
             import librosa  # 惰性：未安装则跳到 except
         except Exception:
-            logger.warning("CreativeModule: 未安装 librosa，跳过音频节奏分析（仅应用 pacing 预设）")
+            logger.warning("CreativeModule: librosa 探测通过但导入失败，跳过音频节奏分析")
             return None
         try:
             y, sr = librosa.load(audio_path, sr=22050, duration=600)
@@ -120,8 +156,11 @@ class CreativeModule(EffectModule):
     def transform_stitch(self, stitch_plan, context: EffectContext):
         if not stitch_plan:
             return stitch_plan
-        mode, fade = PACING_PRESETS.get(self.pacing, PACING_PRESETS["顺滑"])
         sp = dict(stitch_plan)
+        # cinematic(stage=15) 已选 xfade 高级转场时，保留不覆盖（xfade 优先级高于 pacing 的普通淡入淡出）。
+        if sp.get("xfade"):
+            return sp
+        mode, fade = PACING_PRESETS.get(self.pacing, PACING_PRESETS["顺滑"])
         sp["mode"] = mode
         sp["fade_frames"] = fade
         return sp

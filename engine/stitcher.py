@@ -2,6 +2,7 @@ import os
 import json
 import time
 import logging
+import subprocess
 import cv2
 import numpy as np
 import folder_paths
@@ -15,6 +16,31 @@ from .effects.base import EffectContext
 from .debug_log import node_start, node_end, node_error, debug, info, warn
 
 logger = logging.getLogger(__name__)
+
+
+def _build_xfade_filter(durations, xfade, dur):
+    """纯函数：根据各段时长构造 ffmpeg xfade 链式 filter_complex。
+
+    对 N 段视频，xfade 需逐对串联：第 i 次 xfade 的 offset = 当前已合并时长 - 转场时长。
+    返回 (filter_complex 字符串, 最后一个输出 label)。各段时长必须 > dur，否则抛 ValueError。
+    """
+    if len(durations) < 2:
+        raise ValueError("xfade 至少需要 2 段视频")
+    parts = []
+    labels = ["0"]
+    acc = durations[0]
+    for i in range(1, len(durations)):
+        offset = acc - dur
+        if offset <= 0:
+            raise ValueError(f"段时长过短({durations[i-1]:.2f}s)，无法容纳 {dur:.2f}s xfade")
+        prev = labels[-1]
+        out_label = f"x0{i}"
+        parts.append(
+            f"[{prev}][{i}]xfade=transition={xfade}:duration={dur:.3f}:offset={offset:.3f}[{out_label}]"
+        )
+        acc = acc + durations[i] - dur
+        labels.append(out_label)
+    return ";".join(parts), labels[-1]
 
 
 class YunjiiSegmentStitcher:
@@ -44,7 +70,7 @@ class YunjiiSegmentStitcher:
             "optional": {
                 "音频源": ("STRING", {"default": "", "tooltip": "原始参考视频路径，用于提取音频"}),
                 "效果模块": ("STRING", {"default": "", "multiline": True,
-                    "tooltip": "可选效果管线模块列表(JSON数组或逗号分隔)，如 [\"mimic\"]。为空=不启用，行为与现状完全一致。支持: mimic"}),
+                    "tooltip": "可选效果管线模块列表(JSON数组或逗号分隔)，如 [\"mimic\"]。为空=不启用，行为与现状完全一致。支持: mimic, cinematic, enhance, creative（cinematic 可设 xfade 高级转场）"}),
             },
         }
 
@@ -91,15 +117,25 @@ class YunjiiSegmentStitcher:
 
         # 效果管线：拼接侧 transform_stitch。空「效果模块」→ 空管线 → 透传，零回归。
         effect_pipeline = build_pipeline(效果模块)
+        xfade = ""
+        xfade_duration = 0.5
         if not effect_pipeline.is_empty:
             sp = {"mode": 拼接模式, "fade_frames": 淡化帧数, "add_audio": bool(音频源)}
             sp = effect_pipeline.transform_stitch(sp, EffectContext(metadata={"audio": 音频源}))
             拼接模式 = sp.get("mode", 拼接模式)
             淡化帧数 = int(sp.get("fade_frames", 淡化帧数))
+            xfade = sp.get("xfade", "") or ""
+            try:
+                xfade_duration = float(sp.get("xfade_duration", 0.5))
+            except (TypeError, ValueError):
+                xfade_duration = 0.5
             info("Stitcher", "已应用效果模块: %s", effect_pipeline.describe())
 
         try:
-            output_path = self._stitch_videos(videos, 拼接模式, 淡化帧数, 输出文件名, report_lines, run_id)
+            output_path = self._stitch_videos(
+                videos, 拼接模式, 淡化帧数, 输出文件名, report_lines, run_id,
+                xfade=xfade, xfade_duration=xfade_duration,
+            )
         except Exception as e:
             logger.error("Stitch failed: %s", e)
             return ("", f"⚠ 拼接失败: {e}")
@@ -124,7 +160,8 @@ class YunjiiSegmentStitcher:
         node_end("Stitcher", f"输出: {output_path}")
         return (output_path, "\n".join(report_lines))
 
-    def _stitch_videos(self, video_paths, mode, fade_frames, output_prefix, report, run_id=""):
+    def _stitch_videos(self, video_paths, mode, fade_frames, output_prefix, report, run_id="",
+                       xfade="", xfade_duration=0.5):
         output_dir = folder_paths.get_output_directory()
         sub_dir = run_id if run_id else time.strftime("%Y%m%d_%H%M%S")
         yunjii_dir = os.path.join(output_dir, "yunjii_v2v", sub_dir)
@@ -132,6 +169,17 @@ class YunjiiSegmentStitcher:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         output_name = f"{output_prefix}_{timestamp}.mp4"
         output_path = os.path.join(yunjii_dir, output_name)
+
+        # ffmpeg xfade 高级转场：仅在显式开启且多段时尝试；任何失败都回退下面的旧 cv2 淡化（零回归）。
+        if xfade and len(video_paths) > 1:
+            try:
+                return self._stitch_videos_xfade(
+                    video_paths, xfade, xfade_duration, output_path, report, run_id
+                )
+            except Exception as e:
+                logger.warning("Stitcher: xfade 失败，回退普通淡化: %s", e)
+                report.append(f"⚠ xfade 转场失败，已回退普通淡化: {e}")
+                mode = STITCH_CROSS_DISSOLVE
 
         ref_cap = cv2.VideoCapture(video_paths[0])
         fps = ref_cap.get(cv2.CAP_PROP_FPS) or 16.0
@@ -177,6 +225,44 @@ class YunjiiSegmentStitcher:
         writer.release()
 
         report.append(f"  总帧数: {len(all_frames)}, 时长: {len(all_frames) / fps:.1f}s")
+        return output_path
+
+    def _stitch_videos_xfade(self, video_paths, xfade, dur, output_path, report, run_id=""):
+        """ffmpeg xfade 真交叉溶解路径：逐段串联（比 cv2 帧级混合更稳、支持光圈/擦除等高级转场）。
+
+        各段需同分辨率/帧率（本管线生成段天然一致）；转场时长 dur 必须 < 每段时长，否则抛错由调用方回退。
+        """
+        durations = []
+        for vp in video_paths:
+            cap = cv2.VideoCapture(vp)
+            fps = cap.get(cv2.CAP_PROP_FPS) or 16.0
+            n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            cap.release()
+            d = (n / fps) if (fps and n > 0) else 0.0
+            if d <= dur:
+                raise ValueError(f"段时长 {d:.2f}s ≤ 转场时长 {dur:.2f}s，无法用 xfade")
+            durations.append(d)
+
+        filter_complex, last_label = _build_xfade_filter(durations, xfade, dur)
+        inputs = []
+        for vp in video_paths:
+            inputs += ["-i", vp]
+        cmd = (
+            ["ffmpeg", "-y"]
+            + inputs
+            + ["-filter_complex", filter_complex, "-map", f"[{last_label}]",
+               "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+               "-pix_fmt", "yuv420p", output_path]
+        )
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        except FileNotFoundError:
+            raise RuntimeError("未找到 ffmpeg，无法执行 xfade 转场")
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("ffmpeg xfade 超时")
+        if result.returncode != 0 or not os.path.isfile(output_path):
+            raise RuntimeError("ffmpeg xfade 失败: " + (result.stderr or "")[-400:])
+        report.append(f"✨ 已用 ffmpeg xfade 转场（{xfade}，{dur:.2f}s）")
         return output_path
 
     def _read_all_frames(self, video_path, target_w, target_h):
