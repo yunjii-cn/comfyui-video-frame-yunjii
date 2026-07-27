@@ -98,6 +98,17 @@ SCAIL-2 **已是 ComfyUI 原生内置节点**(`WanSCAILToVideo` / `SCAIL2Colored
 
 > 结论:**接口联通已验证(静态+桩),但真实 widget 名需本机跑通后回填这张表**——这是唯一的"最后一公里",且是纯字段对齐,改动量很小。
 
+### 四·补、M0 代码骨架（2026-07-27 已落地，待真模型回填字段）
+
+为把"最后一公里"变成可机械执行，已做两件事：
+
+1. **`engine/adapters/scail.py` 字段集中化**：新增 `SCAIL_FIELD_MAP`（pose_video / reference_image / previous_frames / previous_frame_count / segment_index / frame_count / prompt / replace_mode / width / height）+ `SCAIL_SEG_LEN=81 / SCAIL_OVERLAP=5 / SCAIL_STEP=76` 常量。所有核心节点字段赋值都走这张表，**回填时只改 `SCAIL_FIELD_MAP` 一处，不动逻辑**。同时补上了此前缺失的 `previous_frame_count`（= seg.overlap_prev 或 5），这是段间 5 帧重叠连续串联必需的字段。
+   - 驱动偏移维持 `skip_first_frames = seg.start_frame`：planner 在 SCAIL-2 路线下已算出 `sub_start = start + 76×sub_idx`，即 `seg.start_frame` 本就是 76×index 步进——数学已对齐，无需改。
+2. **`M0_validate_scail_fields.py`（仓库根目录）**：在本机 ComfyUI 跑一次，自动拉取 `WanSCAILToVideo` 等节点的真实 INPUT_TYPES，与 `SCAIL_FIELD_MAP` 逐项比对，精确标出哪些字段存在、哪些改名。把"猜字段"变成"跑脚本拿真实清单"。
+   - 用法：`python M0_validate_scail_fields.py --url http://127.0.0.1:8188`
+   - 跑通后：把脚本输出的真实字段清单与 `SCAIL_FIELD_MAP` 对齐 → 端到端验证 runner（SCAIL-2 路线）→ 通过即把 SCAIL 路线设为默认后端。
+   - **沙箱结构验证已通过**：新增 `.workbuddy/verify_m0_scail.py`，桩掉 cv2/numpy/folder_paths 后真导入 `SCAILAdapter`，构造 7 类节点模板 + 首段/后续段 `SegmentInfo`，断言核心节点字段映射、首段身份注入、后续段 `previous_frames` 串联、`previous_frame_count=5`、驱动偏移 `skip_first_frames=76×index`、深拷贝不污染原 workflow——**35/35 全 PASS**。证明字段集中化与偏移数学结构正确（字段*值*仍待真模型回填，但脚手架逻辑已验证）。
+
 ---
 
 ## 五、接入我们 runner 的第二步验证(字段对齐后)

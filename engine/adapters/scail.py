@@ -38,6 +38,29 @@ SCAIL_VIDEO_LOAD = "VHS_LoadVideo"      # 驱动视频加载
 SCAIL_VIDEO_COMBINE = "VHS_VideoCombine"  # 输出视频保存
 SCAIL_REF_LOAD = "LoadImage"            # 角色参考图加载
 
+# ---- SCAIL-2 官方分块参数（必须与 planner 的 BACKEND_SCAIL2 规则严格对齐）----
+SCAIL_SEG_LEN = 81        # 每段帧数（官方 Base/Extend 子图）
+SCAIL_OVERLAP = 5         # 段间重叠帧数
+SCAIL_STEP = SCAIL_SEG_LEN - SCAIL_OVERLAP   # 有效步进 = 76
+
+# ---- WanSCAILToVideo 核心节点「输入字段名」假设（M0 待真模型校验，见字段映射表）----
+# 这些键名基于 2026-07-26 的 SCAIL-2 文档/社区教程推断。在你本机跑通真模型前，
+# 用本仓库附带的 M0_validate_scail_fields.py 对照你安装的 WanSCAILToVideo 实际
+# INPUT_TYPES 校验；若官方改名，只改下面这个 dict 即可，无需动逻辑。
+# （对照表见 SCAIL-2真模型验证清单.md 第四节）
+SCAIL_FIELD_MAP = {
+    "pose_video": "pose_video",                      # 驱动视频端口（官方名；旧模板曾写 driving_video）
+    "reference_image": "reference_image",            # 参考角色图端口（官方名；旧模板曾写 ref_image）
+    "previous_frames": "previous_frames",            # 前段末帧（连续帧串联）
+    "previous_frame_count": "previous_frame_count",  # 重叠帧数，默认 5（M0 新增，对齐 SCAIL_OVERLAP）
+    "segment_index": "segment_index",                # 段序号（1-based）
+    "frame_count": "frame_count",                    # 本段生成帧数
+    "prompt": "prompt",
+    "replace_mode": "replace_mode",                  # False=Animation，True=Replacement
+    "width": "width",
+    "height": "height",
+}
+
 
 class SCAILNodeMap:
     """SCAIL-2 工作流的节点映射（与 WanVideo 的 NodeMap 字段不同）。"""
@@ -129,7 +152,7 @@ class SCAILAdapter(DirectAdapter):
             prev_name = self._copy_to_input(ref_image_path)
             prev_node = "yunjii_scail_prev_frame"
             wf[prev_node] = {"class_type": "LoadImage", "inputs": {"image": prev_name}}
-            wf[node_map.core].setdefault("inputs", {})["previous_frames"] = [prev_node, 0]
+            wf[node_map.core].setdefault("inputs", {})[SCAIL_FIELD_MAP["previous_frames"]] = [prev_node, 0]
             info("SCAILAdapter", "previous_frames 串联: node=%s, image=%s", node_map.core, prev_name)
 
         # 3) 驱动视频起始帧偏移
@@ -138,20 +161,24 @@ class SCAILAdapter(DirectAdapter):
             di["skip_first_frames"] = max(0, seg.start_frame)
             info("SCAILAdapter", "驱动视频起始帧偏移 -> %d", seg.start_frame)
 
-        # 4) 核心节点参数
+        # 4) 核心节点参数（字段名走 SCAIL_FIELD_MAP，单点可改，M0 校验后回填）
         if node_map.core and node_map.core in wf:
             ci = wf[node_map.core].setdefault("inputs", {})
-            ci["segment_index"] = seg.index + 1
-            ci["frame_count"] = seg.target_frames
-            ci["width"] = seg.params.get("width", 832)
-            ci["height"] = seg.params.get("height", 480)
+            ci[SCAIL_FIELD_MAP["segment_index"]] = seg.index + 1
+            ci[SCAIL_FIELD_MAP["frame_count"]] = seg.target_frames
+            ci[SCAIL_FIELD_MAP["width"]] = seg.params.get("width", 832)
+            ci[SCAIL_FIELD_MAP["height"]] = seg.params.get("height", 480)
             if seg.prompt:
-                ci["prompt"] = seg.prompt
+                ci[SCAIL_FIELD_MAP["prompt"]] = seg.prompt
             # 本 V2V 链路驱动同一角色：统一用 Animation 模式（false）；
             # Replacement 模式（true）适用于"替换驱动视频里某个人"的场景，按需改。
-            ci["replace_mode"] = False
-            info("SCAILAdapter", "核心节点配置: segment_index=%d, frame_count=%d, replace_mode=%s",
-                 ci["segment_index"], ci["frame_count"], ci.get("replace_mode"))
+            ci[SCAIL_FIELD_MAP["replace_mode"]] = False
+            # 段间重叠帧数：驱动 SCAIL-2 的连续帧串联长度，须与 planner 的 SCAIL_OVERLAP 一致
+            ci[SCAIL_FIELD_MAP["previous_frame_count"]] = seg.overlap_prev or SCAIL_OVERLAP
+            info("SCAILAdapter", "核心节点配置: segment_index=%d, frame_count=%d, "
+                 "previous_frame_count=%d, replace_mode=%s",
+                 ci[SCAIL_FIELD_MAP["segment_index"]], ci[SCAIL_FIELD_MAP["frame_count"]],
+                 ci[SCAIL_FIELD_MAP["previous_frame_count"]], ci[SCAIL_FIELD_MAP["replace_mode"]])
 
         # 5) 输出文件名前缀（便于在 output/yunjii_scail/<run_id>/ 下区分分段）
         if node_map.video_combine and node_map.video_combine in wf:
