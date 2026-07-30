@@ -47,6 +47,9 @@ class SegmentPlan:
     segments: list = field(default_factory=list)
     effects: list = field(default_factory=list)
     backend: str = "wanvideo"  # BACKEND_WANVIDEO / BACKEND_SCAIL2
+    # 一镜到底单次超长生成(方案C)：True=单段覆盖驱动视频全长，不切段不拼接，
+    # 由 WanVideoContextOptions 滑窗覆盖全帧，pose_latent 覆盖全帧，单次连贯去噪、零转场。
+    single_pass: bool = False
 
     def to_json(self):
         return json.dumps({
@@ -55,6 +58,7 @@ class SegmentPlan:
             "resolution": self.resolution,
             "target_fps": self.target_fps,
             "backend": self.backend,
+            "single_pass": self.single_pass,
             "segments": [s.to_dict() if isinstance(s, SegmentInfo) else s for s in self.segments],
         }, ensure_ascii=False, indent=2)
 
@@ -68,12 +72,13 @@ class SegmentPlan:
             else:
                 segments.append(s)
         return cls(
-            mode=data.get("mode", "one_shot"),
+            mode=data.get("mode", SEGMENT_MODE_ONE_SHOT),
             total_segments=data.get("total_segments", len(segments)),
             resolution=data.get("resolution", [832, 480]),
             target_fps=data.get("target_fps", 16),
             segments=segments,
             backend=data.get("backend", "wanvideo"),
+            single_pass=data.get("single_pass", False),
         )
 
 
@@ -86,6 +91,8 @@ class SegmentResult:
     prompt_id: str = ""
     error: str = ""
     duration_sec: float = 0.0
+    # 与前一段的重叠帧数（一镜到底链式生成时 >0）。拼接阶段据此去重重叠帧，实现零转场。
+    overlap_prev: int = 0
 
     def to_dict(self):
         return {
@@ -96,6 +103,7 @@ class SegmentResult:
             "prompt_id": self.prompt_id,
             "error": self.error,
             "duration_sec": self.duration_sec,
+            "overlap_prev": self.overlap_prev,
         }
 
 
@@ -128,10 +136,12 @@ STITCH_CROSS_DISSOLVE = "cross_dissolve"
 STITCH_LATENT_BLEND = "latent_blend"
 STITCH_TRANSITION = "transition"
 STITCH_AUTO = "auto"
+# 真·一镜到底：硬切 + 丢弃后续段头部的重叠帧（去重），零转场、零重复帧
+STITCH_SEAMLESS = "seamless"
 
-SEGMENT_MODE_ONE_SHOT = "one_shot"
-SEGMENT_MODE_SMART_SPLIT = "smart_split"
-SEGMENT_MODE_SLIDING_WINDOW = "sliding_window"
+SEGMENT_MODE_ONE_SHOT = "一镜到底"
+SEGMENT_MODE_SMART_SPLIT = "智能分段"
+SEGMENT_MODE_SLIDING_WINDOW = "滑动窗口"
 
 # 生成后端标识（SegmentPlan.backend）
 BACKEND_WANVIDEO = "wanvideo"   # 骨骼路线：4k+1 帧规则

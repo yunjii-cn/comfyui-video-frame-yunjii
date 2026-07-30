@@ -9,7 +9,7 @@ import folder_paths
 
 from .types import (
     SegmentResult,
-    STITCH_HARD_CUT, STITCH_CROSS_DISSOLVE, STITCH_AUTO,
+    STITCH_HARD_CUT, STITCH_CROSS_DISSOLVE, STITCH_AUTO, STITCH_SEAMLESS,
 )
 from .pipeline import build_pipeline
 from .effects.base import EffectContext
@@ -43,6 +43,38 @@ def _build_xfade_filter(durations, xfade, dur):
     return ";".join(parts), labels[-1]
 
 
+def _build_output_ui(output_path: str) -> dict:
+    """构造 ComfyUI 前端预览 + 资产管理器即时入库所需的 ui 字段。
+
+    返回形如 {"gifs": [{"filename":..., "subfolder":..., "type":"output", "format":"video/h264-mp4"}]} 的字典，
+    供节点 return {"ui": _build_output_ui(...), "result": (...)} 使用。
+    - 前端通过 ui.gifs 在节点上显示视频播放器（与 VHS VideoCombine 同机制）。
+    - main.py 的 _collect_output_absolute_paths 会识别 {filename, subfolder, type:"output"} 结构，
+      自动调用 register_output_files() 把成片即时注册到「已生成」资产面板。
+    路径不在 output 目录下时，subfolder 为空字符串，type 仍为 output（前端按相对路径回退）。
+    """
+    preview = {
+        "filename": os.path.basename(output_path),
+        "subfolder": "",
+        "type": "output",
+        "format": "video/h264-mp4",
+    }
+    try:
+        output_dir = os.path.abspath(folder_paths.get_output_directory())
+        parent = os.path.abspath(os.path.dirname(output_path))
+        if parent == output_dir or parent.startswith(output_dir + os.sep):
+            preview["subfolder"] = os.path.relpath(parent, output_dir)
+        # 尝试读取 fps 供前端播放器使用（失败不影响主流程）
+        cap = cv2.VideoCapture(output_path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        cap.release()
+        if fps and fps > 0:
+            preview["frame_rate"] = float(fps)
+    except Exception:
+        pass
+    return {"gifs": [preview]}
+
+
 class YunjiiSegmentStitcher:
     CATEGORY = "Yunjii/Video/Engine"
     FUNCTION = "stitch"
@@ -60,8 +92,8 @@ class YunjiiSegmentStitcher:
             "required": {
                 "执行结果": ("STRING", {"default": "", "tooltip": "来自链式执行引擎的执行结果JSON"}),
                 "拼接模式": (
-                    [STITCH_HARD_CUT, STITCH_CROSS_DISSOLVE, STITCH_AUTO],
-                    {"default": STITCH_AUTO, "tooltip": "硬切=直接拼接; 交叉淡化=平滑过渡; 自动=根据内容选择"},
+                    [STITCH_HARD_CUT, STITCH_CROSS_DISSOLVE, STITCH_AUTO, STITCH_SEAMLESS],
+                    {"default": STITCH_AUTO, "tooltip": "硬切=直接拼接; 交叉淡化=平滑过渡; 自动=根据内容选择; 无缝一镜到底=硬切并丢弃段间重叠帧(零转场)"},
                 ),
                 "淡化帧数": ("INT", {"default": 8, "min": 2, "max": 30, "step": 1,
                     "tooltip": "交叉淡化过渡帧数"}),
@@ -95,11 +127,18 @@ class YunjiiSegmentStitcher:
             segments = results_data
 
         videos = []
+        # 携带每段重叠帧数(overlap_prev)，供 seamless / auto 去重使用
+        video_items = []
         for item in segments:
             if isinstance(item, dict) and item.get("status") == "success":
                 vp = item.get("video_path", "")
                 if vp and os.path.isfile(vp):
                     videos.append(vp)
+                    video_items.append({
+                        "path": vp,
+                        "overlap_prev": int(item.get("overlap_prev", 0) or 0),
+                        "segment_index": item.get("segment_index", len(video_items)),
+                    })
 
         if not videos:
             node_end("Stitcher", "没有成功生成的视频片段")
@@ -109,7 +148,10 @@ class YunjiiSegmentStitcher:
             output_path = self._copy_to_output(videos[0], 输出文件名, run_id)
             info("Stitcher", "仅1段视频，直接复制: %s", output_path)
             node_end("Stitcher", f"输出: {output_path}")
-            return (output_path, f"✅ 仅1段视频，无需拼接\n输出: {output_path}")
+            return {
+                "ui": _build_output_ui(output_path),
+                "result": (output_path, f"✅ 仅1段视频，无需拼接\n输出: {output_path}"),
+            }
 
         report_lines = []
         report_lines.append(f"🎬 开始拼接 {len(videos)} 个视频片段")
@@ -133,7 +175,7 @@ class YunjiiSegmentStitcher:
 
         try:
             output_path = self._stitch_videos(
-                videos, 拼接模式, 淡化帧数, 输出文件名, report_lines, run_id,
+                video_items, 拼接模式, 淡化帧数, 输出文件名, report_lines, run_id,
                 xfade=xfade, xfade_duration=xfade_duration,
             )
         except Exception as e:
@@ -158,10 +200,16 @@ class YunjiiSegmentStitcher:
         report_lines.append(f"\n✅ 最终输出: {output_path}")
         info("Stitcher", "拼接完成: %s", output_path)
         node_end("Stitcher", f"输出: {output_path}")
-        return (output_path, "\n".join(report_lines))
+        return {
+            "ui": _build_output_ui(output_path),
+            "result": (output_path, "\n".join(report_lines)),
+        }
 
-    def _stitch_videos(self, video_paths, mode, fade_frames, output_prefix, report, run_id="",
+    def _stitch_videos(self, video_items, mode, fade_frames, output_prefix, report, run_id="",
                        xfade="", xfade_duration=0.5):
+        # video_items: list of {"path":..., "overlap_prev":int, "segment_index":int}
+        video_paths = [v["path"] for v in video_items]
+
         output_dir = folder_paths.get_output_directory()
         sub_dir = run_id if run_id else time.strftime("%Y%m%d_%H%M%S")
         yunjii_dir = os.path.join(output_dir, "yunjii_v2v", sub_dir)
@@ -188,12 +236,37 @@ class YunjiiSegmentStitcher:
         ref_cap.release()
 
         if mode == STITCH_AUTO:
-            mode = STITCH_HARD_CUT
-            if len(video_paths) > 1:
-                diff = self._compute_boundary_diff(video_paths[0], video_paths[1])
-                if diff < 30:
-                    mode = STITCH_CROSS_DISSOLVE
-                report.append(f"📊 段间差异: {diff:.1f}, 自动选择: {mode}")
+            # 一镜到底等链式模式：段间本就重叠(overlap_prev>0)，再做交叉淡化会出现重影/溶解转场 →
+            # 自动改用 seamless 去重硬切（零转场、零重复帧）。非重叠段仍按边界差异决定。
+            has_overlap = any(int(v.get("overlap_prev", 0)) > 0 for v in video_items[1:])
+            if has_overlap:
+                mode = STITCH_SEAMLESS
+                report.append("📊 检测到段间重叠(一镜到底链式)，自动改为 无缝一镜到底(去重硬切)")
+            else:
+                mode = STITCH_HARD_CUT
+                if len(video_paths) > 1:
+                    diff = self._compute_boundary_diff(video_paths[0], video_paths[1])
+                    if diff < 30:
+                        mode = STITCH_CROSS_DISSOLVE
+                    report.append(f"📊 段间差异: {diff:.1f}, 自动选择: {mode}")
+
+        # —— 真·一镜到底：硬切 + 丢弃后续段头部重叠帧 ——
+        if mode == STITCH_SEAMLESS:
+            all_frames = []
+            for i, v in enumerate(video_items):
+                frames = self._read_all_frames(v["path"], width, height)
+                report.append(f"  段{i}: {len(frames)}帧, {os.path.basename(v['path'])}")
+                if i == 0:
+                    all_frames.extend(frames)
+                else:
+                    drop = min(int(v.get("overlap_prev", 0)), max(0, len(frames) - 1))
+                    if drop > 0:
+                        all_frames.extend(frames[drop:])
+                        report.append(f"  ↳ 去重重叠 {drop} 帧（一镜到底）")
+                    else:
+                        all_frames.extend(frames)
+            report.append(f"  总帧数: {len(all_frames)}, 时长: {len(all_frames) / fps:.1f}s")
+            return self._write_frames(all_frames, output_path, fps, width, height)
 
         all_frames = []
 
@@ -217,14 +290,15 @@ class YunjiiSegmentStitcher:
                 else:
                     all_frames.extend(frames)
 
+        report.append(f"  总帧数: {len(all_frames)}, 时长: {len(all_frames) / fps:.1f}s")
+        return self._write_frames(all_frames, output_path, fps, width, height)
+
+    def _write_frames(self, frames, output_path, fps, width, height):
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-
-        for frame in all_frames:
+        for frame in frames:
             writer.write(frame)
         writer.release()
-
-        report.append(f"  总帧数: {len(all_frames)}, 时长: {len(all_frames) / fps:.1f}s")
         return output_path
 
     def _stitch_videos_xfade(self, video_paths, xfade, dur, output_path, report, run_id=""):

@@ -25,9 +25,25 @@ class DirectAdapter(GenerationAdapter):
 
         server = PromptServer.instance
         self._persistent_executor = PromptExecutor(
-            server, cache_type=CacheType.RAM_PRESSURE, cache_args={"ram": 8.0}
+            server, cache_type=CacheType.RAM_PRESSURE, cache_args=self._build_cache_args()
         )
         info("DirectAdapter", "初始化持久化执行器 (RAM_PRESSURE缓存, 8GB headroom, T5/模型输出跨段复用)")
+
+    @staticmethod
+    def _build_cache_args() -> dict:
+        """复刻 ComfyUI main.py 的 RAM_PRESSURE 缓存参数构造。
+
+        秋叶整合包定制版 execution.execute_async 直接按下标取
+        cache_args['ram'] 与 cache_args['ram_inactive']，二者缺一不可，
+        缺 'ram_inactive' 会抛 KeyError（见此前报错）。
+        """
+        try:
+            import comfy.model_management as mm
+            total_ram_gb = mm.total_ram / 1024.0  # total_ram 单位为 MB
+        except Exception:
+            total_ram_gb = 128.0  # 兜底：按本机 128GB 估算
+        ram_inactive = min(96.0, total_ram_gb)
+        return {"ram": 8.0, "ram_inactive": ram_inactive}
 
     def cleanup_executor(self):
         if self._persistent_executor is not None:
@@ -45,7 +61,7 @@ class DirectAdapter(GenerationAdapter):
     def wait(self, prompt_id: str, timeout: int = 1800) -> dict:
         return {"status": "submitted"}
 
-    def execute_inline(self, workflow_dict: dict, timeout: int = 1800) -> dict:
+    def execute_inline(self, workflow_dict: dict, timeout: int = 1800, primary_output_node=None) -> dict:
         result_container = {}
         exec_start_time = time.time()
 
@@ -64,7 +80,7 @@ class DirectAdapter(GenerationAdapter):
                     executor = self._persistent_executor
                     cache_mode = "RAM_PRESSURE缓存(持久化执行器)"
                 else:
-                    cache_args = {"ram": 8.0}
+                    cache_args = self._build_cache_args()
                     executor = PromptExecutor(server, cache_type=CacheType.RAM_PRESSURE, cache_args=cache_args)
                     cache_mode = "RAM_PRESSURE缓存(临时执行器)"
 
@@ -74,8 +90,8 @@ class DirectAdapter(GenerationAdapter):
 
                 extra_data = {"client_id": "yunjii_direct"}
 
-                execute_outputs = self._get_output_node_ids(workflow_dict)
-                info("DirectAdapter", "execute_outputs=%s", execute_outputs)
+                execute_outputs = self._get_output_node_ids(workflow_dict, primary_output_node)
+                info("DirectAdapter", "execute_outputs=%s (primary=%s)", execute_outputs, primary_output_node)
 
                 if not execute_outputs:
                     log_error("DirectAdapter", "未找到输出节点! 工作流中的节点: %s",
@@ -107,7 +123,7 @@ class DirectAdapter(GenerationAdapter):
                     result_container["prompt_id"] = prompt_id
                     return
 
-                video_path = self._extract_video_from_history(executor, prompt_id)
+                video_path = self._extract_video_from_history(executor, prompt_id, primary_output_node)
                 if not video_path:
                     video_path = self._find_video_after(exec_start_time)
 
@@ -116,6 +132,13 @@ class DirectAdapter(GenerationAdapter):
                     result_container["status"] = "success"
                     result_container["video_path"] = video_path
                     result_container["prompt_id"] = prompt_id
+                    # 方案A(自动化)：把结果注册进前端历史，让资产出现在「已生成/历史」里。
+                    # 内联执行绕过了 API 队列，默认不写历史->前端看不到；这里手动补齐，
+                    # 同时保留内联的程序化控制力(分段/重试/续跑)。
+                    try:
+                        self._register_frontend(server, prompt_id, video_path, workflow_dict, execute_outputs)
+                    except Exception as _reg_e:
+                        warn("DirectAdapter", "前端历史注册异常(不影响出片): %s", _reg_e)
                 else:
                     history = getattr(executor, 'history_result', None)
                     info("DirectAdapter", "未找到视频: history=%s, 扫描=%s",
@@ -195,7 +218,7 @@ class DirectAdapter(GenerationAdapter):
         return "未知错误(无execution_error消息)"
 
     @staticmethod
-    def _get_output_node_ids(workflow_dict):
+    def _get_output_node_ids(workflow_dict, primary_output_node=None):
         output_nodes = []
         try:
             import nodes
@@ -213,55 +236,159 @@ class DirectAdapter(GenerationAdapter):
                     ct = node_data.get("class_type", "")
                     if any(kw in ct for kw in ["VideoCombine", "SaveImage", "PreviewImage"]):
                         output_nodes.append(node_id)
+        # 优先返回调用方指定的主输出节点（Runner 控制的真实成片 VHS），
+        # 避免多输出节点时抽到姿态/预览类骨架视频。
+        # 注意：discover 读 UI 格式(id 为 int)，而 API prompt/history 用字符串键，
+        # 故统一转 str 比对，保证主节点能被正确识别。
+        primary = str(primary_output_node) if primary_output_node is not None else None
+        if primary and primary in [str(o) for o in output_nodes]:
+            return [primary]
         return output_nodes
 
-    def _extract_video_from_history(self, executor, prompt_id: str) -> str:
+    def _extract_video_from_history(self, executor, prompt_id: str, primary_output_node=None) -> str:
         history = getattr(executor, 'history_result', None)
         if not history:
             return ""
 
         outputs = history.get("outputs", {})
-        for node_id, node_output in outputs.items():
-            if not isinstance(node_output, dict):
+        if not outputs:
+            return ""
+
+        # 排序：主输出节点优先（统一转 str，兼容 UI int id 与 API 字符串键）
+        primary = str(primary_output_node) if primary_output_node is not None else None
+        ordered = []
+        if primary and primary in outputs:
+            ordered.append(primary)
+        ordered += [str(n) for n in outputs if str(n) not in ordered]
+
+        real_candidates = []   # 非姿态/骨架的真实成片
+        any_candidates = []    # 兜底（含姿态）
+        for nid in ordered:
+            node_output = outputs[nid]
+            path, sub = self._scan_one_output(node_output)
+            if not path:
                 continue
+            any_candidates.append(path)
+            # 硬性排除姿态/骨架预览节点（如 onetotall_pose_*.mp4），绝不返回骨架视频
+            if DirectAdapter._is_pose_output(path):
+                continue
+            real_candidates.append((path, sub))
 
-            gifs = node_output.get("gifs", [])
-            for gif_info in gifs:
-                if isinstance(gif_info, dict):
-                    fullpath = gif_info.get("fullpath", "")
-                    if fullpath and os.path.isfile(fullpath):
-                        return fullpath
-                    filename = gif_info.get("filename", "")
-                    subfolder = gif_info.get("subfolder", "")
-                    file_type = gif_info.get("type", "output")
-                    if filename:
-                        resolved = self._resolve_output_file(filename, subfolder, file_type)
-                        if resolved:
-                            return resolved
-
-            images = node_output.get("images", [])
-            for img_info in images:
-                if isinstance(img_info, dict):
-                    filename = img_info.get("filename", "")
-                    subfolder = img_info.get("subfolder", "")
-                    file_type = img_info.get("type", "output")
-                    if filename and (filename.lower().endswith(('.mp4', '.avi', '.mov', '.webm', '.gif')) or file_type == "output"):
-                        resolved = self._resolve_output_file(filename, subfolder, file_type)
-                        if resolved:
-                            return resolved
-
-            videos = node_output.get("videos", [])
-            for vid_info in videos:
-                if isinstance(vid_info, dict):
-                    filename = vid_info.get("filename", "")
-                    subfolder = vid_info.get("subfolder", "")
-                    file_type = vid_info.get("type", "output")
-                    if filename:
-                        resolved = self._resolve_output_file(filename, subfolder, file_type)
-                        if resolved:
-                            return resolved
-
+        # 优先返回带真实前缀的成片（yunjii_v2v 或 WanVideo_SCAIL），覆盖两条生成路线
+        for path, sub in real_candidates:
+            if "yunjii_v2v" in (sub or "") or "WanVideo_SCAIL" in os.path.basename(path):
+                return path
+        if real_candidates:
+            return real_candidates[0][0]
+        # 兜底：实在没有非姿态输出时，退回第一个（理论上不会走到）
+        if any_candidates:
+            return any_candidates[0]
         return ""
+
+    def _scan_one_output(self, node_output):
+        """从单个节点的历史输出里抽取视频路径。返回 (path, subfolder)。"""
+        if not isinstance(node_output, dict):
+            return ("", "")
+        for key in ("gifs", "videos"):
+            for info in node_output.get(key, []):
+                if not isinstance(info, dict):
+                    continue
+                fullpath = info.get("fullpath", "")
+                if fullpath and os.path.isfile(fullpath):
+                    return (fullpath, info.get("subfolder", ""))
+                filename = info.get("filename", "")
+                subfolder = info.get("subfolder", "")
+                file_type = info.get("type", "output")
+                if filename:
+                    resolved = self._resolve_output_file(filename, subfolder, file_type)
+                    if resolved:
+                        return (resolved, subfolder)
+        for info in node_output.get("images", []):
+            if not isinstance(info, dict):
+                continue
+            filename = info.get("filename", "")
+            subfolder = info.get("subfolder", "")
+            file_type = info.get("type", "output")
+            if filename and (filename.lower().endswith(('.mp4', '.avi', '.mov', '.webm', '.gif')) or file_type == "output"):
+                resolved = self._resolve_output_file(filename, subfolder, file_type)
+                if resolved:
+                    return (resolved, subfolder)
+        return ("", "")
+
+    def _register_frontend(self, server, prompt_id, video_path, workflow_dict, execute_outputs):
+        """把内联执行的结果注册进前端历史，让资产出现在「已生成/历史」里。
+
+        内联执行绕过了 API 队列，默认不写 prompt_queue.history，因此前端画廊/历史
+        看不到产出。这里手动补齐：按 VHS_VideoCombine 的 gifs 输出格式写入历史，并
+        广播 executed / queue_updated，使前端即时显示。失败仅告警，不影响出片。
+        """
+        try:
+            import folder_paths
+            out_dir = folder_paths.get_output_directory()
+            fname = os.path.basename(video_path)
+            d = os.path.dirname(video_path)
+            rel = os.path.relpath(d, out_dir) if d.startswith(out_dir) else ""
+            subfolder = "" if rel in (".", "") else rel.replace(os.sep, "/")
+
+            preview = {
+                "filename": fname,
+                "subfolder": subfolder,
+                "type": "output",
+                "format": "video/mp4",
+                "frame_rate": None,
+                "workflow": None,
+                "fullpath": video_path,
+            }
+            outputs = {}
+            for onid in execute_outputs:
+                outputs[onid] = {"gifs": [preview]}
+
+            pq = getattr(server, "prompt_queue", None)
+            if pq is not None and hasattr(pq, "history"):
+                import time as _time
+                now_ms = int(_time.time() * 1000)
+                extra_data = {"client_id": None, "extra_pnginfo": {}}
+                # 重要：本 HeiHe fork 的 normalize_history_item 期望 history['prompt']
+                # 是 5 元组 (priority, _, prompt_dict, extra_data, _)。若直接传 dict，
+                # get_jobs 解包会报 "too many values to unpack (expected 5)"，导致
+                # 前端「已生成/历史」面板拉取历史时崩溃。务必按 5 元组写入。
+                pq.history[prompt_id] = {
+                    "prompt": (0, None, workflow_dict, extra_data, None),
+                    "outputs": outputs,
+                    "status": {
+                        "status_str": "success",
+                        "messages": [
+                            ["execution_start", {"prompt_id": prompt_id, "timestamp": now_ms}],
+                            ["execution_success", {"prompt_id": prompt_id, "timestamp": now_ms}],
+                        ],
+                    },
+                }
+                try:
+                    server.queue_updated()
+                except Exception:
+                    pass
+            # 实时广播：executed 仅更新画布节点预览；真正让 Gallery/Queue-History
+            # 画廊刷新的信号是 execution_success（配合前端「Auto-refresh after
+            # generation」开关，本 fork 已默认打开）。两者都发，确保内联出片后
+            # 视频立即出现在前端资产画廊，而无需手动刷新/重载页面。
+            try:
+                server.send_sync("execution_success", {
+                    "prompt_id": prompt_id,
+                }, None)
+            except Exception:
+                pass
+            try:
+                server.send_sync("executed", {
+                    "prompt_id": prompt_id,
+                    "node": execute_outputs[0] if execute_outputs else None,
+                    "output": outputs,
+                }, None)
+            except Exception:
+                pass
+            info("DirectAdapter", "已注册结果到前端历史 prompt_id=%s file=%s subfolder=%s",
+                 prompt_id, fname, subfolder)
+        except Exception as e:
+            warn("DirectAdapter", "注册前端历史失败(不影响出片): %s", e)
 
     def _resolve_output_file(self, filename: str, subfolder: str = "", file_type: str = "output") -> str:
         import folder_paths
@@ -329,22 +456,80 @@ class DirectAdapter(GenerationAdapter):
         cv2.imwrite(out_path, frame)
         return out_path
 
+    # 姿态/骨架预览类输出的文件名标记（用于历史抽取时硬性排除，避免抽到骨架视频）
+    POSE_PREFIX_MARKERS = ("pose", "skeleton", "openpose", "dwpose", "onetotall", "nlfpose")
+
+    @staticmethod
+    def _vhs_meta(ndata):
+        """读取一个 VHS_VideoCombine 节点的 (文件名前缀, 是否 save_output)。
+        同时兼容 UI 保存格式(widgets_values 为 dict) 与 API prompt 格式(inputs 为 dict)。"""
+        wv = ndata.get("widgets_values")
+        if isinstance(wv, dict):
+            return wv.get("filename_prefix", ""), bool(wv.get("save_output", False))
+        inp = ndata.get("inputs", {})
+        if isinstance(inp, dict):
+            return inp.get("filename_prefix", ""), bool(inp.get("save_output", False))
+        return "", False
+
+    @staticmethod
+    def _is_pose_output(path_or_prefix):
+        name = os.path.basename(str(path_or_prefix or "")).lower()
+        return any(m in name for m in DirectAdapter.POSE_PREFIX_MARKERS)
+
+    @staticmethod
+    def _select_primary_vhs(vhs_list):
+        """从若干 VHS_VideoCombine 候选里挑出真实成片节点。
+        vhs_list: [(nid, prefix, save_out), ...]
+        规则：① 非姿态节点且 save_output=True 优先；② 其次非姿态节点；③ 兜底第一个。"""
+        for nid, prefix, save_out in vhs_list:
+            if not DirectAdapter._is_pose_output(prefix) and save_out:
+                return nid
+        for nid, prefix, save_out in vhs_list:
+            if not DirectAdapter._is_pose_output(prefix):
+                return nid
+        return vhs_list[0][0] if vhs_list else ""
+
+    @staticmethod
+    def _iter_nodes(workflow):
+        """统一遍历工作流的节点，兼容三种格式：
+        ① UI 完整格式 nodes=list(元素含 id)；② UI/API 中间格式 nodes=dict(键=id)；
+        ③ API prompt 顶层格式：{node_id: {class_type, inputs}}，无 nodes 包裹
+           （prepare_workflow 返回的就是这种）。"""
+        if not isinstance(workflow, dict):
+            return []
+        nodes = workflow.get("nodes", None)
+        if isinstance(nodes, dict):
+            return list(nodes.items())
+        if isinstance(nodes, list):
+            return [(n.get("id"), n) for n in nodes if isinstance(n, dict)]
+        # 无 nodes 包裹：判断顶层是否就是节点字典（每个值是带 class_type/type 的节点）
+        if nodes is None and workflow:
+            first_val = next(iter(workflow.values()), None)
+            if isinstance(first_val, dict) and ("class_type" in first_val or "type" in first_val):
+                return list(workflow.items())
+        return []
+
     def discover_nodes(self, workflow: dict) -> NodeMap:
         node_map = NodeMap()
-        for nid, ndata in workflow.get("nodes", {}).items() if isinstance(workflow.get("nodes"), dict) else workflow.items():
-            if isinstance(ndata, dict):
-                ct = ndata.get("class_type", "")
-                if "WanVideoAnimateEmbeds" in ct:
-                    node_map.animate_embeds = nid
-                elif "VHS_VideoCombine" in ct:
-                    node_map.video_combine = nid
-                elif "LoadImage" in ct:
-                    if not node_map.ref_image:
-                        node_map.ref_image = nid
-                elif "WanVideoSampler" in ct:
-                    node_map.sampler = nid
-                elif "WanVideoTextEncode" in ct:
-                    node_map.text_encode = nid
+        vhs_candidates = []
+        for nid, ndata in DirectAdapter._iter_nodes(workflow):
+            if not isinstance(ndata, dict):
+                continue
+            ct = ndata.get("class_type") or ndata.get("type", "")
+            if "WanVideoAnimateEmbeds" in ct:
+                node_map.animate_embeds = nid
+            elif "VHS_VideoCombine" in ct:
+                prefix, save_out = DirectAdapter._vhs_meta(ndata)
+                vhs_candidates.append((nid, prefix, save_out))
+            elif "LoadImage" in ct:
+                if not node_map.ref_image:
+                    node_map.ref_image = nid
+            elif "WanVideoSampler" in ct:
+                node_map.sampler = nid
+            elif "WanVideoTextEncode" in ct:
+                node_map.text_encode = nid
+        # 正确选择真实成片节点（剔除姿态/骨架预览，优先 save_output=True）
+        node_map.video_combine = DirectAdapter._select_primary_vhs(vhs_candidates)
         return node_map
 
     def get_output_path(self, workflow_dict: dict) -> str:

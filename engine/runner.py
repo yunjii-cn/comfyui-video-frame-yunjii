@@ -24,6 +24,13 @@ from .debug_log import node_start, node_end, node_error, debug, info, warn, erro
 
 logger = logging.getLogger(__name__)
 
+PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# SCAIL-2 路线默认工作流（官方 WanVideoWrapper 的 SCAIL embeds 子流程，方案 B）
+SCAIL_WORKFLOW_DEFAULT = os.path.join(
+    PLUGIN_ROOT, "workflows", "SCAIL2_embed子流程_官方_20260728_0230.json"
+)
+SCAIL_NODE_MARKER = "WanVideoAddSCAILReferenceEmbeds"
+
 
 class YunjiiSegmentRunner:
     CATEGORY = "Yunjii/Video/Engine"
@@ -88,16 +95,24 @@ class YunjiiSegmentRunner:
 
         # 后端一致性校验：plan 中记录的 backend 必须与本次执行选择的后端一致，
         # 否则分段规则（骨骼路线 4k+1 vs SCAIL-2 81/5/76）不匹配会导致画面崩溃。
+        # 不一致时不再硬性报错，而是**按执行后端自动重规划**（提取 Planner 开窗逻辑），
+        # 这样用户只需在 Imitator 切一个「生成后端」开关即可切换路线，不必手动同步
+        # 上游 Planner 的「生成后端」widget（旧设计的两个独立 widget 容易造成不一致）。
         plan_backend = getattr(plan, "backend", BACKEND_WANVIDEO)
         exec_backend = BACKEND_SCAIL2 if 生成后端 == "SCAIL-2 路线" else BACKEND_WANVIDEO
         if plan_backend != exec_backend:
             plan_label = "SCAIL-2 路线" if plan_backend == BACKEND_SCAIL2 else "骨骼路线(WanVideo)"
             exec_label = "SCAIL-2 路线" if exec_backend == BACKEND_SCAIL2 else "骨骼路线(WanVideo)"
-            node_error("Runner", "后端不匹配: 段落计划由[%s]生成，但本次执行选择了[%s]", plan_label, exec_label)
-            return ("", f"⚠ 后端不匹配：段落计划是按【{plan_label}】规划的，"
-                        f"但本次执行选择了【{exec_label}】。\n"
-                        f"两种路线的分段规则不同（骨骼 4k+1 / SCAIL-2 81帧·重叠5），混用会崩。\n"
-                        f"请重新规划，或将执行后端改回与规划一致。", False)
+            warn("Runner", "后端不一致：计划按[%s]规划，本次执行[%s]，将自动按执行后端重规划",
+                 plan_label, exec_label)
+            try:
+                from .planner import replan_for_backend
+                plan = replan_for_backend(plan, exec_backend)
+                info("Runner", "已自动重规划为[%s]，共 %d 段", exec_label, plan.total_segments)
+            except Exception as e:
+                node_error("Runner", f"后端不一致且自动重规划失败: {e}")
+                return ("", f"⚠ 后端不匹配且自动重规划失败：{e}\n"
+                            f"请确认「分段规划器」与「完美模仿」节点的生成后端选择一致。", False)
 
         # 效果管线：生成前对每段 prompt / params 应用已启用模块。
         # 空「效果模块」→ 空管线 → 透传，输出与现状完全一致（零回归）。
@@ -123,10 +138,17 @@ class YunjiiSegmentRunner:
                 summary += f"  段{seg.index}: 帧{seg.start_frame}-{seg.end_frame}, {seg.target_frames}帧, 参考={seg.ref_strategy}\n"
             return (段落计划, summary, True)
 
-        if not 工作流模板.strip():
+        template_text = (工作流模板 or "").strip()
+        if 生成后端 == "SCAIL-2 路线":
+            # SCAIL-2 路线：未提供模板，或提供的不是 SCAIL 工作流时，自动用内置官方子流程
+            if SCAIL_NODE_MARKER not in template_text:
+                if os.path.isfile(SCAIL_WORKFLOW_DEFAULT):
+                    template_text = SCAIL_WORKFLOW_DEFAULT
+                    info("Runner", "SCAIL-2 路线：使用内置官方工作流 %s", SCAIL_WORKFLOW_DEFAULT)
+                elif not template_text:
+                    return ("", "⚠ SCAIL-2 路线缺少工作流模板，且内置官方工作流缺失", False)
+        elif not template_text:
             return ("", "⚠ 未提供工作流模板，请粘贴ComfyUI工作流JSON或输入JSON文件路径", False)
-
-        template_text = 工作流模板.strip()
         if os.path.isfile(template_text):
             try:
                 with open(template_text, "r", encoding="utf-8") as f:
@@ -140,19 +162,24 @@ class YunjiiSegmentRunner:
         except json.JSONDecodeError as e:
             return ("", f"⚠ 工作流模板JSON格式错误: {e}", False)
 
-        workflow = self._ensure_api_format(workflow_raw)
-        if not workflow:
-            return ("", "⚠ 工作流模板格式无法识别，请提供API格式或完整工作流格式", False)
-
-        info("Runner", "工作流格式: API格式, %d个节点", len(workflow))
-
         if 生成后端 == "SCAIL-2 路线":
+            # SCAIL-2 路线：用适配器自带的工作流预处理（手术 + 模型名模糊匹配 +
+            # 尺寸/姿态兼容），把官方 UI 工作流整理成可提交的干净 API 工作流。
             gen_adapter = SCAILAdapter(folder_paths.get_output_directory())
+            gen_adapter.driving_video_path = 视频路径  # SCAIL 用源视频作动作驱动
+            workflow = gen_adapter.prepare_workflow(workflow_raw)
             backend_name = "SCAIL-2 路线"
+            if not workflow:
+                return ("", "⚠ SCAIL-2 工作流预处理失败（节点缺失或格式无法识别）", False)
+            info("Runner", "SCAIL-2 工作流预处理完成: %d个节点", len(workflow))
         else:
+            workflow = self._ensure_api_format(workflow_raw)
+            if not workflow:
+                return ("", "⚠ 工作流模板格式无法识别，请提供API格式或完整工作流格式", False)
             gen_adapter = DirectAdapter(folder_paths.get_output_directory())
             backend_name = "骨骼路线(WanVideo)"
         info("Runner", "使用生成后端: %s（内联PromptExecutor）", backend_name)
+        info("Runner", "工作流格式: API格式, %d个节点", len(workflow))
         node_map = gen_adapter.discover_nodes(workflow)
         info("Runner", "节点发现结果: %s", node_map.to_dict())
         info("Runner", "工作流节点列表: %s", list(workflow.keys()))
@@ -256,7 +283,10 @@ class YunjiiSegmentRunner:
                     try:
                         info("Runner", "段%d: 内联执行 (尝试%d/%d)", seg.index, attempt + 1, 最大重试 + 1)
 
-                        result = gen_adapter.execute_inline(wf, timeout=3600)
+                        # 主输出节点：骨骼路线=NodeMap.video_combine，SCAIL路线=SCAILNodeMap.combine。
+                        # 传给适配器，使其在多个视频输出节点时优先抓取真实成片(而非姿态/预览骨架视频)。
+                        primary_out = getattr(node_map, "video_combine", None) or getattr(node_map, "combine", None)
+                        result = gen_adapter.execute_inline(wf, timeout=3600, primary_output_node=primary_out)
                         status = result.get("status", "")
 
                         if status == "success":
@@ -273,6 +303,7 @@ class YunjiiSegmentRunner:
                                 status="success",
                                 prompt_id=result.get("prompt_id", ""),
                                 duration_sec=seg_duration,
+                                overlap_prev=seg.overlap_prev,
                             )
                             results.append(seg_result)
 
@@ -316,7 +347,7 @@ class YunjiiSegmentRunner:
             gen_adapter.cleanup_executor()
 
         results_json = json.dumps(
-            {"run_id": run_id, "segments": [r.to_dict() for r in results]},
+            {"run_id": run_id, "mode": plan.mode, "segments": [r.to_dict() for r in results]},
             ensure_ascii=False, indent=2
         )
 
@@ -432,10 +463,13 @@ class YunjiiSegmentRunner:
                 for name, config in cat_inputs.items():
                     if isinstance(config, (list, tuple)) and len(config) > 0:
                         typ = config[0]
-                        if isinstance(typ, str) and typ in [
-                            "STRING", "INT", "FLOAT", "BOOLEAN",
-                            "COMBO", "ENUM",
-                        ]:
+                        # widget 输入：标量类型(STRING/INT/...) 或 COMBO(选项列表)
+                        is_widget = (
+                            isinstance(typ, str)
+                            and typ
+                            in ["STRING", "INT", "FLOAT", "BOOLEAN", "COMBO", "ENUM"]
+                        ) or isinstance(typ, list)
+                        if is_widget:
                             widget_names.append(name)
 
             return widget_names

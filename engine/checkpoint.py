@@ -7,7 +7,7 @@ logger = logging.getLogger(__name__)
 
 
 class CheckpointManager:
-    def __init__(self, mode="one_shot"):
+    def __init__(self, mode="一镜到底"):
         self.mode = mode
         self._dir = ""
 

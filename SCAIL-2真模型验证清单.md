@@ -134,3 +134,33 @@ SCAIL-2 **已是 ComfyUI 原生内置节点**(`WanSCAILToVideo` / `SCAIL2Colored
 - fp8 主模型 ≈ 16–17G;GGUF Q4 ≈ 10G;text_encoder ≈ 6G;clip_vision ≈ 2G;vae ≈ 0.3G;sam3 ≈ 3G;lora ≈ 0.6–1.2G。
 - **合计约 28–35G**(fp8)/ 22G 左右(GGUF Q4)/ 30G 左右(GGUF Q8_0 组合)。
 - ~~F 盘当前仅剩 27G,需先清理腾空间~~ → **已于 2026-07-26 清理完成,F 盘可用 182G**,空间充足,可直接下载 fp8 全套。
+
+---
+
+## 七、2026-07-30 状态更新：真骨架(NLF)路线已端到端跑通 + 稳定性修复
+
+> 本清单第四节及之前内容描述的是「原生 `WanSCAILToVideo` 字段回填」路线。实际落地时我们**改走官方 embeds 子流程路线**（适配器直接驱动 `WanVideoAddSCAILReferenceEmbeds`+`WanVideoAddSCAILPoseEmbeds`），真骨架 = 该工作流内嵌的 **NLF 3D 骨骼分支**。以下为最终状态。
+
+### 实际落地路径
+- 适配器：`engine/adapters/scail.py` 重写为方案 B（embeds 子流程）。
+- 工作流：`workflows/SCAIL2_embed子流程_官方_20260728_0230.json`，内部已含真骨架链：
+  `NLFModelLoader → NLFPredictPoses → RenderNLFPoses → WanVideoAddSCAILPoseEmbeds`。
+- 权重（均已就位）：14B 扩散 `wan2.1_14B_SCAIL_2_fp8_scaled`、NLF `nlf_l_multi_0.3.2_fp16`、detection onnx、SAM3 `sam3.1_multiplex_fp16`、clip_vision、umt5。
+- 闸门：`_official_pose_runnable()` 检查上述权重 + `RenderNLFPoses` 输入兼容，True 即自动走真骨架，不再回退原始驱动帧。
+
+### 稳定性修复（关键）
+- **症状**：RTX 3090(sm_86, Ampere 无 fp8 硬件) 上，`WanVideoTorchCompileSettings` 接通 `WanVideoModelLoader.compile_args` → transformer 被 `torch.compile` → 采样首步触发 **Windows 堆损坏 `0xc0000374`**，间歇性硬崩、**杀掉整个 ComfyUI 进程**（无 Python traceback，history 空）。run2 侥幸过、run1/run4 触发，典型非确定性表现。
+- **根因**：WanVideoWrapper 在 `fp8_e4m3fn + cc<8.9` 时原仅打印 warning，未阻止 compile（`nodes_model_loading.py` 约 L1217）。
+- **修复（双保险）**：
+  1. 工作流层：断开 `compile_args` 连线并移除编译节点（本插件工作流，随插件发布）。
+  2. 代码层：`nodes_model_loading.py` 在 `compile_args is not None and "e4" in quantization and cc<8.9` 时**强制 `compile_args = None`**（第三方节点文件补丁，升级 WanVideoWrapper 需重打）。
+  - torch.compile 仅加速、不影响功能；关闭后真骨架链路照常出片。
+
+### 验证结果
+- 连跑 **3 轮**（每轮干净重启 ComfyUI + 真实重跑，排除 RAM 缓存假通过）：全部 **PASS**，服务端累计 `0xc0000374` 崩溃 = **0**。
+- 产出：`WanVideo_SCAIL_00009.mp4` / `00010.mp4` / `00011.mp4`（真 NLF 骨架条件，非驱动帧回退）。
+- 结论：**② 真骨架链路现已生产可用**。
+
+### ③ SAM3 v2 完整骨架（进阶，暂缓）
+- 在 ② 基础上仅多 SAM3 语义部位掩码；消费节点 `WanVideoAddSCAIL2ConditionEmbeds` 本机未注册，需升级核心依赖/重架构工作流，边际收益小、风险高 → **不值得现在做**（7-28 已评估）。
+

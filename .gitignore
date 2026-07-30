@@ -14,3 +14,9 @@ _archive/
 
 # 运行时日志（引擎执行产生，不入库）
 yunjii_logs/
+
+# 备份文件（工作流/前端 .bak*）
+*.bak*
+
+# 临时审计 dump
+m0_*_dump.json

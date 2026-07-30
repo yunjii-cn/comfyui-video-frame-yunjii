@@ -14,15 +14,17 @@ Yunjii 长视频完美模仿 —— 贯穿节点（Composer）
 - 效果模块"一处定义、两侧复用"是本节点最核心的价值。
 """
 import logging
+import json
 
 from .runner import YunjiiSegmentRunner
-from .stitcher import YunjiiSegmentStitcher
+from .stitcher import YunjiiSegmentStitcher, _build_output_ui
+from .types import SEGMENT_MODE_ONE_SHOT, STITCH_SEAMLESS
 from .debug_log import node_start, node_end, node_error, info, warn
 
 logger = logging.getLogger(__name__)
 
 # 拼接模式与 stitcher 保持一致（避免与 stitcher 硬编码值漂移）
-_STITCH_MODES = ["hard_cut", "cross_dissolve", "auto"]
+_STITCH_MODES = ["hard_cut", "cross_dissolve", "auto", "seamless"]
 
 
 class YunjiiVideoImitator:
@@ -84,6 +86,25 @@ class YunjiiVideoImitator:
                 起始段=0, 音频源="", 效果模块="", ComfyUI地址="127.0.0.1:8188"):
         node_start("Imitator", 执行模式=执行模式, 生成后端=生成后端, 拼接模式=拼接模式, 效果模块=效果模块 or "(空)")
 
+        # —— 一镜到底：生成模式即「零转场连续长镜头」，拼接必须走 seamless(去重硬切) ——
+        # 否则 auto 会在段边界连续(差异<30)时误选交叉淡化，产生可见溶解转场，违背一镜到底本意。
+        # 这里读取段落计划的生成模式，强制覆盖拼接模式（用户误选交叉淡化也无效）。
+        try:
+            _plan_mode = ""
+            _plan_single_pass = False
+            _plan_raw = 段落计划.strip()
+            if _plan_raw:
+                _pd = json.loads(_plan_raw)
+                _plan_mode = _pd.get("mode", "")
+                _plan_single_pass = bool(_pd.get("single_pass", False))
+        except Exception:
+            _plan_mode = ""
+            _plan_single_pass = False
+        if _plan_mode == SEGMENT_MODE_ONE_SHOT and 拼接模式 != STITCH_SEAMLESS:
+            info("Imitator", "生成模式=一镜到底，强制拼接模式=无缝一镜到底(seamless)，忽略用户所选=%s", 拼接模式)
+            warn("Imitator", "一镜到底模式已强制使用「无缝一镜到底」拼接（去重硬切，零转场），忽略拼接模式=%s", 拼接模式)
+            拼接模式 = STITCH_SEAMLESS
+
         # —— 单一效果模块，份传给两侧（本节点核心价值）——
         effects = 效果模块 or ""
 
@@ -106,6 +127,20 @@ class YunjiiVideoImitator:
             node_end("Imitator", "生成失败")
             return ("", 执行日志, False)
 
+        # 一镜到底单次超长(方案C)：单段即成片，无需拼接，直接返回该段视频
+        if _plan_single_pass:
+            try:
+                _res = json.loads(执行结果)
+                _segs = _res.get("segments", [])
+                if _segs and _segs[0].get("video_path"):
+                    _final = _segs[0]["video_path"]
+                    info("Imitator", "一镜到底单次超长成片(方案C): %s (单次生成无需拼接)", _final)
+                    node_end("Imitator", "单次超长完成")
+                    return {"ui": _build_output_ui(_final),
+                            "result": (_final, f"{执行日志}\n---\n✅ 一镜到底单次超长生成，单段即成片，无需拼接", True)}
+            except Exception as e:
+                warn("Imitator", "单次超长结果解析失败，回退拼接: %s", e)
+
         # 2) 拼接相位：调用无缝拼接，效果模块作用于成片（超分/插帧/调色等）
         stitcher = YunjiiSegmentStitcher()
         最终视频路径, 拼接报告 = stitcher.stitch(
@@ -122,4 +157,7 @@ class YunjiiVideoImitator:
         combined = f"{执行日志}\n---\n{拼接报告}" if 执行日志 else 拼接报告
         info("Imitator", "完美模仿完成: %s", 最终视频路径)
         node_end("Imitator", "完成")
-        return (最终视频路径, combined, True)
+        return {
+            "ui": _build_output_ui(最终视频路径),
+            "result": (最终视频路径, combined, True),
+        }

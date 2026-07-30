@@ -13,6 +13,14 @@ from .debug_log import node_start, node_end, node_error, debug, info, warn
 
 logger = logging.getLogger(__name__)
 
+# 生成模式兼容别名：早期版本用英文名(one_shot/smart_split/sliding_window)，
+# 后因迁移改为中文。这里做兼容，使任何旧工作流(存英文值)也能通过校验并正确运行。
+MODE_ALIASES = {
+    "one_shot": "一镜到底",
+    "smart_split": "智能分段",
+    "sliding_window": "滑动窗口",
+}
+
 
 class YunjiiSegmentPlanner:
     CATEGORY = "Yunjii/Video/Engine"
@@ -33,7 +41,7 @@ class YunjiiSegmentPlanner:
                 "运动提示词": ("STRING", {"default": "", "tooltip": "来自运动分析节点的运动提示词"}),
                 "生成模式": (
                     [SEGMENT_MODE_ONE_SHOT, SEGMENT_MODE_SMART_SPLIT, SEGMENT_MODE_SLIDING_WINDOW],
-                    {"default": SEGMENT_MODE_ONE_SHOT, "tooltip": "一镜到底=零接缝链式; 智能分段=转场编排; 滑动窗口=超长视频"},
+                    {"default": SEGMENT_MODE_ONE_SHOT, "tooltip": "一镜到底=零转场连续长镜头(SCAIL-2长视频自动单次超长生成,context滑窗覆盖全帧); 智能分段=转场编排; 滑动窗口=超长视频"},
                 ),
                 "每段最大帧数": ("INT", {"default": 81, "min": 9, "max": 257, "step": 4,
                     "tooltip": "4k+1格式: 41/61/81/85/89/121"}),
@@ -57,13 +65,22 @@ class YunjiiSegmentPlanner:
             },
         }
 
+    @classmethod
+    def VALIDATE_INPUTS(cls, **kwargs):
+        # 兼容旧工作流：早期「生成模式」存英文值(one_shot 等)，节点 COMBO 现仅接受中文。
+        # 定义本方法让 ComfyUI 跳过默认 COMBO 成员校验，由 plan() 内部归一化。
+        return True
+
     def plan(self, 分段信息, 运动提示词, 生成模式, 每段最大帧数, 重叠帧数, 目标分辨率,
              目标帧率, 自适应参数, 姿态数据="", 负面提示词="", 生成后端="骨骼路线(WanVideo)"):
 
+        # 归一化：旧工作流可能传英文值(one_shot 等)，统一映射为中文常量
+        生成模式 = MODE_ALIASES.get(生成模式, 生成模式)
+
         backend = BACKEND_SCAIL2 if 生成后端 == "SCAIL-2 路线" else BACKEND_WANVIDEO
-        if backend == BACKEND_SCAIL2:
+        if backend == BACKEND_SCAIL2 and 生成模式 != SEGMENT_MODE_ONE_SHOT:
             # SCAIL-2 官方分块规则：每段 81 帧、段间重叠 5、有效步进 76。
-            # 覆盖用户的帧数/重叠设置，避免段边界跳帧/重影。
+            # 仅非一镜到底模式强制；一镜到底走「单次超长生成」(方案C)，不切段。
             if 每段最大帧数 != 81 or 重叠帧数 != 5:
                 info("Planner", "SCAIL-2 路线：分段参数已对齐官方规则（81帧/重叠5/步进76），"
                      "忽略用户设置 每段最大帧数=%d 重叠帧数=%d", 每段最大帧数, 重叠帧数)
@@ -96,10 +113,71 @@ class YunjiiSegmentPlanner:
 
         width, height = (int(x) for x in 目标分辨率.split("x"))
 
+        segments = self._build_segments(
+            scenes, backend, 每段最大帧数, 重叠帧数, width, height,
+            prompts, 生成模式, 目标帧率, 自适应参数, 负面提示词,
+        )
+
+        # 一镜到底单次超长(方案C)：单段且 target_frames 超过单段上限×1.5 即判定
+        is_single_pass = (
+            生成模式 == SEGMENT_MODE_ONE_SHOT and backend == BACKEND_SCAIL2
+            and len(segments) == 1 and segments
+            and segments[0].start_frame == 0
+            and segments[0].target_frames > 每段最大帧数 * 1.5
+        )
+        plan = SegmentPlan(
+            mode=生成模式,
+            total_segments=len(segments),
+            resolution=[width, height],
+            target_fps=目标帧率,
+            segments=segments,
+            backend=backend,
+            single_pass=is_single_pass,
+        )
+
+        plan_json = plan.to_json()
+        info("Planner", "规划完成: %d段, 模式=%s, 分辨率=%s", len(segments), 生成模式, 目标分辨率)
+        node_end("Planner", f"{len(segments)}段")
+        summary = self._build_summary(plan)
+        return (plan_json, len(segments), summary)
+
+    def _build_segments(self, scenes, backend, 每段最大帧数, 重叠帧数, width, height,
+                        prompts, 生成模式, target_fps, 自适应参数=True, 负面提示词=""):
+        """按指定后端的官方分块规则对 scenes 开窗建段。plan() 与 replan_for_backend() 共用。"""
+        # 防御性归一化：兼容旧 plan JSON 里残存的英文模式值(one_shot 等)
+        生成模式 = MODE_ALIASES.get(生成模式, 生成模式)
         segments = []
+
+        # —— 方案C：一镜到底单次超长生成（仅 SCAIL-2 路线）——
+        # 一镜到底 = 零转场连续长镜头。长驱动视频(>单段上限×1.5)时不切段，
+        # 整段作为单次生成：num_frames=全长对齐4k+1，由 WanVideoContextOptions
+        # 滑窗(81帧窗/48重叠)覆盖全帧，pose_latent 覆盖全帧 → 单次连贯去噪，
+        # 段边界问题彻底消失。骨骼路线无 context 滑窗，不走此路径(会 OOM)。
+        if 生成模式 == SEGMENT_MODE_ONE_SHOT and backend == BACKEND_SCAIL2 and scenes:
+            total = max(e for _, e, _ in scenes)
+            if total > 每段最大帧数 * 1.5:
+                aligned = max(9, ((total - 1) // 4) * 4 + 1)
+                segments.append(SegmentInfo(
+                    index=0,
+                    start_frame=0,
+                    end_frame=total,
+                    target_frames=aligned,
+                    overlap_prev=0,
+                    overlap_next=0,
+                    complexity=self._estimate_complexity(total, target_fps),
+                    ref_strategy=REF_STRATEGY_USER_IMAGE,
+                    prompt=prompts[0] if prompts else "smooth continuous motion, cinematic",
+                    negative_prompt=负面提示词,
+                    params={"steps": 30, "cfg": 6.0, "denoise": 1.0,
+                            "width": width, "height": height},
+                ))
+                info("Planner", "一镜到底单次超长(方案C): 全长%d帧→对齐%d帧, context滑窗覆盖全帧, 零转场不拼接",
+                     total, aligned)
+                return segments
+
         for scene_idx, scene in enumerate(scenes):
             start, end, duration = scene
-            complexity = self._estimate_complexity(duration, 目标帧率)
+            complexity = self._estimate_complexity(duration, target_fps)
 
             if 自适应参数:
                 seg_frames, steps, cfg = self._adaptive_params(complexity, 每段最大帧数)
@@ -172,21 +250,8 @@ class YunjiiSegmentPlanner:
                         "height": height,
                     },
                 ))
+        return segments
 
-        plan = SegmentPlan(
-            mode=生成模式,
-            total_segments=len(segments),
-            resolution=[width, height],
-            target_fps=目标帧率,
-            segments=segments,
-            backend=backend,
-        )
-
-        plan_json = plan.to_json()
-        info("Planner", "规划完成: %d段, 模式=%s, 分辨率=%s", len(segments), 生成模式, 目标分辨率)
-        node_end("Planner", f"{len(segments)}段")
-        summary = self._build_summary(plan)
-        return (plan_json, len(segments), summary)
 
     def _extract_original_fps(self, info_str):
         fps_match = re.search(r'(\d+(?:\.\d+)?)fps', info_str)
@@ -314,6 +379,9 @@ class YunjiiSegmentPlanner:
             SEGMENT_MODE_ONE_SHOT: "一镜到底",
             SEGMENT_MODE_SMART_SPLIT: "智能分段",
             SEGMENT_MODE_SLIDING_WINDOW: "滑动窗口",
+            "one_shot": "一镜到底",
+            "smart_split": "智能分段",
+            "sliding_window": "滑动窗口",
         }
         lines.append(f"📋 生成模式: {mode_names.get(plan.mode, plan.mode)}")
         lines.append(f"📊 总段数: {plan.total_segments}")
@@ -340,3 +408,39 @@ class YunjiiSegmentPlanner:
             )
 
         return "\n".join(lines)
+
+
+def replan_for_backend(plan, new_backend):
+    """将已有 plan 按新后端重新切分（保留场景边界/提示词/分辨率/帧率/负面提示）。
+
+    用于「用户切了执行后端、但 plan 是按另一后端规划的」场景：自动按新后端的
+    官方分块规则（SCAIL-2=81帧/重叠5；骨骼=4k+1/重叠默认）重切，避免段边界
+    跳帧/重影，同时让单一开关即可切换路线，不必手动同步两个「生成后端」widget。
+    """
+    if new_backend == BACKEND_SCAIL2:
+        每段最大帧数, 重叠帧数 = 81, 5
+    else:
+        每段最大帧数, 重叠帧数 = 81, 8
+
+    res = plan.resolution or [832, 480]
+    width, height = (int(x) for x in res[:2])
+    prompts = [s.prompt for s in plan.segments]
+    负面 = ""
+    if plan.segments and getattr(plan.segments[0], "negative_prompt", ""):
+        负面 = plan.segments[0].negative_prompt
+
+    # 把每个已有 segment 当作一个场景，按新后端规则重新开窗
+    scenes = [(s.start_frame, s.end_frame, s.end_frame - s.start_frame) for s in plan.segments]
+    tmp = YunjiiSegmentPlanner()
+    segments = tmp._build_segments(
+        scenes, new_backend, 每段最大帧数, 重叠帧数, width, height,
+        prompts, plan.mode, plan.target_fps, 自适应参数=True, 负面提示词=负面,
+    )
+    return SegmentPlan(
+        mode=plan.mode,
+        total_segments=len(segments),
+        resolution=[width, height],
+        target_fps=plan.target_fps,
+        segments=segments,
+        backend=new_backend,
+    )

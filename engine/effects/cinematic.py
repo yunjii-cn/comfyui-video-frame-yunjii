@@ -3,7 +3,7 @@ import logging
 import subprocess
 
 from .base import EffectModule, EffectContext
-from ..types import STITCH_AUTO, STITCH_CROSS_DISSOLVE, STITCH_HARD_CUT
+from ..types import STITCH_AUTO, STITCH_CROSS_DISSOLVE, STITCH_HARD_CUT, STITCH_SEAMLESS
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +164,9 @@ class CinematicModule(EffectModule):
         if not stitch_plan:
             return stitch_plan
         sp = dict(stitch_plan)
+        # 一镜到底已强制 seamless：不再注入任何转场（溶解会破坏零转场连续性）
+        if sp.get("mode") == STITCH_SEAMLESS:
+            return sp
         if self.xfade:
             # 新路径：xfade 真交叉溶解。强制把 mode/fade_frames 设为交叉淡化作为失败回退
             # （避免上游传入 hard_cut 时 xfade 失败却无任何过渡）。

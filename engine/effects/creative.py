@@ -3,7 +3,7 @@ import logging
 import sys
 
 from .base import EffectModule, EffectContext
-from ..types import STITCH_HARD_CUT, STITCH_CROSS_DISSOLVE
+from ..types import STITCH_HARD_CUT, STITCH_CROSS_DISSOLVE, STITCH_SEAMLESS
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +157,9 @@ class CreativeModule(EffectModule):
         if not stitch_plan:
             return stitch_plan
         sp = dict(stitch_plan)
+        # 一镜到底已强制 seamless：不再注入任何节奏转场（保持零转场连续性）
+        if sp.get("mode") == STITCH_SEAMLESS:
+            return sp
         # cinematic(stage=15) 已选 xfade 高级转场时，保留不覆盖（xfade 优先级高于 pacing 的普通淡入淡出）。
         if sp.get("xfade"):
             return sp
