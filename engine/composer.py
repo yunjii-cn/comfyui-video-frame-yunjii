@@ -20,8 +20,8 @@ import os
 from .runner import YunjiiSegmentRunner
 from .stitcher import YunjiiSegmentStitcher, _build_output_ui, XFADE_NAME_MAP
 from .types import (
-    SEGMENT_MODE_ONE_SHOT, STITCH_SEAMLESS, STITCH_SEAMLESS_BLEND, STITCH_TRANSITION,
-    STITCH_LABELS, STITCH_LABEL_TO_VALUE,
+    SEGMENT_MODE_ONE_SHOT, STITCH_HARD_CUT, STITCH_SEAMLESS, STITCH_SEAMLESS_BLEND,
+    STITCH_TRANSITION, STITCH_LABELS, STITCH_LABEL_TO_VALUE,
 )
 from .debug_log import node_start, node_end, node_error, info, warn
 
@@ -84,7 +84,7 @@ class YunjiiVideoImitator:
                 "最大重试": ("INT", {"default": 3, "min": 0, "max": 10}),
                 "拼接模式": (
                     _STITCH_MODES,
-                    {"default": "ffmpeg转场", "tooltip": "硬切=直接拼接; 交叉淡化=像素级平滑过渡; 自动=根据内容选择; 无缝一镜到底(零转场)=硬切去重零转场; 无缝一镜到底(重叠混合)=接缝短窗交叉溶解软化跳变; ffmpeg转场=视频级高级转场(需选转场类型)"},
+                    {"default": "ffmpeg转场", "tooltip": "硬切=直接拼接(一镜到底会被防呆回退重叠混合); 交叉淡化=像素级平滑过渡; 自动=根据内容选择(一镜到底落重叠混合); 无缝一镜到底(零转场)=硬切去重零转场; 无缝一镜到底(重叠混合)=接缝短窗交叉溶解软化跳变; ffmpeg转场=视频级高级转场(选「转场类型」生效，一镜到底可用作0.5s平滑接缝)"},
                 ),
                 "淡化帧数": ("INT", {"default": 8, "min": 2, "max": 30, "step": 1,
                     "tooltip": "交叉淡化过渡帧数（仅 交叉淡化 模式生效）"}),
@@ -141,12 +141,13 @@ class YunjiiVideoImitator:
         except Exception:
             _plan_mode = ""
             _plan_single_pass = False
-        # —— 一镜到底：拼接模式防呆 ——
-        # 一镜到底=连续长镜头，若用户选了 ffmpeg转场/交叉淡化/硬切(明显转场)，会破坏"一镜"观感。
-        # 自动(auto) 已落 seamless_blend；此处把其余"可见转场"选择也强制回退重叠混合，并打提示。
-        # 仅"无缝一镜到底(零转场)" 与 seamless_blend 被保留。
-        if _plan_mode == SEGMENT_MODE_ONE_SHOT and 拼接模式 not in (STITCH_SEAMLESS, STITCH_SEAMLESS_BLEND):
-            info("Imitator", "生成模式=一镜到底，拼接模式='%s' 会插入明显转场破坏连贯，强制回退「无缝一镜到底(重叠混合)」", _raw_mode)
+        # —— 一镜到底：拼接模式防呆（仅拦截真正破坏连贯的「硬切」）——
+        # 一镜到底=连续长镜头；硬切会暴露段边界跳变，故强制回退 重叠混合。
+        # ffmpeg转场(xfade 真·交叉溶解) 与 交叉淡化 本质都是「平滑过渡」，恰是一镜到底想要的丝滑，
+        # 故放行（用户选 ffmpeg转场+淡入淡出 即恢复此前最喜欢的 0.5s 平滑接缝）。
+        # 自动(auto) 已落 seamless_blend；零转场/重叠混合 均为用户显式基线，保留。
+        if _plan_mode == SEGMENT_MODE_ONE_SHOT and 拼接模式 == STITCH_HARD_CUT:
+            info("Imitator", "生成模式=一镜到底，硬切会暴露段边界跳变，强制回退「无缝一镜到底(重叠混合)」")
             拼接模式 = STITCH_SEAMLESS_BLEND
 
         # —— 单一效果模块，份传给两侧（本节点核心价值）——
