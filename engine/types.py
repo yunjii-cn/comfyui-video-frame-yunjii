@@ -50,6 +50,12 @@ class SegmentPlan:
     # 一镜到底单次超长生成(方案C)：True=单段覆盖驱动视频全长，不切段不拼接，
     # 由 WanVideoContextOptions 滑窗覆盖全帧，pose_latent 覆盖全帧，单次连贯去噪、零转场。
     single_pass: bool = False
+    # 连贯策略（生成侧时序连续性方案）：multi_seg / single_pass / warm_start
+    continuity_strategy: str = "multi_seg"
+    # 模型精度：fp8(默认,省显存) / fp16(更精细,吃显存) —— 仅 SCAIL-2 路线生效
+    model_precision: str = "fp8"
+    # 单遍时长上限(秒)：>0 时限制方案C单遍长度，超出则回退多段seamless，抑制长程稀释画质退化
+    single_pass_cap: float = 0.0
 
     def to_json(self):
         return json.dumps({
@@ -59,6 +65,9 @@ class SegmentPlan:
             "target_fps": self.target_fps,
             "backend": self.backend,
             "single_pass": self.single_pass,
+            "continuity_strategy": self.continuity_strategy,
+            "model_precision": self.model_precision,
+            "single_pass_cap": self.single_pass_cap,
             "segments": [s.to_dict() if isinstance(s, SegmentInfo) else s for s in self.segments],
         }, ensure_ascii=False, indent=2)
 
@@ -79,6 +88,9 @@ class SegmentPlan:
             segments=segments,
             backend=data.get("backend", "wanvideo"),
             single_pass=data.get("single_pass", False),
+            continuity_strategy=data.get("continuity_strategy", "multi_seg"),
+            model_precision=data.get("model_precision", "fp8"),
+            single_pass_cap=data.get("single_pass_cap", 0.0),
         )
 
 
@@ -158,6 +170,23 @@ STITCH_LABEL_TO_VALUE.update({value: value for value, _ in STITCH_LABELS})  # �
 SEGMENT_MODE_ONE_SHOT = "一镜到底"
 SEGMENT_MODE_SMART_SPLIT = "智能分段"
 SEGMENT_MODE_SLIDING_WINDOW = "滑动窗口"
+
+# —— 连贯策略（生成侧时序连续性方案，与拼接模式正交）—— #
+# 多段无缝：分段独立 I2V + 接缝混合（仅化妆，默认）
+# 单遍连贯：整片一次去噪(latent连续)，方案C，长视频画质软
+# 暖启动：分段 + 上段真实帧喂回 WanAnimatePlus prefix_frames（Tier2，连续+画质）
+CONTINUITY_MULTI_SEG = "multi_seg"
+CONTINUITY_SINGLE_PASS = "single_pass"
+CONTINUITY_WARM_START = "warm_start"
+CONTINUITY_AUTO = "auto"  # 兼容旧 单遍连贯模式 bool 的未显式选择态
+
+CONTINUITY_LABELS = [
+    (CONTINUITY_MULTI_SEG,   "多段无缝(默认)"),
+    (CONTINUITY_SINGLE_PASS, "单遍连贯(方案C)"),
+    (CONTINUITY_WARM_START,  "暖启动(Tier2)"),
+]
+CONTINUITY_LABEL_TO_VALUE = {label: value for value, label in CONTINUITY_LABELS}
+CONTINUITY_LABEL_TO_VALUE.update({value: value for value, _ in CONTINUITY_LABELS})
 
 # 生成后端标识（SegmentPlan.backend）
 BACKEND_WANVIDEO = "wanvideo"   # 骨骼路线：4k+1 帧规则

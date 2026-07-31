@@ -133,14 +133,20 @@ class YunjiiVideoImitator:
         try:
             _plan_mode = ""
             _plan_single_pass = False
+            _plan_continuity = ""
+            _plan_precision = "fp8"
             _plan_raw = 段落计划.strip()
             if _plan_raw:
                 _pd = json.loads(_plan_raw)
                 _plan_mode = _pd.get("mode", "")
                 _plan_single_pass = bool(_pd.get("single_pass", False))
+                _plan_continuity = _pd.get("continuity_strategy", "")
+                _plan_precision = _pd.get("model_precision", "fp8")
         except Exception:
             _plan_mode = ""
             _plan_single_pass = False
+            _plan_continuity = ""
+            _plan_precision = "fp8"
         # —— 一镜到底：拼接模式防呆（仅拦截真正破坏连贯的「硬切」）——
         # 一镜到底=连续长镜头；硬切会暴露段边界跳变，故强制回退 重叠混合。
         # ffmpeg转场(xfade 真·交叉溶解) 与 交叉淡化 本质都是「平滑过渡」，恰是一镜到底想要的丝滑，
@@ -159,6 +165,7 @@ class YunjiiVideoImitator:
             段落计划, 工作流模板, 执行模式, 最大重试,
             生成后端=生成后端, 视频路径=视频路径, 参考图=参考图, 姿态图=姿态图,
             人物参考图=人物参考图, 起始段=起始段, 效果模块=effects, ComfyUI地址=ComfyUI地址,
+            连贯策略=_plan_continuity, 模型精度=_plan_precision,
         )
 
         # 仅规划：runner 已返回计划摘要，直接短路，不做拼接

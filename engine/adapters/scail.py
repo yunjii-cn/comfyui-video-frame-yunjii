@@ -97,9 +97,16 @@ class SCAILAdapter(DirectAdapter):
         super().__init__(*args, **kwargs)
         # 由 runner 在 SCAIL 路线注入：动作源视频（驱动视频）路径
         self.driving_video_path = ""
+        # 模型精度：fp8(默认,省显存) / fp16(更精细,吃显存)。通过选不同权重文件实现。
+        self.model_precision = "fp8"
 
-    def _detect_scail_model(self):
-        """在 diffusion_models 目录下探测 SCAIL fp8 权重，返回相对路径。"""
+    def _detect_scail_model(self, precision="fp8"):
+        """在 diffusion_models 目录下探测 SCAIL 权重，返回相对路径。
+
+        precision="fp8"（默认）：选 *SCAIL*fp8* 权重（省显存，RTX3090 稳定）。
+        precision="fp16"：优先选非 fp8 的 SCAIL 权重（fp16/bf16，更精细）；
+                          若本机无此类权重则回退 fp8 并告警（不报错，保证可跑）。
+        """
         try:
             import folder_paths
             dirs = folder_paths.get_folder_paths("diffusion_models") or []
@@ -108,6 +115,22 @@ class SCAILAdapter(DirectAdapter):
         if not dirs:
             dirs = [os.path.join(os.path.dirname(os.path.dirname(
                 os.path.dirname(os.path.abspath(__file__)))), "models", "diffusion_models")]
+
+        if precision == "fp16":
+            for d in dirs:
+                # 排除显式 fp8 文件，优先取其他 SCAIL 权重（fp16/bf16）
+                all_scail = glob.glob(os.path.join(d, "*SCAIL*"), recursive=True)
+                if not all_scail:
+                    all_scail = glob.glob(os.path.join(d, "**", "*SCAIL*"), recursive=True)
+                non_fp8 = [m for m in all_scail
+                           if "fp8" not in os.path.basename(m).lower()]
+                if non_fp8:
+                    full = non_fp8[0]
+                    rel = os.path.relpath(full, d)
+                    info("SCAILAdapter", "SCAIL 权重(fp16): %s", rel)
+                    return rel.replace(os.sep, "/")
+            warn("SCAILAdapter", "未探测到非-fp8 的 SCAIL 权重，回退 fp8")
+
         for d in dirs:
             matches = glob.glob(os.path.join(d, SCAIL_MODEL_GLOB), recursive=True)
             if not matches:
@@ -221,8 +244,8 @@ class SCAILAdapter(DirectAdapter):
         # SCAIL 身份一致性：始终用角色参考图，不随段切换到前段末帧
         char_ref = user_ref_path or ref_image_path
 
-        # 1) 模型权重：自动探测 SCAIL fp8 文件
-        scail_model = self._detect_scail_model()
+        # 1) 模型权重：自动探测 SCAIL 权重（fp16 优先非-fp8 文件，否则回退 fp8）
+        scail_model = self._detect_scail_model(self.model_precision)
         if scail_model:
             self._set(wf, node_map.model_loader, "model", scail_model)
             info("SCAILAdapter", "SCAIL 权重: %s", scail_model)

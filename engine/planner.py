@@ -8,6 +8,8 @@ from .types import (
     SEGMENT_MODE_ONE_SHOT, SEGMENT_MODE_SMART_SPLIT, SEGMENT_MODE_SLIDING_WINDOW,
     REF_STRATEGY_USER_IMAGE, REF_STRATEGY_PREV_LAST_FRAME, REF_STRATEGY_AUTO_SELECT,
     BACKEND_WANVIDEO, BACKEND_SCAIL2,
+    CONTINUITY_MULTI_SEG, CONTINUITY_SINGLE_PASS, CONTINUITY_WARM_START,
+    CONTINUITY_AUTO, CONTINUITY_LABEL_TO_VALUE,
 )
 from .debug_log import node_start, node_end, node_error, debug, info, warn
 
@@ -63,7 +65,20 @@ class YunjiiSegmentPlanner:
                      "tooltip": "SCAIL-2 路线自动改用「每段81帧/重叠5/步进76」的官方分块规则；需与执行节点的后端选择一致"},
                 ),
                 "单遍连贯模式": ("BOOLEAN", {"default": False,
-                    "tooltip": "【实验】一镜到底下启用「单次超长生成(方案C)」：整片一次连贯去噪，latent 天然连续=真·一镜到底无接缝。代价：11s 长视频画质会被长程稀释下降(4步蒸馏)。默认关→走多段 seamless(质量优先)。仅 SCAIL-2 路线生效。"}),
+                    "tooltip": "【已并入连贯策略】旧开关，等价连贯策略=单遍连贯(方案C)。建议改用下方「连贯策略」下拉。"}),
+                "连贯策略": (
+                    [CONTINUITY_MULTI_SEG, CONTINUITY_SINGLE_PASS, CONTINUITY_WARM_START],
+                    {"default": CONTINUITY_MULTI_SEG,
+                     "tooltip": "生成侧时序连续性方案：多段无缝(默认,接缝化妆)=分段独立I2V+混合; "
+                                "单遍连贯(方案C)=整片一次去噪latent连续真·一镜到底,长视频画质软; "
+                                "暖启动(Tier2)=分段+上段真实帧喂回WanAnimatePlus prefix_frames,连续+画质兼得(需SCAIL-2路线+WanAnimatePlus)"},
+                ),
+                "单遍时长上限": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 30.0, "step": 0.5,
+                    "tooltip": "方案C单遍最大时长(秒)。>0 时超出则回退多段seamless以抑制长程稀释画质退化；0=不限制(整片单遍)"}),
+                "模型精度": (
+                    ["fp8", "fp16"],
+                    {"default": "fp8", "tooltip": "SCAIL-2 扩散模型精度：fp8(默认,省显存,略软); fp16(更精细,吃显存,需本机有fp16权重或显存充足)"},
+                ),
             },
         }
 
@@ -75,7 +90,7 @@ class YunjiiSegmentPlanner:
 
     def plan(self, 分段信息, 运动提示词, 生成模式, 每段最大帧数, 重叠帧数, 目标分辨率,
              目标帧率, 自适应参数, 姿态数据="", 负面提示词="", 生成后端="骨骼路线(WanVideo)",
-             单遍连贯模式=False):
+             单遍连贯模式=False, 连贯策略=CONTINUITY_AUTO, 单遍时长上限=0.0, 模型精度="fp8"):
 
         # 归一化：旧工作流可能传英文值(one_shot 等)，统一映射为中文常量
         生成模式 = MODE_ALIASES.get(生成模式, 生成模式)
@@ -117,27 +132,47 @@ class YunjiiSegmentPlanner:
 
         width, height = (int(x) for x in 目标分辨率.split("x"))
 
-        # 方案C 单遍判定：一镜到底 + SCAIL-2 + 长视频(>单段上限×1.5) + 用户显式勾选
+        # 方案C 单遍判定：一镜到底 + SCAIL-2 + 长视频(>单段上限×1.5) + 用户显式选单遍/勾选旧开关
         total_frames = (max(e for _, e, _ in scenes) - min(s for s, _, _ in scenes)) if scenes else 0
-        单遍 = (
-            bool(单遍连贯模式)
+        total_seconds = total_frames / max(目标帧率, 1)
+
+        # 连贯策略归一：显式选择(非auto)优先；否则回退旧「单遍连贯模式」bool
+        _raw_strategy = 连贯策略
+        if not _raw_strategy or _raw_strategy == CONTINUITY_AUTO:
+            _raw_strategy = CONTINUITY_SINGLE_PASS if 单遍连贯模式 else CONTINUITY_MULTI_SEG
+        strategy = CONTINUITY_LABEL_TO_VALUE.get(_raw_strategy, _raw_strategy)
+        if strategy not in (CONTINUITY_MULTI_SEG, CONTINUITY_SINGLE_PASS, CONTINUITY_WARM_START):
+            strategy = CONTINUITY_MULTI_SEG
+
+        single_pass_requested = (
+            strategy == CONTINUITY_SINGLE_PASS
             and 生成模式 == SEGMENT_MODE_ONE_SHOT
             and backend == BACKEND_SCAIL2
             and total_frames > 每段最大帧数 * 1.5
         )
-        if 单遍:
+        # 方案C 画质增强：单遍时长上限。超出则回退多段seamless(抑制长程稀释)
+        cap = float(单遍时长上限) if 单遍时长上限 else 0.0
+        single_pass = single_pass_requested
+        if single_pass and cap > 0 and total_seconds > cap:
+            warn("Planner", "方案C 单遍被「单遍时长上限=%.1fs」截断(%d帧≈%.1fs)，回退多段seamless 抑制画质退化",
+                 cap, total_frames, total_seconds)
+            single_pass = False
+        if single_pass:
             info("Planner", "方案C 单遍连贯模式启用：一镜到底长视频(%d帧) 改为单次超长生成(真·一镜到底)", total_frames)
+        elif strategy == CONTINUITY_WARM_START:
+            info("Planner", "暖启动(Tier2) 启用：分段 + 上段真实帧喂回 WanAnimatePlus prefix_frames（需SCAIL-2路线+WanAnimatePlus）")
 
         segments = self._build_segments(
             scenes, backend, 每段最大帧数, 重叠帧数, width, height,
             prompts, 生成模式, 目标帧率, 自适应参数, 负面提示词,
-            single_pass=单遍,
+            single_pass=single_pass,
         )
 
         # 一镜到底长视频默认走「多段 seamless」(质量优先)：每段 81 帧(5s 原生)全质量生成，
         # composer 强制 seamless 硬切丢重叠帧 = 零转场、零重复帧，质量对齐好片。
-        # 仅当用户勾选「单遍连贯模式」(方案C)时 is_single_pass=True → 整片一次连贯去噪(真连贯，画质代价)。
-        is_single_pass = 单遍
+        # 仅当连贯策略=单遍连贯(方案C)时 is_single_pass=True → 整片一次连贯去噪(真连贯，画质代价)。
+        # 暖启动(Tier2) 仍为多段，但由适配器注入上段末帧作 prefix，段间连续+画质兼得。
+        is_single_pass = single_pass
         plan = SegmentPlan(
             mode=生成模式,
             total_segments=len(segments),
@@ -146,6 +181,9 @@ class YunjiiSegmentPlanner:
             segments=segments,
             backend=backend,
             single_pass=is_single_pass,
+            continuity_strategy=strategy,
+            model_precision=模型精度 if backend == BACKEND_SCAIL2 else "fp8",
+            single_pass_cap=cap,
         )
 
         plan_json = plan.to_json()

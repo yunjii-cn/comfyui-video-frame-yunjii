@@ -14,9 +14,12 @@ from .types import (
     SegmentPlan, SegmentResult, SegmentContext,
     SEGMENT_MODE_ONE_SHOT, REF_STRATEGY_PREV_LAST_FRAME,
     BACKEND_WANVIDEO, BACKEND_SCAIL2,
+    CONTINUITY_MULTI_SEG, CONTINUITY_SINGLE_PASS, CONTINUITY_WARM_START,
+    CONTINUITY_LABEL_TO_VALUE,
 )
 from .adapters.direct import DirectAdapter
 from .adapters.scail import SCAILAdapter
+from .adapters.animateplus import AnimatePlusSCAILAdapter
 from .checkpoint import CheckpointManager
 from .pipeline import build_pipeline, EffectPipeline
 from .effects.base import EffectContext
@@ -30,6 +33,13 @@ SCAIL_WORKFLOW_DEFAULT = os.path.join(
     PLUGIN_ROOT, "workflows", "SCAIL2_embed子流程_官方_20260728_0230.json"
 )
 SCAIL_NODE_MARKER = "WanVideoAddSCAILReferenceEmbeds"
+
+# WanAnimatePlus SCAIL_2 家族标记（Tier 2 暖启动路线）
+AP_NODE_MARKER = "WanAnimatePlus SCAIL_2 Embeds"
+# Tier 2 内置参考工作流（若存在则暖启动可不提供模板）。本机缺省时应由用户粘贴。
+AP_WORKFLOW_DEFAULT = os.path.join(
+    PLUGIN_ROOT, "workflows", "WanAnimatePlus_SCAIL2_参考.json"
+)
 
 
 class YunjiiSegmentRunner:
@@ -72,10 +82,20 @@ class YunjiiSegmentRunner:
                 "起始段": ("INT", {"default": 0, "min": 0, "max": 100}),
                 "效果模块": ("STRING", {"default": "", "multiline": True,
                     "tooltip": "可选效果管线模块列表(JSON数组或逗号分隔)，如 [\"mimic\"]。为空=不启用任何效果，行为与现状完全一致。支持: mimic, cinematic, enhance, creative（cinematic 可设 xfade 高级转场）"}),
+                "连贯策略": (
+                    ["多段无缝(默认)", "单遍连贯(方案C)", "暖启动(Tier2)"],
+                    {"default": "多段无缝(默认)",
+                     "tooltip": "生成侧时序连续性方案(与拼接模式正交)：多段无缝=分段独立+接缝混合(默认,仅化妆); 单遍连贯(方案C)=整片一次去噪(latent连续)但长视频画质软; 暖启动(Tier2)=WanAnimatePlus多段+上段真实帧喂回prefix_frames(连续+画质兼得)。需对应工作流模板支持"},
+                ),
+                "模型精度": (
+                    ["fp8", "fp16"],
+                    {"default": "fp8",
+                     "tooltip": "SCAIL-2 路线模型精度：fp8(默认,省显存,RTX3090稳定); fp16(更精细,吃显存,需对应权重文件)。仅 SCAIL-2 路线生效"},
+                ),
             },
         }
 
-    def run(self, 段落计划, 工作流模板, 执行模式, 最大重试, 生成后端="骨骼路线(WanVideo)", 视频路径="", 参考图=None, 姿态图=None, 人物参考图="", 起始段=0, 效果模块="", ComfyUI地址="127.0.0.1:8188"):
+    def run(self, 段落计划, 工作流模板, 执行模式, 最大重试, 生成后端="骨骼路线(WanVideo)", 视频路径="", 参考图=None, 姿态图=None, 人物参考图="", 起始段=0, 效果模块="", ComfyUI地址="127.0.0.1:8188", 连贯策略="", 模型精度="fp8"):
         node_start("Runner", 执行模式=执行模式, 最大重试=最大重试, ComfyUI地址=ComfyUI地址)
         info("Runner", "参数诊断: 段落计划类型=%s, 工作流模板类型=%s, 视频路径='%s', 参考图类型=%s, 姿态图类型=%s, 人物参考图='%s', 起始段=%s, ComfyUI地址='%s'",
              type(段落计划).__name__, type(工作流模板).__name__,
@@ -114,6 +134,18 @@ class YunjiiSegmentRunner:
                 return ("", f"⚠ 后端不匹配且自动重规划失败：{e}\n"
                             f"请确认「分段规划器」与「完美模仿」节点的生成后端选择一致。", False)
 
+        # —— 连贯策略归一（与拼接模式正交的生成侧时序连续性方案）——
+        # 优先用显式传入的 连贯策略 参数；为空则从计划内 continuity_strategy 推导；
+        # 仍为空则默认多段无缝。中文标签 → 英文值。
+        _strategy = 连贯策略 or getattr(plan, "continuity_strategy", "") or CONTINUITY_MULTI_SEG
+        _strategy = CONTINUITY_LABEL_TO_VALUE.get(_strategy, _strategy)
+        if _strategy not in (CONTINUITY_MULTI_SEG, CONTINUITY_SINGLE_PASS, CONTINUITY_WARM_START):
+            _strategy = CONTINUITY_MULTI_SEG
+        _precision = 模型精度 or getattr(plan, "model_precision", "") or "fp8"
+        if _precision not in ("fp8", "fp16"):
+            _precision = "fp8"
+        info("Runner", "连贯策略=%s, 模型精度=%s", _strategy, _precision)
+
         # 效果管线：生成前对每段 prompt / params 应用已启用模块。
         # 空「效果模块」→ 空管线 → 透传，输出与现状完全一致（零回归）。
         effect_pipeline = build_pipeline(效果模块)
@@ -139,14 +171,33 @@ class YunjiiSegmentRunner:
             return (段落计划, summary, True)
 
         template_text = (工作流模板 or "").strip()
+        # 模板所含 SCAIL 家族判定
+        is_ap_template = (AP_NODE_MARKER in template_text)
+        is_std_scail_template = (SCAIL_NODE_MARKER in template_text)
+
         if 生成后端 == "SCAIL-2 路线":
-            # SCAIL-2 路线：未提供模板，或提供的不是 SCAIL 工作流时，自动用内置官方子流程
-            if SCAIL_NODE_MARKER not in template_text:
-                if os.path.isfile(SCAIL_WORKFLOW_DEFAULT):
+            # 未提供模板或提供的不是 SCAIL 工作流时，按策略选内置默认：
+            # 暖启动(Tier2) 优先用 WanAnimatePlus 参考工作流；否则用标准 SCAIL 子流程。
+            if not (is_ap_template or is_std_scail_template):
+                if _strategy == CONTINUITY_WARM_START and os.path.isfile(AP_WORKFLOW_DEFAULT):
+                    template_text = AP_WORKFLOW_DEFAULT
+                    info("Runner", "暖启动(Tier2): 使用内置 WanAnimatePlus 参考工作流 %s", AP_WORKFLOW_DEFAULT)
+                elif os.path.isfile(SCAIL_WORKFLOW_DEFAULT):
                     template_text = SCAIL_WORKFLOW_DEFAULT
                     info("Runner", "SCAIL-2 路线：使用内置官方工作流 %s", SCAIL_WORKFLOW_DEFAULT)
                 elif not template_text:
-                    return ("", "⚠ SCAIL-2 路线缺少工作流模板，且内置官方工作流缺失", False)
+                    return ("", "⚠ SCAIL-2 路线缺少工作流模板，请粘贴 ComfyUI 工作流JSON或输入JSON文件路径", False)
+            # 重判模板家族（若上面填了默认）
+            is_ap_template = (AP_NODE_MARKER in template_text)
+            is_std_scail_template = (SCAIL_NODE_MARKER in template_text)
+            if _strategy == CONTINUITY_WARM_START and not is_ap_template:
+                # 暖启动要求 WanAnimatePlus SCAIL_2 工作流（含 prefix_frames 入口），
+                # 标准 WanVideoWrapper SCAIL 无该入口 → 给出明确指引而非静默降级。
+                return ("", "⚠ 暖启动(Tier2) 需要一个『WanAnimatePlus SCAIL_2』工作流模板"
+                                "（含 WanAnimatePlus SCAIL_2 Embeds 节点）。请在『工作流模板』中"
+                                "粘贴该工作流 JSON 或其文件路径，或确认已放置内置参考工作流。", False)
+            if _strategy == CONTINUITY_SINGLE_PASS and is_ap_template:
+                warn("Runner", "单遍连贯(方案C) 在 WanAnimatePlus 家族不支持，回退为『多段无缝』运行该模板")
         elif not template_text:
             return ("", "⚠ 未提供工作流模板，请粘贴ComfyUI工作流JSON或输入JSON文件路径", False)
         if os.path.isfile(template_text):
@@ -163,15 +214,21 @@ class YunjiiSegmentRunner:
             return ("", f"⚠ 工作流模板JSON格式错误: {e}", False)
 
         if 生成后端 == "SCAIL-2 路线":
-            # SCAIL-2 路线：用适配器自带的工作流预处理（手术 + 模型名模糊匹配 +
-            # 尺寸/姿态兼容），把官方 UI 工作流整理成可提交的干净 API 工作流。
-            gen_adapter = SCAILAdapter(folder_paths.get_output_directory())
+            # SCAIL-2 路线含两大家族，按模板自动选适配器：
+            #  · WanAnimatePlus SCAIL_2  → AnimatePlusSCAILAdapter（支持暖启动 prefix）
+            #  · 标准 WanVideoWrapper SCAIL → SCAILAdapter（多段 / 单遍方案C）
+            if is_ap_template:
+                gen_adapter = AnimatePlusSCAILAdapter(folder_paths.get_output_directory())
+                backend_name = "SCAIL-2 路线(WanAnimatePlus/Tier2)"
+            else:
+                gen_adapter = SCAILAdapter(folder_paths.get_output_directory())
+                backend_name = "SCAIL-2 路线"
             gen_adapter.driving_video_path = 视频路径  # SCAIL 用源视频作动作驱动
+            gen_adapter.model_precision = _precision
             workflow = gen_adapter.prepare_workflow(workflow_raw)
-            backend_name = "SCAIL-2 路线"
             if not workflow:
                 return ("", "⚠ SCAIL-2 工作流预处理失败（节点缺失或格式无法识别）", False)
-            info("Runner", "SCAIL-2 工作流预处理完成: %d个节点", len(workflow))
+            info("Runner", "%s 工作流预处理完成: %d个节点", backend_name, len(workflow))
         else:
             workflow = self._ensure_api_format(workflow_raw)
             if not workflow:
@@ -250,6 +307,7 @@ class YunjiiSegmentRunner:
         results = []
         prev_context = SegmentContext(last_frame_path=ref_image_path)
         all_success = True
+        prev_video_path = ""  # 上一段成片视频路径（暖启动 Tier2 用于 prefix 注入）
 
         start_from = 起始段 if 起始段 > 0 else 0
 
@@ -274,7 +332,12 @@ class YunjiiSegmentRunner:
                     current_ref = ref_image_path
                     log_lines.append(f"  👤 使用用户参考图")
 
-                wf = gen_adapter.modify_workflow_for_segment(workflow, node_map, seg, current_ref, pose_dir, run_id, user_ref_path=ref_image_path)
+                # 暖启动(Tier2)：仅当策略为 warm_start 时把上段成片注入 prefix；
+                # 其余策略不传，避免无谓的 prefix 注入。
+                _prev_vp = prev_video_path if _strategy == CONTINUITY_WARM_START else ""
+                wf = gen_adapter.modify_workflow_for_segment(
+                    workflow, node_map, seg, current_ref, pose_dir, run_id,
+                    user_ref_path=ref_image_path, prev_video_path=_prev_vp)
 
                 success = False
                 last_error = ""
@@ -310,6 +373,10 @@ class YunjiiSegmentRunner:
                             if last_frame:
                                 prev_context = SegmentContext(last_frame_path=last_frame)
                                 cp.save(seg.index, last_frame, [r.to_dict() for r in results])
+
+                            # 记录上段成片，供暖启动(Tier2)跨段 prefix 注入
+                            if output_path and os.path.isfile(output_path):
+                                prev_video_path = output_path
 
                             log_lines.append(f"  ✅ 完成! 耗时{seg_duration:.1f}s, 输出={output_path}")
                             info("Runner", "段%d: ✅ 完成! 耗时%.1fs", seg.index, seg_duration)
