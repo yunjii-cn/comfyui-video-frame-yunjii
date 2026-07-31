@@ -62,6 +62,8 @@ class YunjiiSegmentPlanner:
                     {"default": "骨骼路线(WanVideo)",
                      "tooltip": "SCAIL-2 路线自动改用「每段81帧/重叠5/步进76」的官方分块规则；需与执行节点的后端选择一致"},
                 ),
+                "单遍连贯模式": ("BOOLEAN", {"default": False,
+                    "tooltip": "【实验】一镜到底下启用「单次超长生成(方案C)」：整片一次连贯去噪，latent 天然连续=真·一镜到底无接缝。代价：11s 长视频画质会被长程稀释下降(4步蒸馏)。默认关→走多段 seamless(质量优先)。仅 SCAIL-2 路线生效。"}),
             },
         }
 
@@ -72,7 +74,8 @@ class YunjiiSegmentPlanner:
         return True
 
     def plan(self, 分段信息, 运动提示词, 生成模式, 每段最大帧数, 重叠帧数, 目标分辨率,
-             目标帧率, 自适应参数, 姿态数据="", 负面提示词="", 生成后端="骨骼路线(WanVideo)"):
+             目标帧率, 自适应参数, 姿态数据="", 负面提示词="", 生成后端="骨骼路线(WanVideo)",
+             单遍连贯模式=False):
 
         # 归一化：旧工作流可能传英文值(one_shot 等)，统一映射为中文常量
         生成模式 = MODE_ALIASES.get(生成模式, 生成模式)
@@ -80,7 +83,8 @@ class YunjiiSegmentPlanner:
         backend = BACKEND_SCAIL2 if 生成后端 == "SCAIL-2 路线" else BACKEND_WANVIDEO
         if backend == BACKEND_SCAIL2 and 生成模式 != SEGMENT_MODE_ONE_SHOT:
             # SCAIL-2 官方分块规则：每段 81 帧、段间重叠 5、有效步进 76。
-            # 仅非一镜到底模式强制；一镜到底走「单次超长生成」(方案C)，不切段。
+            # 仅非一镜到底模式强制；一镜到底默认走「多段 seamless」(质量优先)，
+            # 仅当用户勾选「单遍连贯模式」时才走方案C 单次超长生成(真·一镜到底，画质代价)。
             if 每段最大帧数 != 81 or 重叠帧数 != 5:
                 info("Planner", "SCAIL-2 路线：分段参数已对齐官方规则（81帧/重叠5/步进76），"
                      "忽略用户设置 每段最大帧数=%d 重叠帧数=%d", 每段最大帧数, 重叠帧数)
@@ -113,17 +117,27 @@ class YunjiiSegmentPlanner:
 
         width, height = (int(x) for x in 目标分辨率.split("x"))
 
+        # 方案C 单遍判定：一镜到底 + SCAIL-2 + 长视频(>单段上限×1.5) + 用户显式勾选
+        total_frames = (max(e for _, e, _ in scenes) - min(s for s, _, _ in scenes)) if scenes else 0
+        单遍 = (
+            bool(单遍连贯模式)
+            and 生成模式 == SEGMENT_MODE_ONE_SHOT
+            and backend == BACKEND_SCAIL2
+            and total_frames > 每段最大帧数 * 1.5
+        )
+        if 单遍:
+            info("Planner", "方案C 单遍连贯模式启用：一镜到底长视频(%d帧) 改为单次超长生成(真·一镜到底)", total_frames)
+
         segments = self._build_segments(
             scenes, backend, 每段最大帧数, 重叠帧数, width, height,
             prompts, 生成模式, 目标帧率, 自适应参数, 负面提示词,
+            single_pass=单遍,
         )
 
-        # 一镜到底长视频不再走「单次超长生成(方案C)」：
-        # 11s 单遍用 context 滑窗一次去噪会被长程重度混合稀释，画质明显低于 5s 原生分段
-        # （好片 00006/00017 即 5s 分段，码率 1091~1490kbps；单遍 00018 仅 934kbps）。
-        # 改走下方多段 seamless 拼接：每段 81 帧(5s 原生)全质量生成，
+        # 一镜到底长视频默认走「多段 seamless」(质量优先)：每段 81 帧(5s 原生)全质量生成，
         # composer 强制 seamless 硬切丢重叠帧 = 零转场、零重复帧，质量对齐好片。
-        is_single_pass = False
+        # 仅当用户勾选「单遍连贯模式」(方案C)时 is_single_pass=True → 整片一次连贯去噪(真连贯，画质代价)。
+        is_single_pass = 单遍
         plan = SegmentPlan(
             mode=生成模式,
             total_segments=len(segments),
@@ -141,15 +155,50 @@ class YunjiiSegmentPlanner:
         return (plan_json, len(segments), summary)
 
     def _build_segments(self, scenes, backend, 每段最大帧数, 重叠帧数, width, height,
-                        prompts, 生成模式, target_fps, 自适应参数=True, 负面提示词=""):
+                        prompts, 生成模式, target_fps, 自适应参数=True, 负面提示词="",
+                        single_pass=False):
         """按指定后端的官方分块规则对 scenes 开窗建段。plan() 与 replan_for_backend() 共用。"""
         # 防御性归一化：兼容旧 plan JSON 里残存的英文模式值(one_shot 等)
         生成模式 = MODE_ALIASES.get(生成模式, 生成模式)
         segments = []
 
-        # —— 方案C 已停用（见上方 is_single_pass=False 注释）——
-        # 一镜到底长视频改走下方「多段 seamless」：每段 81 帧(5s 原生)全质量生成，
-        # composer 强制 seamless 硬切丢重叠帧 = 零转场，质量对齐 5s 好片。
+        # —— 方案C 单遍（仅当用户显式勾选「单遍连贯模式」时 single_pass=True）——
+        # 一镜到底长视频做成「单段覆盖全长」：整片一次连贯去噪，latent 天然连续 = 真·一镜到底无接缝。
+        # 代价：11s 长视频被长程重度混合稀释 → 画质下降(4步蒸馏)。多段 seamless 仍是默认质量优先路径。
+        if single_pass and 生成模式 == SEGMENT_MODE_ONE_SHOT and backend == BACKEND_SCAIL2:
+            full_start = min(s for s, _, _ in scenes) if scenes else 0
+            full_end = max(e for _, e, _ in scenes) if scenes else 0
+            full_duration = max(0, full_end - full_start)
+            if full_duration <= 0:
+                node_error("Planner", "方案C 单遍失败：视频时长无效")
+                return []
+            target_frames = max(9, ((full_duration - 1) // 4) * 4 + 1)
+            complexity = self._estimate_complexity(full_duration, target_fps)
+            if 自适应参数:
+                _, steps, cfg = self._adaptive_params(complexity, 每段最大帧数)
+            else:
+                steps, cfg = 30, 6.0
+            prompt = prompts[0] if prompts else ""
+            segments.append(SegmentInfo(
+                index=0,
+                start_frame=full_start,
+                end_frame=full_end,
+                target_frames=target_frames,
+                overlap_prev=0,
+                overlap_next=0,
+                complexity=complexity,
+                ref_strategy=REF_STRATEGY_USER_IMAGE,
+                prompt=prompt,
+                negative_prompt=负面提示词,
+                params={
+                    "steps": steps,
+                    "cfg": cfg,
+                    "denoise": 1.0,
+                    "width": width,
+                    "height": height,
+                },
+            ))
+            return segments
 
         for scene_idx, scene in enumerate(scenes):
             start, end, duration = scene
