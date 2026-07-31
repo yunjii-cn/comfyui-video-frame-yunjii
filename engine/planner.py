@@ -118,13 +118,12 @@ class YunjiiSegmentPlanner:
             prompts, 生成模式, 目标帧率, 自适应参数, 负面提示词,
         )
 
-        # 一镜到底单次超长(方案C)：单段且 target_frames 超过单段上限×1.5 即判定
-        is_single_pass = (
-            生成模式 == SEGMENT_MODE_ONE_SHOT and backend == BACKEND_SCAIL2
-            and len(segments) == 1 and segments
-            and segments[0].start_frame == 0
-            and segments[0].target_frames > 每段最大帧数 * 1.5
-        )
+        # 一镜到底长视频不再走「单次超长生成(方案C)」：
+        # 11s 单遍用 context 滑窗一次去噪会被长程重度混合稀释，画质明显低于 5s 原生分段
+        # （好片 00006/00017 即 5s 分段，码率 1091~1490kbps；单遍 00018 仅 934kbps）。
+        # 改走下方多段 seamless 拼接：每段 81 帧(5s 原生)全质量生成，
+        # composer 强制 seamless 硬切丢重叠帧 = 零转场、零重复帧，质量对齐好片。
+        is_single_pass = False
         plan = SegmentPlan(
             mode=生成模式,
             total_segments=len(segments),
@@ -148,32 +147,9 @@ class YunjiiSegmentPlanner:
         生成模式 = MODE_ALIASES.get(生成模式, 生成模式)
         segments = []
 
-        # —— 方案C：一镜到底单次超长生成（仅 SCAIL-2 路线）——
-        # 一镜到底 = 零转场连续长镜头。长驱动视频(>单段上限×1.5)时不切段，
-        # 整段作为单次生成：num_frames=全长对齐4k+1，由 WanVideoContextOptions
-        # 滑窗(81帧窗/48重叠)覆盖全帧，pose_latent 覆盖全帧 → 单次连贯去噪，
-        # 段边界问题彻底消失。骨骼路线无 context 滑窗，不走此路径(会 OOM)。
-        if 生成模式 == SEGMENT_MODE_ONE_SHOT and backend == BACKEND_SCAIL2 and scenes:
-            total = max(e for _, e, _ in scenes)
-            if total > 每段最大帧数 * 1.5:
-                aligned = max(9, ((total - 1) // 4) * 4 + 1)
-                segments.append(SegmentInfo(
-                    index=0,
-                    start_frame=0,
-                    end_frame=total,
-                    target_frames=aligned,
-                    overlap_prev=0,
-                    overlap_next=0,
-                    complexity=self._estimate_complexity(total, target_fps),
-                    ref_strategy=REF_STRATEGY_USER_IMAGE,
-                    prompt=prompts[0] if prompts else "smooth continuous motion, cinematic",
-                    negative_prompt=负面提示词,
-                    params={"steps": 30, "cfg": 6.0, "denoise": 1.0,
-                            "width": width, "height": height},
-                ))
-                info("Planner", "一镜到底单次超长(方案C): 全长%d帧→对齐%d帧, context滑窗覆盖全帧, 零转场不拼接",
-                     total, aligned)
-                return segments
+        # —— 方案C 已停用（见上方 is_single_pass=False 注释）——
+        # 一镜到底长视频改走下方「多段 seamless」：每段 81 帧(5s 原生)全质量生成，
+        # composer 强制 seamless 硬切丢重叠帧 = 零转场，质量对齐 5s 好片。
 
         for scene_idx, scene in enumerate(scenes):
             start, end, duration = scene

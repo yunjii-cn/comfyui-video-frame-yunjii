@@ -138,6 +138,22 @@ STITCH_TRANSITION = "transition"
 STITCH_AUTO = "auto"
 # 真·一镜到底：硬切 + 丢弃后续段头部的重叠帧（去重），零转场、零重复帧
 STITCH_SEAMLESS = "seamless"
+# 一镜到底重叠混合：在段间接缝处做短窗（淡化帧数）交叉溶解，软化位置跳变；
+# 注意：仅缓解位置不连续，无法修复动作(速度)跳变——真·连贯需生成侧前帧时序上下文(see 记忆)。
+STITCH_SEAMLESS_BLEND = "seamless_blend"
+
+# —— 拼接模式：中文标签（下拉显示） ↔ 英文值（内部逻辑/旧工作流存值） ——
+# 显示用中文，比较/存储仍用英文值；旧已保存的英文值（auto/transition...）仍兼容。
+STITCH_LABELS = [
+    (STITCH_HARD_CUT,       "硬切"),
+    (STITCH_CROSS_DISSOLVE, "交叉淡化"),
+    (STITCH_AUTO,           "自动"),
+    (STITCH_SEAMLESS,       "无缝一镜到底(零转场)"),
+    (STITCH_SEAMLESS_BLEND, "无缝一镜到底(重叠混合)"),
+    (STITCH_TRANSITION,     "ffmpeg转场"),
+]
+STITCH_LABEL_TO_VALUE = {label: value for value, label in STITCH_LABELS}
+STITCH_LABEL_TO_VALUE.update({value: value for value, _ in STITCH_LABELS})  # 旧英文值也能归一
 
 SEGMENT_MODE_ONE_SHOT = "一镜到底"
 SEGMENT_MODE_SMART_SPLIT = "智能分段"

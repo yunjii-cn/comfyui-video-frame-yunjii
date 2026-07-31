@@ -15,16 +15,40 @@ Yunjii 长视频完美模仿 —— 贯穿节点（Composer）
 """
 import logging
 import json
+import os
 
 from .runner import YunjiiSegmentRunner
-from .stitcher import YunjiiSegmentStitcher, _build_output_ui
-from .types import SEGMENT_MODE_ONE_SHOT, STITCH_SEAMLESS
+from .stitcher import YunjiiSegmentStitcher, _build_output_ui, XFADE_NAME_MAP
+from .types import (
+    SEGMENT_MODE_ONE_SHOT, STITCH_SEAMLESS, STITCH_SEAMLESS_BLEND, STITCH_TRANSITION,
+    STITCH_LABELS, STITCH_LABEL_TO_VALUE,
+)
 from .debug_log import node_start, node_end, node_error, info, warn
 
 logger = logging.getLogger(__name__)
 
-# 拼接模式与 stitcher 保持一致（避免与 stitcher 硬编码值漂移）
-_STITCH_MODES = ["hard_cut", "cross_dissolve", "auto", "seamless"]
+# 拼接模式下拉 = 中文标签（内部比较仍用英文值；旧 saved 英文值经 STITCH_LABEL_TO_VALUE 归一）
+_STITCH_MODES = [label for _, label in STITCH_LABELS]
+
+
+def _coerce_float(v, default):
+    """把 widget 值稳妥转成 float；空串/None/非法值回落到 default。
+    用于兼容旧工作流把数字 widget 存成 '' 的情况（避免校验期崩溃）。"""
+    if v is None or v == "":
+        return default
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_int(v, default):
+    if v is None or v == "":
+        return default
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return default
 
 
 class YunjiiVideoImitator:
@@ -60,10 +84,14 @@ class YunjiiVideoImitator:
                 "最大重试": ("INT", {"default": 3, "min": 0, "max": 10}),
                 "拼接模式": (
                     _STITCH_MODES,
-                    {"default": "auto", "tooltip": "硬切=直接拼接; 交叉淡化=平滑过渡; 自动=根据内容选择"},
+                    {"default": "ffmpeg转场", "tooltip": "硬切=直接拼接; 交叉淡化=像素级平滑过渡; 自动=根据内容选择; 无缝一镜到底(零转场)=硬切去重零转场; 无缝一镜到底(重叠混合)=接缝短窗交叉溶解软化跳变; ffmpeg转场=视频级高级转场(需选转场类型)"},
                 ),
                 "淡化帧数": ("INT", {"default": 8, "min": 2, "max": 30, "step": 1,
-                    "tooltip": "交叉淡化过渡帧数"}),
+                    "tooltip": "交叉淡化过渡帧数（仅 交叉淡化 模式生效）"}),
+                "转场类型": (list(XFADE_NAME_MAP.keys()), {"default": "淡入淡出",
+                    "tooltip": "ffmpeg xfade 视频级转场类型（仅 ffmpeg转场 拼接模式生效）。自动=固定淡入淡出；随机=每个接缝随机抽一种；推荐：淡入淡出"}),
+                "转场时长": ("STRING", {"default": "0.5",
+                    "tooltip": "转场时长(秒，填数字)，需小于每段时长，否则自动回退交叉淡化。推荐 0.5s"}),
                 "输出文件名": ("STRING", {"default": "yunjii_v2v", "tooltip": "输出文件名前缀"}),
             },
             "optional": {
@@ -71,7 +99,7 @@ class YunjiiVideoImitator:
                 "参考图": ("IMAGE", {"tooltip": "参考图（从LoadImage节点连线传入），优先使用"}),
                 "姿态图": ("IMAGE", {"tooltip": "姿态引导图（从VideoPoseExtractor节点连线传入）"}),
                 "人物参考图": ("STRING", {"default": "", "tooltip": "参考图文件名（input目录下），连线传入参考图时此项可忽略"}),
-                "起始段": ("INT", {"default": 0, "min": 0, "max": 100}),
+                "起始段": ("STRING", {"default": "0", "tooltip": "从第几段开始生成（填数字，默认0=从头）。兼容旧工作流空值"}),
                 "音频源": ("STRING", {"default": "", "tooltip": "原始参考视频路径，用于提取音频"}),
                 # —— 核心：单一效果模块，同时作用于生成相位与拼接相位 ——
                 "效果模块": ("STRING", {"default": "", "multiline": True,
@@ -83,8 +111,21 @@ class YunjiiVideoImitator:
 
     def imitate(self, 段落计划, 工作流模板, 执行模式, 最大重试, 拼接模式, 淡化帧数, 输出文件名,
                 生成后端="骨骼路线(WanVideo)", 视频路径="", 参考图=None, 姿态图=None, 人物参考图="",
-                起始段=0, 音频源="", 效果模块="", ComfyUI地址="127.0.0.1:8188"):
+                起始段=0, 音频源="", 效果模块="", ComfyUI地址="127.0.0.1:8188",
+                转场类型="淡入淡出", 转场时长=0.5):
         node_start("Imitator", 执行模式=执行模式, 生成后端=生成后端, 拼接模式=拼接模式, 效果模块=效果模块 or "(空)")
+        # —— 健壮性：widget 改为 STRING 后，旧工作流可能残留空串/非法值，这里兜底转换 ——
+        转场时长 = _coerce_float(转场时长, 0.5)
+        起始段 = _coerce_int(起始段, 0)
+        if 转场类型 not in XFADE_NAME_MAP:
+            info("Imitator", f"转场类型'{转场类型}'非法，回退默认'淡入淡出'")
+            转场类型 = "淡入淡出"
+
+        # —— 拼接模式中文标签 → 英文值归一（兼容旧 saved 英文值）——
+        _raw_mode = 拼接模式
+        拼接模式 = STITCH_LABEL_TO_VALUE.get(拼接模式, 拼接模式)
+        if _raw_mode != 拼接模式:
+            info("Imitator", "拼接模式归一: '%s' → '%s'", _raw_mode, 拼接模式)
 
         # —— 一镜到底：生成模式即「零转场连续长镜头」，拼接必须走 seamless(去重硬切) ——
         # 否则 auto 会在段边界连续(差异<30)时误选交叉淡化，产生可见溶解转场，违背一镜到底本意。
@@ -100,10 +141,13 @@ class YunjiiVideoImitator:
         except Exception:
             _plan_mode = ""
             _plan_single_pass = False
-        if _plan_mode == SEGMENT_MODE_ONE_SHOT and 拼接模式 != STITCH_SEAMLESS:
-            info("Imitator", "生成模式=一镜到底，强制拼接模式=无缝一镜到底(seamless)，忽略用户所选=%s", 拼接模式)
-            warn("Imitator", "一镜到底模式已强制使用「无缝一镜到底」拼接（去重硬切，零转场），忽略拼接模式=%s", 拼接模式)
-            拼接模式 = STITCH_SEAMLESS
+        # —— 一镜到底：拼接模式防呆 ——
+        # 一镜到底=连续长镜头，若用户选了 ffmpeg转场/交叉淡化/硬切(明显转场)，会破坏"一镜"观感。
+        # 自动(auto) 已落 seamless_blend；此处把其余"可见转场"选择也强制回退重叠混合，并打提示。
+        # 仅"无缝一镜到底(零转场)" 与 seamless_blend 被保留。
+        if _plan_mode == SEGMENT_MODE_ONE_SHOT and 拼接模式 not in (STITCH_SEAMLESS, STITCH_SEAMLESS_BLEND):
+            info("Imitator", "生成模式=一镜到底，拼接模式='%s' 会插入明显转场破坏连贯，强制回退「无缝一镜到底(重叠混合)」", _raw_mode)
+            拼接模式 = STITCH_SEAMLESS_BLEND
 
         # —— 单一效果模块，份传给两侧（本节点核心价值）——
         effects = 效果模块 or ""
@@ -134,6 +178,20 @@ class YunjiiVideoImitator:
                 _segs = _res.get("segments", [])
                 if _segs and _segs[0].get("video_path"):
                     _final = _segs[0]["video_path"]
+                    # 方案C 单遍跳过 stitcher，需在此补回音频混流（与多段路径一致）。
+                    # 优先「音频源」，为空则回退驱动「视频路径」（二者均带原参考视频音轨）。
+                    _audio_src = 音频源 or ""
+                    if not _audio_src and 视频路径 and str(视频路径).lower().endswith(
+                            (".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v")):
+                        _audio_src = 视频路径
+                    if _audio_src and os.path.isfile(_audio_src):
+                        try:
+                            _stitcher = YunjiiSegmentStitcher()
+                            _final = _stitcher._add_audio(_final, _audio_src, 输出文件名,
+                                                          _res.get("run_id", ""))
+                            info("Imitator", "一镜到底单遍已混入原始音频: %s", _final)
+                        except Exception as e:
+                            warn("Imitator", "单遍音频混流失败(不影响成片): %s", e)
                     info("Imitator", "一镜到底单次超长成片(方案C): %s (单次生成无需拼接)", _final)
                     node_end("Imitator", "单次超长完成")
                     return {"ui": _build_output_ui(_final),
@@ -146,6 +204,7 @@ class YunjiiVideoImitator:
         最终视频路径, 拼接报告 = stitcher.stitch(
             执行结果, 拼接模式, 淡化帧数, 输出文件名,
             音频源=音频源, 效果模块=effects,
+            转场类型=转场类型, 转场时长=转场时长,
         )
 
         if not 最终视频路径:

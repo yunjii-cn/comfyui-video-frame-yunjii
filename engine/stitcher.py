@@ -10,7 +10,32 @@ import folder_paths
 from .types import (
     SegmentResult,
     STITCH_HARD_CUT, STITCH_CROSS_DISSOLVE, STITCH_AUTO, STITCH_SEAMLESS,
+    STITCH_SEAMLESS_BLEND, STITCH_TRANSITION, STITCH_LABELS, STITCH_LABEL_TO_VALUE,
 )
+
+# ffmpeg xfade 转场：中文显示名 -> ffmpeg transition 名（仅 ffmpeg转场 拼接模式生效）。
+# 这些均为 ffmpeg 原生 xfade 支持的 transition；若值非法，_stitch_videos_xfade 会回退到交叉淡化。
+# 特殊键：自动=固定 fade（与默认等价）；随机=每次拼接为每个接缝随机抽取一种（同一次拼接内固定随机种子，可复现）。
+XFADE_NAME_MAP = {
+    "自动": "fade",
+    "淡入淡出": "fade",
+    "黑场过渡": "fadeblack",
+    "白场过渡": "fadewhite",
+    "圆形扩散": "circlecrop",
+    "矩形擦除": "rectcrop",
+    "横向擦除": "horzclose",
+    "纵向擦除": "vertclose",
+    "左滑": "slideleft",
+    "右滑": "slideright",
+    "上滑": "slideup",
+    "下滑": "slidedown",
+    "溶解": "dissolve",
+    "像素化": "pixelize",
+    "缩放进入": "zoomin",
+    "随机": "__random__",
+}
+# 随机可抽取的转场池（除 自动/随机 自身外的具体效果）
+XFADE_RANDOM_POOL = [v for k, v in XFADE_NAME_MAP.items() if v not in ("fade", "__random__")]
 from .pipeline import build_pipeline
 from .effects.base import EffectContext
 from .debug_log import node_start, node_end, node_error, debug, info, warn
@@ -23,9 +48,15 @@ def _build_xfade_filter(durations, xfade, dur):
 
     对 N 段视频，xfade 需逐对串联：第 i 次 xfade 的 offset = 当前已合并时长 - 转场时长。
     返回 (filter_complex 字符串, 最后一个输出 label)。各段时长必须 > dur，否则抛 ValueError。
+    xfade 可为单一字符串（所有接缝同款）或等长 list（每个接缝独立指定）。
     """
     if len(durations) < 2:
         raise ValueError("xfade 至少需要 2 段视频")
+    if isinstance(xfade, (list, tuple)):
+        if len(xfade) != len(durations) - 1:
+            raise ValueError(f"xfade 列表长度 {len(xfade)} 应与接缝数 {len(durations)-1} 一致")
+    else:
+        xfade = [xfade] * (len(durations) - 1)
     parts = []
     labels = ["0"]
     acc = durations[0]
@@ -36,7 +67,7 @@ def _build_xfade_filter(durations, xfade, dur):
         prev = labels[-1]
         out_label = f"x0{i}"
         parts.append(
-            f"[{prev}][{i}]xfade=transition={xfade}:duration={dur:.3f}:offset={offset:.3f}[{out_label}]"
+            f"[{prev}][{i}]xfade=transition={xfade[i-1]}:duration={dur:.3f}:offset={offset:.3f}[{out_label}]"
         )
         acc = acc + durations[i] - dur
         labels.append(out_label)
@@ -92,11 +123,15 @@ class YunjiiSegmentStitcher:
             "required": {
                 "执行结果": ("STRING", {"default": "", "tooltip": "来自链式执行引擎的执行结果JSON"}),
                 "拼接模式": (
-                    [STITCH_HARD_CUT, STITCH_CROSS_DISSOLVE, STITCH_AUTO, STITCH_SEAMLESS],
-                    {"default": STITCH_AUTO, "tooltip": "硬切=直接拼接; 交叉淡化=平滑过渡; 自动=根据内容选择; 无缝一镜到底=硬切并丢弃段间重叠帧(零转场)"},
+                    [label for _, label in STITCH_LABELS],
+                    {"default": "ffmpeg转场", "tooltip": "硬切=直接拼接; 交叉淡化=像素级平滑过渡; 自动=根据内容选择; 无缝一镜到底(零转场)=硬切去重零转场; 无缝一镜到底(重叠混合)=接缝短窗交叉溶解软化跳变; ffmpeg转场=视频级高级转场(需选转场类型)"},
                 ),
                 "淡化帧数": ("INT", {"default": 8, "min": 2, "max": 30, "step": 1,
-                    "tooltip": "交叉淡化过渡帧数"}),
+                    "tooltip": "交叉淡化过渡帧数（仅 交叉淡化 模式生效）"}),
+                "转场类型": (list(XFADE_NAME_MAP.keys()), {"default": "淡入淡出",
+                    "tooltip": "ffmpeg xfade 视频级转场类型（仅 ffmpeg转场 拼接模式生效）。自动=固定淡入淡出；随机=每个接缝随机抽一种；推荐：淡入淡出"}),
+                "转场时长": ("FLOAT", {"default": 0.5, "min": 0.1, "max": 2.0, "step": 0.1,
+                    "tooltip": "转场时长(秒)，需小于每段时长，否则自动回退交叉淡化。推荐 0.5s"}),
                 "输出文件名": ("STRING", {"default": "yunjii_v2v", "tooltip": "输出文件名前缀"}),
             },
             "optional": {
@@ -106,7 +141,9 @@ class YunjiiSegmentStitcher:
             },
         }
 
-    def stitch(self, 执行结果, 拼接模式, 淡化帧数, 输出文件名, 音频源="", 效果模块=""):
+    def stitch(self, 执行结果, 拼接模式, 淡化帧数, 输出文件名, 音频源="", 效果模块="", 转场类型="淡入淡出", 转场时长=0.5):
+        # 中文标签 → 英文值归一（兼容旧 saved 英文值 + stitcher 独立调用场景）
+        拼接模式 = STITCH_LABEL_TO_VALUE.get(拼接模式, 拼接模式)
         node_start("Stitcher", 拼接模式=拼接模式, 淡化帧数=淡化帧数, 输出文件名=输出文件名)
 
         if not 执行结果.strip():
@@ -161,16 +198,35 @@ class YunjiiSegmentStitcher:
         effect_pipeline = build_pipeline(效果模块)
         xfade = ""
         xfade_duration = 0.5
+        # ffmpeg转场 模式：直接用 UI 选择的转场类型/时长（优先于效果模块）
+        if 拼接模式 == STITCH_TRANSITION:
+            _xfade_key = XFADE_NAME_MAP.get(转场类型, "fade")
+            if _xfade_key == "__random__":
+                # 随机：同一次拼接内用固定随机种子，保证可复现；每个接缝独立抽奖。
+                import random as _random
+                _rng = _random.Random(12345)
+                _n_joints = max(0, len(videos) - 1)
+                xfade = [_rng.choice(XFADE_RANDOM_POOL) for _ in range(_n_joints)]
+                info("Stitcher", "ffmpeg转场模式: 随机转场, 接缝数=%d", _n_joints)
+            else:
+                xfade = _xfade_key
+            try:
+                xfade_duration = float(转场时长)
+            except (TypeError, ValueError):
+                xfade_duration = 0.5
+            info("Stitcher", "ffmpeg转场模式: transition=%s, duration=%.2fs", xfade, xfade_duration)
         if not effect_pipeline.is_empty:
             sp = {"mode": 拼接模式, "fade_frames": 淡化帧数, "add_audio": bool(音频源)}
             sp = effect_pipeline.transform_stitch(sp, EffectContext(metadata={"audio": 音频源}))
             拼接模式 = sp.get("mode", 拼接模式)
             淡化帧数 = int(sp.get("fade_frames", 淡化帧数))
-            xfade = sp.get("xfade", "") or ""
-            try:
-                xfade_duration = float(sp.get("xfade_duration", 0.5))
-            except (TypeError, ValueError):
-                xfade_duration = 0.5
+            # 仅当非 ffmpeg转场 模式时，才接受效果模块提供的 xfade
+            if not xfade:
+                xfade = sp.get("xfade", "") or ""
+                try:
+                    xfade_duration = float(sp.get("xfade_duration", xfade_duration))
+                except (TypeError, ValueError):
+                    xfade_duration = 0.5
             info("Stitcher", "已应用效果模块: %s", effect_pipeline.describe())
 
         try:
@@ -237,11 +293,12 @@ class YunjiiSegmentStitcher:
 
         if mode == STITCH_AUTO:
             # 一镜到底等链式模式：段间本就重叠(overlap_prev>0)，再做交叉淡化会出现重影/溶解转场 →
-            # 自动改用 seamless 去重硬切（零转场、零重复帧）。非重叠段仍按边界差异决定。
+            # 自动改用 seamless_blend 重叠混合（接缝短窗交叉溶解，软化位置跳变但保留零大转场观感）。
+            # 非重叠段仍按边界差异决定。
             has_overlap = any(int(v.get("overlap_prev", 0)) > 0 for v in video_items[1:])
             if has_overlap:
-                mode = STITCH_SEAMLESS
-                report.append("📊 检测到段间重叠(一镜到底链式)，自动改为 无缝一镜到底(去重硬切)")
+                mode = STITCH_SEAMLESS_BLEND
+                report.append("📊 检测到段间重叠(一镜到底链式)，自动改为 无缝一镜到底(重叠混合)")
             else:
                 mode = STITCH_HARD_CUT
                 if len(video_paths) > 1:
@@ -265,6 +322,39 @@ class YunjiiSegmentStitcher:
                         report.append(f"  ↳ 去重重叠 {drop} 帧（一镜到底）")
                     else:
                         all_frames.extend(frames)
+            report.append(f"  总帧数: {len(all_frames)}, 时长: {len(all_frames) / fps:.1f}s")
+            return self._write_frames(all_frames, output_path, fps, width, height)
+
+        # —— 一镜到底(重叠混合)：接缝处短窗交叉溶解，软化位置跳变 ——
+        # 段i保留完整；段i+1 丢弃头部重叠帧后，用「前段尾 b 帧」与「本段新头 b 帧」做交叉溶解，
+        # 把生硬硬切变成几帧的平滑过渡（b=min(重叠帧数, 淡化帧数)）。仅缓解位置不连续；
+        # 动作(速度)跳变属生成侧问题，需 previous_frames 时序上下文才能根治（见项目记忆）。
+        if mode == STITCH_SEAMLESS_BLEND:
+            all_frames = []
+            for i, v in enumerate(video_items):
+                frames = self._read_all_frames(v["path"], width, height)
+                report.append(f"  段{i}: {len(frames)}帧, {os.path.basename(v['path'])}")
+                if i == 0:
+                    all_frames.extend(frames)
+                    continue
+                O = int(v.get("overlap_prev", 0))
+                if O <= 0 or len(frames) <= O:
+                    all_frames.extend(frames)
+                    continue
+                b = max(2, min(O, int(fade_frames)))
+                prev_tail = all_frames[-b:] if len(all_frames) >= b else list(all_frames)
+                curr_new = frames[O:O + b]
+                n = min(len(prev_tail), len(curr_new))
+                blended = []
+                for j in range(n):
+                    alpha = (j + 1) / b
+                    blended.append(cv2.addWeighted(prev_tail[j], 1.0 - alpha, curr_new[j], alpha, 0))
+                if len(all_frames) >= b:
+                    all_frames[-b:] = blended
+                else:
+                    all_frames = blended
+                all_frames.extend(frames[O + b:])
+                report.append(f"  ↳ 接缝混合 {b} 帧（重叠{O}帧, 去重后交叉溶解）")
             report.append(f"  总帧数: {len(all_frames)}, 时长: {len(all_frames) / fps:.1f}s")
             return self._write_frames(all_frames, output_path, fps, width, height)
 
@@ -336,7 +426,10 @@ class YunjiiSegmentStitcher:
             raise RuntimeError("ffmpeg xfade 超时")
         if result.returncode != 0 or not os.path.isfile(output_path):
             raise RuntimeError("ffmpeg xfade 失败: " + (result.stderr or "")[-400:])
-        report.append(f"✨ 已用 ffmpeg xfade 转场（{xfade}，{dur:.2f}s）")
+        if isinstance(xfade, (list, tuple)):
+            report.append(f"✨ 已用 ffmpeg xfade 随机转场（{len(xfade)} 个接缝，{dur:.2f}s）")
+        else:
+            report.append(f"✨ 已用 ffmpeg xfade 转场（{xfade}，{dur:.2f}s）")
         return output_path
 
     def _read_all_frames(self, video_path, target_w, target_h):
