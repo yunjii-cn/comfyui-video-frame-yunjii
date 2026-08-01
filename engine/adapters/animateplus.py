@@ -179,6 +179,7 @@ class AnimatePlusSCAILAdapter(SCAILAdapter):
                 and ("class_type" in workflow_raw[first] or "type" in workflow_raw[first]):
             # 已是 API 格式
             api = self._prune_api_missing(dict(workflow_raw))
+            self._sanitize_numeric_inputs(api)
             self._fix_model_names(api)
             return api
         # UI 完整格式：手术 + 转换（与 SCAILAdapter 同套通用清理，但不跑
@@ -191,6 +192,7 @@ class AnimatePlusSCAILAdapter(SCAILAdapter):
         full = self._keep_main_chain(full)
         full = self._drop_bypassed(full)
         api = self._convert_full_to_api(full, self._node_class_mappings())
+        self._sanitize_numeric_inputs(api)
         self._fix_model_names(api)
         info("AnimatePlusAdapter", "prepare_workflow: 整理后 %d 个节点", len(api))
         return api
@@ -207,7 +209,12 @@ class AnimatePlusSCAILAdapter(SCAILAdapter):
         # 0) 主输出节点强制落盘（参考工作流里 VHS_VideoCombine.save_output 可能为 False，
         #    不强制会导致 ComfyUI 不写文件、runner 抓不到成片路径）
         if node_map.video_combine and node_map.video_combine in wf:
-            wf[node_map.video_combine].setdefault("inputs", {})["save_output"] = True
+            vc = wf[node_map.video_combine].setdefault("inputs", {})
+            vc["save_output"] = True
+            # 清理 VHS 输出前缀：模板常带 %date:yyyy-MM-dd% 等 Windows 非法路径 token，
+            # ComfyUI 不展开，直接传给 os.makedirs 会因 ':' 非法而崩溃(WinError 267)。
+            # 统一改写成安全、分段可定位的命名（与主线 yunjii_v2v 同源风格）。
+            vc["filename_prefix"] = "yunjii_tier2/seg%d" % seg.index
 
         # 1) 参考图（每段注入，保证身份一致）
         if char_ref and node_map.ref_image and node_map.ref_image in wf:

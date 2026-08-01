@@ -731,6 +731,52 @@ class SCAILAdapter(DirectAdapter):
         return api
 
     @staticmethod
+    def _sanitize_numeric_inputs(api):
+        """UI 工作流常把数值输入写成 'disabled' 等非法字符串（例如
+        WanAnimatePlus SCAIL_2 Embeds 的 ref_end_percent）。进程内 execute_inline
+        侥幸能跑（跳过 /prompt 的严格类型校验），但一旦前置节点修好、执行到该
+        节点就会因 float('disabled') 崩溃。这里用 object_info 类型声明，把
+        FLOAT/INT 输入里无法转数字的字符串替换为该字段默认值，保证两种执行路径都健壮。"""
+        oi = SCAILAdapter._object_info()
+        fixed = 0
+        for nid, nd in api.items():
+            ct = nd.get("class_type")
+            spec = oi.get(ct, {}).get("input", {}) if oi else {}
+            inputs_decl = {}
+            for cat in ("required", "optional"):
+                inputs_decl.update(spec.get(cat, {}))
+            if not inputs_decl:
+                continue
+            for k, v in list(nd.get("inputs", {}).items()):
+                if isinstance(v, list):
+                    continue  # 连线，不动
+                decl = inputs_decl.get(k)
+                if not (isinstance(decl, list) and decl):
+                    continue
+                typ = decl[0]
+                if typ in ("FLOAT", "INT") and isinstance(v, str):
+                    try:
+                        if typ == "INT":
+                            int(v)
+                        else:
+                            float(v)
+                    except (ValueError, TypeError):
+                        default = 0.0
+                        try:
+                            if isinstance(decl[1], dict):
+                                default = decl[1].get("default", 0.0)
+                        except Exception:
+                            pass
+                        default = int(default) if typ == "INT" else float(default)
+                        nd["inputs"][k] = default
+                        fixed += 1
+                        warn("SCAILAdapter", "sanitize: 节点%s(%s) 输入 '%s' 非法值 %r → 默认值 %s",
+                             nid, ct, k, v, default)
+        if fixed:
+            info("SCAILAdapter", "sanitize: 修正 %d 个非法数值输入", fixed)
+        return api
+
+    @staticmethod
     def _fix_model_names(api):
         """通用：凡 model_name / lora / lora_name 当前值不在本机该节点可用文件列表里，
         自动选最相近的可用文件（difflib 模糊匹配, sim>0.6）。
@@ -933,6 +979,7 @@ class SCAILAdapter(DirectAdapter):
         if first is not None and isinstance(workflow_raw[first], dict) \
                 and ("class_type" in workflow_raw[first] or "type" in workflow_raw[first]):
             api = self._prune_api_missing(dict(workflow_raw))
+            self._sanitize_numeric_inputs(api)
             self._fix_model_names(api)
             self._fix_pose_images(api)
             return api
@@ -954,6 +1001,7 @@ class SCAILAdapter(DirectAdapter):
         full = self._drop_bypassed(full)
         mappings = self._node_class_mappings()
         api = self._convert_full_to_api(full, mappings)
+        self._sanitize_numeric_inputs(api)
         missing = {nd["class_type"] for nd in api.values()
                    if nd["class_type"] not in mappings}
         if missing:
