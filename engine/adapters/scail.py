@@ -511,6 +511,42 @@ class SCAILAdapter(DirectAdapter):
         return full
 
     @staticmethod
+    def _drop_bypassed(full):
+        """删除 mode==4（ComfyUI 中『禁用/绕过(bypass)』）的节点，并断开其消费方连线。
+
+        ComfyUI 不执行 mode==4 节点，其输出视为断开。若只在 _convert_full_to_api 里
+        用 `mode==4: continue` 跳过该节点、却不清理它的输出连线，则下游消费方仍会引用
+        这个不存在的节点 id，导致内联执行报 NodeNotFoundError：
+        实测 Tier2 模板里被禁用的 LoraSelectMulti=node66 就触发了『Node 66 not found』
+        （其输出 link 62 仍指向 WanAnimatePlus SetLoRAs 的 lora 输入，转换后变成
+        [\"66\", slot] 悬空引用）。
+
+        这里与 _delete_unregistered 同理：断开消费方、清理 links、移除节点。
+        mode==4 节点的消费方输入断开后由 ComfyUI 当作未连接处理（对应输入默认 None，
+        如 SetLoRAs.lora），语义上等价于用户在 UI 里禁用该节点。"""
+        nodes = full.get("nodes", [])
+        links = full.get("links", [])
+        bypass_ids = {str(n["id"]) for n in nodes if (n.get("mode", 0) == 4)}
+        if not bypass_ids:
+            return full
+        for n in nodes:
+            if str(n["id"]) in bypass_ids:
+                continue
+            for i in n.get("inputs", []):
+                lnk = i.get("link")
+                if lnk is None:
+                    continue
+                src = next((l for l in links if l[0] == lnk), None)
+                if src and str(src[1]) in bypass_ids:
+                    i["link"] = None
+        full["links"] = [l for l in links
+                         if str(l[1]) not in bypass_ids and str(l[3]) not in bypass_ids]
+        full["nodes"] = [n for n in nodes if str(n["id"]) not in bypass_ids]
+        info("SCAILAdapter", "预处理：丢弃 %d 个禁用(bypass,mode=4)节点: %s",
+              len(bypass_ids), sorted(bypass_ids))
+        return full
+
+    @staticmethod
     def _delete_dangling_vhs(full):
         """删除 images 输入未连线(缺失/悬空)的 VHS_VideoCombine（例如已被删的姿势预览合成节点）。
         通用判定：只要其 images 输入没有指向一个现存节点输出，即视为悬空丢弃。"""
@@ -898,6 +934,7 @@ class SCAILAdapter(DirectAdapter):
         # 回退到「驱动帧作 pose_images」的可靠路径，避免执行 400。
         if not self._official_pose_runnable(full):
             full = self._drop_pose_branch(full)
+        full = self._drop_bypassed(full)
         mappings = self._node_class_mappings()
         api = self._convert_full_to_api(full, mappings)
         missing = {nd["class_type"] for nd in api.values()

@@ -487,6 +487,11 @@ class YunjiiSegmentRunner:
 
         node_class_mappings = YunjiiSegmentRunner._get_node_class_mappings()
 
+        # mode==4 的节点在 ComfyUI 里是『禁用/绕过(bypass)』，不执行且输出视为断开。
+        # 若消费方仍引用它的输出连线，转换后会指向不存在的节点 -> 执行报 NodeNotFoundError。
+        # 这里跳过这类连线（消费方输入视作未连接），与 _drop_bypassed 语义一致。
+        bypassed_ids = {str(n.get("id")) for n in nodes_list if (n.get("mode", 0) == 4)}
+
         api_workflow = {}
         for node in nodes_list:
             node_id = str(node.get("id", ""))
@@ -507,6 +512,8 @@ class YunjiiSegmentRunner:
                 link_id = inp.get("link")
                 if link_id is not None and link_id in link_map:
                     link_info = link_map[link_id]
+                    if link_info["src_node"] in bypassed_ids:
+                        continue
                     api_inputs[inp_name] = [link_info["src_node"], link_info["src_slot"]]
                     linked_inputs.add(inp_name)
 

@@ -189,6 +189,7 @@ class AnimatePlusSCAILAdapter(SCAILAdapter):
         full = self._delete_unregistered(full)
         full = self._delete_dangling_vhs(full)
         full = self._keep_main_chain(full)
+        full = self._drop_bypassed(full)
         api = self._convert_full_to_api(full, self._node_class_mappings())
         self._fix_model_names(api)
         info("AnimatePlusAdapter", "prepare_workflow: 整理后 %d 个节点", len(api))

@@ -172,7 +172,7 @@ class YunjiiVideoImitator:
             import traceback as _tb
             _detail = "".join(_tb.format_exception_only(type(_exc), _exc)).strip()
             _stack = _tb.format_exc()
-            node_error("Imitator", "生成阶段异常: %s", _detail)
+            node_error("Imitator", "生成阶段异常: %s" % _detail)
             info("Imitator", "异常堆栈:\n%s", _stack)
             node_end("Imitator", "生成失败(异常)")
             return ("", f"{执行日志}\n[异常] {_detail}", False)
@@ -186,7 +186,7 @@ class YunjiiVideoImitator:
         if not 完成状态:
             # 透传 runner 返回的真实错误信息（执行结果里含具体原因），不再笼统吞掉
             _err_msg = (执行结果 or "未知原因").strip()
-            node_error("Imitator", "生成阶段失败: %s", _err_msg)
+            node_error("Imitator", "生成阶段失败: %s" % _err_msg)
             node_end("Imitator", "生成失败")
             return ("", f"{执行日志}\n[生成失败] {_err_msg}", False)
 
