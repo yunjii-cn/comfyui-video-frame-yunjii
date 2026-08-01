@@ -282,6 +282,8 @@ class AnimatePlusSCAILAdapter(SCAILAdapter):
         if seg.index > 0 and prev_video_path and os.path.isfile(prev_video_path):
             self._inject_prefix(wf, node_map, prev_video_path)
 
+        # 防御：SCAIL 基座模型低步数 → 模糊（详见 _enforce_min_sampling_steps）
+        wf = self._enforce_min_sampling_steps(wf)
         return wf
 
     # ------------------------------------------------------------------
