@@ -9,7 +9,7 @@ from .types import (
     REF_STRATEGY_USER_IMAGE, REF_STRATEGY_PREV_LAST_FRAME, REF_STRATEGY_AUTO_SELECT,
     BACKEND_WANVIDEO, BACKEND_SCAIL2,
     CONTINUITY_MULTI_SEG, CONTINUITY_SINGLE_PASS, CONTINUITY_WARM_START,
-    CONTINUITY_AUTO, CONTINUITY_LABEL_TO_VALUE,
+    CONTINUITY_AUTO, CONTINUITY_LABEL_TO_VALUE, CONTINUITY_LABELS,
 )
 from .debug_log import node_start, node_end, node_error, debug, info, warn
 
@@ -67,8 +67,8 @@ class YunjiiSegmentPlanner:
                 "单遍连贯模式": ("BOOLEAN", {"default": False,
                     "tooltip": "【已并入连贯策略】旧开关，等价连贯策略=单遍连贯(方案C)。建议改用下方「连贯策略」下拉。"}),
                 "连贯策略": (
-                    [CONTINUITY_MULTI_SEG, CONTINUITY_SINGLE_PASS, CONTINUITY_WARM_START],
-                    {"default": CONTINUITY_MULTI_SEG,
+                    [label for _, label in CONTINUITY_LABELS],
+                    {"default": "多段无缝(默认)",
                      "tooltip": "生成侧时序连续性方案：多段无缝(默认,接缝化妆)=分段独立I2V+混合; "
                                 "单遍连贯(方案C)=整片一次去噪latent连续真·一镜到底,长视频画质软; "
                                 "暖启动(Tier2)=分段+上段真实帧喂回WanAnimatePlus prefix_frames,连续+画质兼得(需SCAIL-2路线+WanAnimatePlus)"},
