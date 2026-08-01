@@ -2,65 +2,87 @@
 Tier 2 暖启动适配器（AnimatePlus SCAIL-2 路线）。
 
 设计目标：把 SCAIL-2 生成从 WanVideoWrapper 家族重包进 WanAnimatePlus 家族
-（参考「分段队列」丝滑工作流的做法），用其原生时序建模 + 多段重叠融合得到
-「连续 + 画质」兼得的真·一镜到底；并对 seg>0 把上段真实成片末帧注入
-`WanAnimatePlus SCAIL_2 Embeds.prefix_frames`，做跨段暖启动（加分项）。
+（复用用户现成的「分段队列」丝滑工作流），用其原生时序建模 + 多段重叠融合得到
+「连续 + 画质」兼得的真·一镜到底；并对 seg>0 把上段真实成片末 5 帧经
+`VHS_LoadVideo` 截帧后注入 `WanAnimatePlus SCAIL_2 Embeds.prefix_frames`，
+做跨段暖启动（硬冻结到本段 latent 开头，6 个 prefix latent 预置）。
 
 复用：
-- DirectAdapter 的内联执行核心（execute_inline / init_executor / cleanup_executor /
-  _copy_to_input / _extract_last_frame）。
-- SCAILAdapter 的静态预处理（Set/Get 重连、Reroute 解析、未注册节点清理、
-  UI→API 转换、模型名模糊匹配、pose_images 回退）——这些与具体家族无关，通用。
+- SCAILAdapter 的全部静态手术（Set/Get 重连、Reroute 解析、未注册节点清理、
+  UI→API 转换、模型名模糊匹配）——与具体家族无关，通用。本适配器直接继承
+  SCAILAdapter，从而自然复用这些实例方法，只覆盖 discover / modify / prepare。
 
 非破坏性：若模板不是 WanAnimatePlus SCAIL_2 工作流（缺关键节点），discover 失败，
 runner 会优雅回退到标准 SCAIL 路线；prefix 注入任何异常都被 try/except 吞掉，
 最坏情况只是「无 prefix 的 WanAnimatePlus 多段」（仍比纯 WanVideoWrapper 连续）。
 
 注意：本适配器端到端跑通依赖本机 WanAnimatePlus 节点集 + 权重 + 显存，需用户在
-GPU 上验证（我方无 GPU）。若报错，回退「多段无缝」或「单遍连贯(方案C)」即可，
-现有 WanVideoWrapper SCAIL 路线不受影响。
+GPU 上验证。若报错，回退「多段无缝」或「单遍连贯(方案C)」即可，现有 WanVideoWrapper
+SCAIL 路线不受影响。
 """
 
 import os
 import json
 import cv2
 
-from .direct import DirectAdapter, NodeMap
 from .scail import SCAILAdapter, DEFAULT_NEGATIVE
 from ..debug_log import info, warn, error as log_error
 
-# WanAnimatePlus 家族关键 class_type
-AP_SCAIL_EMBEDS = "WanAnimatePlus SCAIL_2 Embeds"
+# WanAnimatePlus SCAIL-2 Embeds 节点的两种 class_type（本机运行版本 vs 磁盘新版）
+AP_SCAIL_EMBEDS_VARIANTS = ("WanAnimatePlus SCAIL_2 Embeds", "WanAnimatePlusSCAIL2Embeds")
 AP_SAMPLER_FROM_SETTINGS = "WanAnimatePlus SamplerFromSettings"
+AP_SAMPLER_SETTINGS = "WanAnimatePlus SamplerSettings"
 AP_SAMPLER = "WanAnimatePlus Sampler"
-AP_TEXT_ENCODE = "WanVideoTextEncodeCached"
-AP_VHS_LOADVIDEO = "VHS_LoadVideo"
-AP_REF_IMAGE = "LoadImage"
-AP_VIDEO_COMBINE = "VHS_VideoCombine"
-AP_IMAGEFROMBATCH = "ImageFromBatch"
+AP_MODEL_LOADER = "WanAnimatePlus ModelLoader"
 AP_CONTEXT_OPTIONS = "WanAnimatePlus ContextOptions"
+AP_TEXT_ENCODE_VARIANTS = ("WanAnimatePlus TextEncodeCached", "WanVideoTextEncodeCached")
+AP_VHS_LOADVIDEO = "VHS_LoadVideo"
+AP_LOADIMAGE = "LoadImage"
+AP_VIDEO_COMBINE = "VHS_VideoCombine"
+AP_VAE_LOADER_VARIANTS = ("WanAnimatePlus VAELoader", "WanVideo VAELoader")
+AP_CLIP_VISION_VARIANTS = ("WanAnimatePlus ClipVisionEncode V2", "WanVideoClipVisionEncode")
 
 # prefix_frames 最多注入帧数（WanAnimatePlus 限制 ≤5，最多 17 帧 prefix）
 PREFIX_MAX_FRAMES = 5
 
 
-class AnimatePlusNodeMap(NodeMap):
+class AnimatePlusNodeMap:
+    """Tier 2 节点映射（不继承 NodeMap，字段按本家族定制）。"""
+
     def __init__(self):
-        super().__init__()
-        self.driving_video = ""
-        self.ap_sampler = ""
+        self.animate_embeds = ""
+        self.sampler = ""
+        self.sampler_settings = ""
+        self.model_loader = ""
         self.context_options = ""
+        self.text_encode = ""
+        self.vae_loader = ""
+        self.clip_vision = ""
+        self.driving_video = ""
+        self.ref_image = ""
+        self.video_combine = ""
 
     def to_dict(self):
-        d = super().to_dict()
-        d.update({"ap_sampler": self.ap_sampler, "context_options": self.context_options})
-        return d
+        return {
+            "animate_embeds": self.animate_embeds,
+            "sampler": self.sampler,
+            "sampler_settings": self.sampler_settings,
+            "model_loader": self.model_loader,
+            "context_options": self.context_options,
+            "text_encode": self.text_encode,
+            "vae_loader": self.vae_loader,
+            "clip_vision": self.clip_vision,
+            "driving_video": self.driving_video,
+            "ref_image": self.ref_image,
+            "video_combine": self.video_combine,
+        }
 
     def is_valid(self):
-        return bool(self.animate_embeds and self.video_combine and self.ref_image and self.text_encode)
+        return bool(self.animate_embeds and self.sampler and self.video_combine
+                    and self.driving_video and self.ref_image)
 
 
-class AnimatePlusSCAILAdapter(DirectAdapter):
+class AnimatePlusSCAILAdapter(SCAILAdapter):
     """Tier 2 暖启动：WanAnimatePlus SCAIL_2 家族 + prefix_frames 跨段暖启动。"""
 
     def __init__(self, *args, **kwargs):
@@ -75,74 +97,72 @@ class AnimatePlusSCAILAdapter(DirectAdapter):
     def discover_nodes(self, workflow):
         nm = AnimatePlusNodeMap()
         vhs_candidates = []
-        for nid, ndata in DirectAdapter._iter_nodes(workflow):
+        for nid, ndata in workflow.items():
             if not isinstance(ndata, dict):
                 continue
             ct = ndata.get("class_type") or ndata.get("type", "")
-            if ct == AP_SCAIL_EMBEDS and not nm.animate_embeds:
+            if ct in AP_SCAIL_EMBEDS_VARIANTS and not nm.animate_embeds:
                 nm.animate_embeds = nid
-            elif ct in (AP_SAMPLER_FROM_SETTINGS, AP_SAMPLER) and not nm.ap_sampler:
-                nm.ap_sampler = nid
+            elif ct in (AP_SAMPLER_FROM_SETTINGS, AP_SAMPLER) and not nm.sampler:
                 nm.sampler = nid
-            elif ct == AP_TEXT_ENCODE and not nm.text_encode:
-                nm.text_encode = nid
-            elif ct == AP_VHS_LOADVIDEO and not nm.driving_video:
-                nm.driving_video = nid
-            elif ct == AP_VIDEO_COMBINE:
-                prefix, save_out = DirectAdapter._vhs_meta(ndata)
-                vhs_candidates.append((nid, prefix, save_out))
+            elif ct == AP_SAMPLER_SETTINGS and not nm.sampler_settings:
+                nm.sampler_settings = nid
+            elif ct == AP_MODEL_LOADER and not nm.model_loader:
+                nm.model_loader = nid
             elif ct == AP_CONTEXT_OPTIONS and not nm.context_options:
                 nm.context_options = nid
+            elif ct in AP_TEXT_ENCODE_VARIANTS and not nm.text_encode:
+                nm.text_encode = nid
+            elif ct in AP_VAE_LOADER_VARIANTS and not nm.vae_loader:
+                nm.vae_loader = nid
+            elif ct in AP_CLIP_VISION_VARIANTS and not nm.clip_vision:
+                nm.clip_vision = nid
+            elif ct == AP_VIDEO_COMBINE:
+                prefix, save_out = self._vhs_meta(ndata)
+                vhs_candidates.append((nid, prefix, save_out))
 
-        # 参考图：优先从 animate_embeds.ref_image 上游回溯到真正的 LoadImage
-        # （参考工作流里 ref 常经 Reroute/ImageResize 才连到 LoadImage）。
+        # 驱动视频：沿 embeds.pose_images 向上回溯，找第一个 VHS_LoadVideo
         if nm.animate_embeds and nm.animate_embeds in workflow:
-            ref_link = workflow[nm.animate_embeds].get("inputs", {}).get("ref_image")
-            if isinstance(ref_link, list) and len(ref_link) >= 1:
-                li = self._find_upstream_loadimage(workflow, ref_link[0])
-                if li:
-                    nm.ref_image = li
-        if not nm.ref_image:
-            # 退化：title 含 参考/reference/人物 的 LoadImage（兼容中文标题）
-            for nid, ndata in DirectAdapter._iter_nodes(workflow):
-                if isinstance(ndata, dict) and ndata.get("class_type") == AP_REF_IMAGE:
-                    title = (ndata.get("title") or ndata.get("_meta", {}).get("title") or "")
-                    if any(k in title.lower() for k in ("参考", "reference", "ref", "人物")):
-                        nm.ref_image = nid
-                        break
-        if not nm.ref_image:
-            # 再退化：第一个 LoadImage
-            for nid, ndata in DirectAdapter._iter_nodes(workflow):
-                if isinstance(ndata, dict) and ndata.get("class_type") == AP_REF_IMAGE:
-                    nm.ref_image = nid
-                    break
+            nm.driving_video = self._trace_to_class(
+                workflow, nm.animate_embeds, "pose_images", AP_VHS_LOADVIDEO)
+        # 参考图：沿 embeds.ref_image 向上回溯，找第一个 LoadImage
+        if nm.animate_embeds and nm.animate_embeds in workflow:
+            nm.ref_image = self._trace_to_class(
+                workflow, nm.animate_embeds, "ref_image", AP_LOADIMAGE)
 
-        nm.video_combine = DirectAdapter._select_primary_vhs(vhs_candidates)
+        nm.video_combine = self._select_primary_vhs(vhs_candidates)
         if not nm.is_valid():
             miss = [n for n, v in [
                 ("WanAnimatePlus SCAIL_2 Embeds", nm.animate_embeds),
+                ("WanAnimatePlus Sampler", nm.sampler),
                 ("VHS_VideoCombine", nm.video_combine),
-                ("LoadImage", nm.ref_image),
-                ("WanVideoTextEncodeCached", nm.text_encode),
+                ("VHS_LoadVideo(驱动)", nm.driving_video),
+                ("LoadImage(参考)", nm.ref_image),
             ] if not v]
             warn("AnimatePlusAdapter", "工作流缺少必要 WanAnimatePlus 节点: %s", ", ".join(miss))
         return nm
 
-    def _find_upstream_loadimage(self, workflow, start_node_id, max_depth=10):
-        """从某节点沿 link([src_node, slot]) 向上回溯，返回第一个 LoadImage 的 id。"""
-        seen = set()
-        stack = [start_node_id]
+    def _trace_to_class(self, workflow, start_node, start_input, target_class, max_depth=12):
+        """从 start_node 的 start_input 链接出发，沿输入链向上回溯，
+        返回第一个 class_type==target_class 的祖先节点 id；找不到返回 ''。"""
+        node = workflow.get(start_node)
+        if not isinstance(node, dict):
+            return ""
+        link = node.get("inputs", {}).get(start_input)
+        if not (isinstance(link, list) and len(link) >= 1):
+            return ""
+        seen, stack = set(), [str(link[0])]
         while stack and len(seen) < max_depth + 1:
             nid = stack.pop()
             if nid in seen:
                 continue
             seen.add(nid)
-            node = workflow.get(nid)
-            if not isinstance(node, dict):
+            nd = workflow.get(nid)
+            if not isinstance(nd, dict):
                 continue
-            if node.get("class_type") == AP_REF_IMAGE:
+            if nd.get("class_type") == target_class:
                 return nid
-            for v in node.get("inputs", {}).values():
+            for v in nd.get("inputs", {}).values():
                 if isinstance(v, list) and len(v) == 2 and isinstance(v[0], str):
                     stack.append(v[0])
         return ""
@@ -157,18 +177,20 @@ class AnimatePlusSCAILAdapter(DirectAdapter):
         first = next(iter(workflow_raw), None)
         if first is not None and isinstance(workflow_raw[first], dict) \
                 and ("class_type" in workflow_raw[first] or "type" in workflow_raw[first]):
-            api = SCAILAdapter._prune_api_missing(dict(workflow_raw))
-            SCAILAdapter._fix_model_names(api)
-            # _fix_pose_images 作用于 WanVideoAddSCAILPoseEmbeds，本家族无该节点→安全 no-op
+            # 已是 API 格式
+            api = self._prune_api_missing(dict(workflow_raw))
+            self._fix_model_names(api)
             return api
+        # UI 完整格式：手术 + 转换（与 SCAILAdapter 同套通用清理，但不跑
+        # WanVideoWrapper 专属的 _fix_pose_images / 姿态分支丢弃）
         full = json.loads(json.dumps(workflow_raw))
-        full = SCAILAdapter._rewire_setget(full)
-        full = SCAILAdapter._resolve_reroutes(full)
-        full = SCAILAdapter._delete_unregistered(full)
-        full = SCAILAdapter._delete_dangling_vhs(full)
-        full = SCAILAdapter._keep_main_chain(full)
-        api = SCAILAdapter._convert_full_to_api(full, SCAILAdapter._node_class_mappings())
-        SCAILAdapter._fix_model_names(api)
+        full = self._rewire_setget(full)
+        full = self._resolve_reroutes(full)
+        full = self._delete_unregistered(full)
+        full = self._delete_dangling_vhs(full)
+        full = self._keep_main_chain(full)
+        api = self._convert_full_to_api(full, self._node_class_mappings())
+        self._fix_model_names(api)
         info("AnimatePlusAdapter", "prepare_workflow: 整理后 %d 个节点", len(api))
         return api
 
@@ -181,6 +203,11 @@ class AnimatePlusSCAILAdapter(DirectAdapter):
         wf = json.loads(json.dumps(workflow))
         char_ref = user_ref_path or ref_image_path
 
+        # 0) 主输出节点强制落盘（参考工作流里 VHS_VideoCombine.save_output 可能为 False，
+        #    不强制会导致 ComfyUI 不写文件、runner 抓不到成片路径）
+        if node_map.video_combine and node_map.video_combine in wf:
+            wf[node_map.video_combine].setdefault("inputs", {})["save_output"] = True
+
         # 1) 参考图（每段注入，保证身份一致）
         if char_ref and node_map.ref_image and node_map.ref_image in wf:
             img_name = self._copy_to_input(char_ref)
@@ -188,20 +215,17 @@ class AnimatePlusSCAILAdapter(DirectAdapter):
                 wf[node_map.ref_image].setdefault("inputs", {})["image"] = img_name
                 info("AnimatePlusAdapter", "参考图注入: node=%s, image=%s", node_map.ref_image, img_name)
 
-        # 2) WanAnimatePlus SCAIL_2 Embeds：分辨率 + 帧数（4k+1 对齐）
+        # 2) WanAnimatePlus SCAIL_2 Embeds：帧数（4k+1 对齐）+ frame_window_size
         if node_map.animate_embeds and node_map.animate_embeds in wf:
             ae = wf[node_map.animate_embeds]
             ae.setdefault("inputs", {})
-            w = seg.params.get("width", 832) if isinstance(seg.params, dict) else 832
-            h = seg.params.get("height", 480) if isinstance(seg.params, dict) else 480
             n = seg.target_frames
             aligned = max(9, ((n - 1) // 4) * 4 + 1)
-            ae["inputs"]["width"] = w
-            ae["inputs"]["height"] = h
             ae["inputs"]["num_frames"] = aligned
             if "frame_window_size" in ae["inputs"]:
                 ae["inputs"]["frame_window_size"] = aligned
-            info("AnimatePlusAdapter", "Embeds: width=%d height=%d num_frames=%d(aligned %d)", w, h, n, aligned)
+            info("AnimatePlusAdapter", "Embeds: num_frames=%d(aligned %d), 段索引=%d",
+                 n, aligned, seg.index)
 
         # 3) 驱动视频（动作源）+ 分段偏移 + 段长
         if node_map.driving_video and node_map.driving_video in wf and self.driving_video_path \
@@ -214,18 +238,39 @@ class AnimatePlusSCAILAdapter(DirectAdapter):
             di["frame_load_cap"] = seg.target_frames
             if "select_every_nth" in di:
                 di["select_every_nth"] = 1
-            info("AnimatePlusAdapter", "驱动视频: %s, 偏移=%d, 段长=%d", fname, seg.start_frame, seg.target_frames)
-        elif node_map.driving_video:
+            info("AnimatePlusAdapter", "驱动视频: %s, 偏移=%d, 段长=%d",
+                 fname, seg.start_frame, seg.target_frames)
+        elif node_map.driving_video and not (self.driving_video_path
+                                             and os.path.isfile(self.driving_video_path)):
             warn("AnimatePlusAdapter", "未设置驱动视频路径，WanAnimatePlus SCAIL-2 无法生成动作")
 
         # 4) 提示词
         if node_map.text_encode and node_map.text_encode in wf:
+            neg = (seg.params.get("negative") if isinstance(seg.params, dict) else None) \
+                or DEFAULT_NEGATIVE
             self._set(wf, node_map.text_encode, "positive_prompt", seg.prompt or "")
-            self._set(wf, node_map.text_encode, "negative_prompt",
-                      (seg.params.get("negative") if isinstance(seg.params, dict) else None)
-                      or DEFAULT_NEGATIVE)
+            self._set(wf, node_map.text_encode, "negative_prompt", neg)
 
-        # 5) prefix_frames 暖启动（seg>0）：上段成片末帧 → 硬冻结到本段 latent 开头
+        # 5) 上下文窗口随段长收缩（防御性：不超过 num_frames）
+        if node_map.context_options and node_map.context_options in wf:
+            co = wf[node_map.context_options].setdefault("inputs", {})
+            if "context_frames" in co:
+                cur = co["context_frames"]
+                try:
+                    cur = int(cur)
+                except (TypeError, ValueError):
+                    cur = 81
+                co["context_frames"] = min(cur, seg.target_frames) if seg.target_frames < cur else cur
+
+        # 6) 模型精度（仅 fp16 时调整 base_precision；fp8 保持工作流默认）
+        if self.model_precision == "fp16" and node_map.model_loader and node_map.model_loader in wf:
+            ml = wf[node_map.model_loader].setdefault("inputs", {})
+            if "base_precision" in ml:
+                ml["base_precision"] = "fp16_fast"
+            if "quantization" in ml:
+                ml["quantization"] = "disabled"
+
+        # 7) prefix_frames 暖启动（seg>0）：上段成片末帧 → 硬冻结到本段 latent 开头
         if seg.index > 0 and prev_video_path and os.path.isfile(prev_video_path):
             self._inject_prefix(wf, node_map, prev_video_path)
 
@@ -239,9 +284,13 @@ class AnimatePlusSCAILAdapter(DirectAdapter):
             if not node_map.animate_embeds or node_map.animate_embeds not in wf:
                 return
             ae = wf[node_map.animate_embeds]
-            if "prefix_frames" not in ae.get("inputs", {}):
-                return  # 该节点版本不支持 prefix
-            if ae["inputs"].get("prefix_frames") is not None:
+            # 该节点类（WanAnimatePlus SCAIL_2 Embeds）原生支持 prefix_frames。
+            # 未连线的可选输入在 UI→API 转换后不会出现在 inputs 里，此时应直接注入；
+            # 仅当模板已硬占用 prefix_frames（非 None）时才跳过。
+            ct = ae.get("class_type", "")
+            if ct not in AP_SCAIL_EMBEDS_VARIANTS:
+                return  # 未知节点，不冒险注入
+            if ae.get("inputs", {}).get("prefix_frames") is not None:
                 return  # 已被模板占用，不覆盖
 
             # 复制上段成片到 input 目录（与驱动视频同机制），用 VHS 加载其尾部帧
@@ -256,31 +305,30 @@ class AnimatePlusSCAILAdapter(DirectAdapter):
                 warn("AnimatePlusAdapter", "prefix: 上段成片无有效帧，跳过 prefix 注入")
                 return
 
-            vhs_id = "yunjii_prev_vhs"
-            ifb_id = "yunjii_prev_ifb"
+            # 直接让 VHS 加载最后 n 帧（skip_first_frames = max(0,total-n), cap=n），
+            # 输出 IMAGE 直连 prefix_frames，避免 ImageFromBatch 负索引歧义。
+            vhs_id = "yunjii_prev_vhs_%d" % (abs(hash(prev_video_path)) % 100000)
             wf[vhs_id] = {
                 "class_type": AP_VHS_LOADVIDEO,
                 "inputs": {
                     "video": fname,
                     "force_rate": 0,
-                    "frame_load_cap": 0,   # 0=全加载，由 ImageFromBatch 抽尾帧
-                    "skip_first_frames": 0,
+                    "custom_width": 0,
+                    "custom_height": 0,
+                    "frame_load_cap": n,
+                    "skip_first_frames": max(0, (total or n) - n),
                     "select_every_nth": 1,
+                    "format": "Wan",
                 },
             }
-            wf[ifb_id] = {
-                "class_type": AP_IMAGEFROMBATCH,
-                "inputs": {
-                    "image": [vhs_id, 0],
-                    "batch_index": -n,
-                    "length": n,
-                },
-            }
-            ae["inputs"]["prefix_frames"] = [ifb_id, 0]
+            ae["inputs"]["prefix_frames"] = [vhs_id, 0]
             info("AnimatePlusAdapter", "prefix_frames 注入: 上段成片%s → 末%d帧暖启动", prev_video_path, n)
         except Exception as e:
             warn("AnimatePlusAdapter", "prefix_frames 注入异常(已跳过，不影响主生成): %s", str(e)[:200])
 
+    # ------------------------------------------------------------------
+    # 工具
+    # ------------------------------------------------------------------
     @staticmethod
     def _video_frame_count(video_path):
         """返回视频总帧数；失败返回 None。"""

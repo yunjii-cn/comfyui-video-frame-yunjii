@@ -36,9 +36,11 @@ SCAIL_NODE_MARKER = "WanVideoAddSCAILReferenceEmbeds"
 
 # WanAnimatePlus SCAIL_2 家族标记（Tier 2 暖启动路线）
 AP_NODE_MARKER = "WanAnimatePlus SCAIL_2 Embeds"
-# Tier 2 内置参考工作流（若存在则暖启动可不提供模板）。本机缺省时应由用户粘贴。
+# Tier 2 内置参考工作流（暖启动可不提供模板，自动用此文件）。
+# 来源：用户云集智能目录下同名丝滑工作流（含 WanAnimatePlus SCAIL_2 Embeds 节点），
+# 复制为 ASCII 命名以便稳定引用；prepare_workflow 会按需转 API 格式。
 AP_WORKFLOW_DEFAULT = os.path.join(
-    PLUGIN_ROOT, "workflows", "WanAnimatePlus_SCAIL2_参考.json"
+    PLUGIN_ROOT, "workflows", "Tier2_WanAnimatePlus_SCAIL2_template.json"
 )
 
 
