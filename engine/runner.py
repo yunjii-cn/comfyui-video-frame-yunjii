@@ -173,7 +173,16 @@ class YunjiiSegmentRunner:
             return (段落计划, summary, True)
 
         template_text = (工作流模板 or "").strip()
-        # 模板所含 SCAIL 家族判定
+        # 若是文件路径，先读成内容；后续所有家族判定都基于内容而非路径
+        # （否则 WanAnimatePlus 模板在『路径字符串』阶段会被误判，导致暖启动提前报错）。
+        if template_text and os.path.isfile(template_text):
+            try:
+                with open(template_text, "r", encoding="utf-8") as f:
+                    template_text = f.read()
+                info("Runner", "从文件加载工作流模板: %s", 工作流模板.strip())
+            except Exception as e:
+                return ("", f"⚠ 无法读取模板文件 {工作流模板}: {e}", False)
+        # 模板所含 SCAIL 家族判定（基于内容）
         is_ap_template = (AP_NODE_MARKER in template_text)
         is_std_scail_template = (SCAIL_NODE_MARKER in template_text)
 
@@ -182,14 +191,24 @@ class YunjiiSegmentRunner:
             # 暖启动(Tier2) 优先用 WanAnimatePlus 参考工作流；否则用标准 SCAIL 子流程。
             if not (is_ap_template or is_std_scail_template):
                 if _strategy == CONTINUITY_WARM_START and os.path.isfile(AP_WORKFLOW_DEFAULT):
-                    template_text = AP_WORKFLOW_DEFAULT
-                    info("Runner", "暖启动(Tier2): 使用内置 WanAnimatePlus 参考工作流 %s", AP_WORKFLOW_DEFAULT)
+                    try:
+                        with open(AP_WORKFLOW_DEFAULT, "r", encoding="utf-8") as f:
+                            template_text = f.read()
+                        info("Runner", "暖启动(Tier2): 使用内置 WanAnimatePlus 参考工作流 %s", AP_WORKFLOW_DEFAULT)
+                    except Exception as e:
+                        return ("", f"⚠ 无法读取内置 Tier2 模板 {AP_WORKFLOW_DEFAULT}: {e}", False)
+                    is_ap_template = True
                 elif os.path.isfile(SCAIL_WORKFLOW_DEFAULT):
-                    template_text = SCAIL_WORKFLOW_DEFAULT
-                    info("Runner", "SCAIL-2 路线：使用内置官方工作流 %s", SCAIL_WORKFLOW_DEFAULT)
+                    try:
+                        with open(SCAIL_WORKFLOW_DEFAULT, "r", encoding="utf-8") as f:
+                            template_text = f.read()
+                        info("Runner", "SCAIL-2 路线：使用内置官方工作流 %s", SCAIL_WORKFLOW_DEFAULT)
+                    except Exception as e:
+                        return ("", f"⚠ 无法读取内置 SCAIL 模板 {SCAIL_WORKFLOW_DEFAULT}: {e}", False)
+                    is_std_scail_template = True
                 elif not template_text:
                     return ("", "⚠ SCAIL-2 路线缺少工作流模板，请粘贴 ComfyUI 工作流JSON或输入JSON文件路径", False)
-            # 重判模板家族（若上面填了默认）
+            # 重判模板家族（若上面填了默认，或用户直接粘贴内容）
             is_ap_template = (AP_NODE_MARKER in template_text)
             is_std_scail_template = (SCAIL_NODE_MARKER in template_text)
             if _strategy == CONTINUITY_WARM_START and not is_ap_template:

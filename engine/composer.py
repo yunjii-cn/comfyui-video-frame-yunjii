@@ -161,12 +161,21 @@ class YunjiiVideoImitator:
 
         # 1) 生成相位：调用链式执行引擎，效果模块作用于每段 prompt/params
         runner = YunjiiSegmentRunner()
-        执行结果, 执行日志, 完成状态 = runner.run(
-            段落计划, 工作流模板, 执行模式, 最大重试,
-            生成后端=生成后端, 视频路径=视频路径, 参考图=参考图, 姿态图=姿态图,
-            人物参考图=人物参考图, 起始段=起始段, 效果模块=effects, ComfyUI地址=ComfyUI地址,
-            连贯策略=_plan_continuity, 模型精度=_plan_precision,
-        )
+        try:
+            执行结果, 执行日志, 完成状态 = runner.run(
+                段落计划, 工作流模板, 执行模式, 最大重试,
+                生成后端=生成后端, 视频路径=视频路径, 参考图=参考图, 姿态图=姿态图,
+                人物参考图=人物参考图, 起始段=起始段, 效果模块=effects, ComfyUI地址=ComfyUI地址,
+                连贯策略=_plan_continuity, 模型精度=_plan_precision,
+            )
+        except Exception as _exc:
+            import traceback as _tb
+            _detail = "".join(_tb.format_exception_only(type(_exc), _exc)).strip()
+            _stack = _tb.format_exc()
+            node_error("Imitator", "生成阶段异常: %s", _detail)
+            info("Imitator", "异常堆栈:\n%s", _stack)
+            node_end("Imitator", "生成失败(异常)")
+            return ("", f"{执行日志}\n[异常] {_detail}", False)
 
         # 仅规划：runner 已返回计划摘要，直接短路，不做拼接
         if 执行模式 == "仅规划":
@@ -175,9 +184,11 @@ class YunjiiVideoImitator:
             return ("", 执行日志, 完成状态)
 
         if not 完成状态:
-            node_error("Imitator", "生成阶段失败，终止")
+            # 透传 runner 返回的真实错误信息（执行结果里含具体原因），不再笼统吞掉
+            _err_msg = (执行结果 or "未知原因").strip()
+            node_error("Imitator", "生成阶段失败: %s", _err_msg)
             node_end("Imitator", "生成失败")
-            return ("", 执行日志, False)
+            return ("", f"{执行日志}\n[生成失败] {_err_msg}", False)
 
         # 一镜到底单次超长(方案C)：单段即成片，无需拼接，直接返回该段视频
         if _plan_single_pass:
