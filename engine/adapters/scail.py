@@ -760,8 +760,25 @@ class SCAILAdapter(DirectAdapter):
                     continue
                 if cur in opts:
                     continue
+                # 文本编码器家族感知：WanVideoTextEncode* 节点只要 Wan 的 umT5，
+                # 且显式拒绝 fp8_scaled（节点加载时会 raise）。避免 umt5 类名字
+                # 因共享 'fp8_e4m3fn' 后缀被 difflib 错配到 SDXL 的 t5xxl
+                # （t5xxl 仅 block0 有 relative_attention_bias，转换后缺
+                #  blocks.N.pos_embedding，umt5_xxl 模型加载即 KeyError）。
+                cands = opts
+                if ct.lower().startswith("wanvideotextencode"):
+                    cl = cur.lower()
+                    if "umt5" in cl:
+                        pref = [o for o in opts
+                                if "umt5" in o.lower() and "scaled" not in o.lower()]
+                        if pref:
+                            cands = pref
+                    elif "t5xxl" in cl or "t5-xxl" in cl:
+                        pref = [o for o in opts if "t5xxl" in o.lower()]
+                        if pref:
+                            cands = pref
                 best, bestr = None, 0.0
-                for o in opts:
+                for o in cands:
                     r = difflib.SequenceMatcher(None, cur.lower(), o.lower()).ratio()
                     if r > bestr:
                         bestr, best = r, o
