@@ -304,9 +304,95 @@ class SCAILAdapter(DirectAdapter):
 
         info("SCAILAdapter", "核心参数: width=%d, height=%d, num_frames=%d, seed=%d",
              w, h, n, (1234567 + seg.index * 101) & 0xFFFFFFFF)
+
+        # 蒸馏 LoRA 路线：固定 4 步快速（步数蒸馏 LoRA 为 4 步设计，高步数反而崩坏）。
+        # 同时把模型/LoRA 显式钉到本机真实存在的文件，避免模板错位文件(不存在的
+        # preview 模型 / rank64 蒸馏 LoRA 名)作怪。
+        if SCAILAdapter._workflow_has_distill_lora(wf):
+            # 蒸馏 LoRA 路线：凡是带 steps 输入的采样/调度节点，一律钉到 4 步(快速)。
+            # 步数蒸馏 LoRA 为 4 步设计，高步数会因 schedule 错配产生结构性崩坏伪影。
+            # 覆盖两类挂载方式：调度器(WanVideoSchedulerv2) 与 采样器设置
+            # (WanAnimatePlus SamplerSettings / WanVideoSamplerv2)，两条路线都修。
+            for nid, nd in wf.items():
+                if not isinstance(nd, dict):
+                    continue
+                ct = nd.get("class_type") or ""
+                if not any(k in ct for k in ("Schedulerv2", "Scheduler",
+                                             "SamplerSettings", "Samplerv2", "Sampler")):
+                    continue
+                inp = nd.get("inputs")
+                if isinstance(inp, dict) and "steps" in inp:
+                    if int(inp.get("steps", 0)) != 4:
+                        inp["steps"] = 4
+                        info("SCAILAdapter", "蒸馏 LoRA 路线: %s(%s) 步数→4(快速)", nid, ct)
+            self._pin_distill_lora_and_model(wf)
+
         # 防御：SCAIL 基座模型低步数 → 模糊（详见 _enforce_min_sampling_steps）
         wf = self._enforce_min_sampling_steps(wf)
         return wf
+
+    @staticmethod
+    def _pin_distill_lora_and_model(wf):
+        """蒸馏 LoRA 路线：把模型与蒸馏 LoRA 显式钉到本机真实存在的文件。
+
+        背景：官方 SCAIL 模板节点默认指向 Wan21-14B-SCAIL-preview_fp8_e4m3fn_scaled_KJ
+        (模型) 与 lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16 (LoRA)，二者在本机
+        均不存在；_detect_scail_model 已把模型替成 wan2.1_14B_SCAIL_2_fp8_scaled，但
+        LoRA 仅靠 _fix_model_names 模糊匹配，可能因同名权重多而选错。这里显式锁定：
+        模型 = wan2.1_14B_SCAIL_2_fp8_scaled，蒸馏 LoRA = lightx2v_I2V_14B_480p_cfg_step_distill_rank256_bf16。
+        """
+        import os as _os
+        dm_dirs = []
+        try:
+            import folder_paths
+            dm_dirs = folder_paths.get_folder_paths("diffusion_models") or []
+        except Exception:
+            pass
+        if not dm_dirs:
+            dm_dirs = [r"F:\ComfyUI_heihe\ComfyUI\models\diffusion_models"]
+        lora_dirs = []
+        try:
+            lora_dirs = folder_paths.get_folder_paths("loras") or []
+        except Exception:
+            pass
+        if not lora_dirs:
+            lora_dirs = [r"F:\ComfyUI_heihe\ComfyUI\models\loras"]
+
+        target_model = "wan2.1_14B_SCAIL_2_fp8_scaled.safetensors"
+        target_lora = _os.path.join("wan", "lightx2v_I2V_14B_480p_cfg_step_distill_rank256_bf16.safetensors")
+
+        def _exists(name, dirs):
+            for d in dirs:
+                if _os.path.isfile(_os.path.join(d, name)):
+                    return True
+            return False
+
+        if not _exists(target_model, dm_dirs):
+            warn("SCAILAdapter", "钉模型失败: %s 不在 diffusion_models/", target_model)
+            target_model = None
+        if not _exists(target_lora, lora_dirs):
+            warn("SCAILAdapter", "钉 LoRA 失败: %s 不在 loras/", target_lora)
+            target_lora = None
+
+        for nid, nd in wf.items():
+            if not isinstance(nd, dict):
+                continue
+            ct = nd.get("class_type") or ""
+            inp = nd.get("inputs")
+            if not isinstance(inp, dict):
+                continue
+            # 模型加载器：钉 model 字段
+            if ct == "WanVideoModelLoader" and target_model and "model" in inp:
+                if inp["model"] != target_model:
+                    inp["model"] = target_model
+                    info("SCAILAdapter", "钉模型: %s → %s", nid, target_model)
+            # LoRA 选择节点：钉 lora/lora_name 字段到真实蒸馏 LoRA
+            if target_lora and ("LoraSelect" in ct or "SetLoRA" in ct):
+                for fk in ("lora", "lora_name"):
+                    if isinstance(inp.get(fk), str) and "distill" in inp[fk].lower():
+                        if inp[fk] != target_lora:
+                            inp[fk] = target_lora
+                            info("SCAILAdapter", "钉蒸馏 LoRA: %s.%s → %s", nid, fk, target_lora)
 
     # ==================================================================
     # 工作流预处理：把官方 SCAIL UI 工作流整理成干净、可提交的 API 工作流。
@@ -779,6 +865,23 @@ class SCAILAdapter(DirectAdapter):
         return api
 
     @staticmethod
+    def _workflow_has_distill_lora(wf):
+        """判断工作流是否已挂载『步数蒸馏 LoRA』(lightx2v / step_distill 等)。
+        蒸馏 LoRA 为 4 步设计，强行提高步数反而会因 schedule 错配产生结构性
+        伪影(即用户所说的『崩坏』)，故一旦检测到蒸馏 LoRA 就放行原生快速步数。"""
+        for nd in wf.values():
+            if not isinstance(nd, dict):
+                continue
+            inp = nd.get("inputs", {})
+            if not isinstance(inp, dict):
+                continue
+            for fk in ("lora", "lora_name", "model_name"):
+                v = inp.get(fk)
+                if isinstance(v, str) and ("distill" in v.lower() or "lightx2v" in v.lower()):
+                    return True
+        return False
+
+    @staticmethod
     def _enforce_min_sampling_steps(wf, min_steps=20, target=25):
         """防御性：SCAIL-2 路线用的 wan2.1_14B_SCAIL_2 是基座模型(非步数蒸馏)，
         采样步数过低会严重欠去噪 → 生成内容高频细节丢失、整体模糊。
@@ -787,7 +890,13 @@ class SCAILAdapter(DirectAdapter):
         (WanVideoSchedulerv2)上，故按输入键名精确匹配 'steps'(不靠 class_type，
         否则会漏掉含 Scheduler 的调度器节点)。任何 SCAIL 节点的 steps 低于阈值一律
         提到 target，避免模板/UI 旧图再次掉回低步数导致模糊。
+
+        关键例外：若工作流已挂载步数蒸馏 LoRA(lightx2v/step_distill)，则 4 步即正确，
+        必须放行快速步数——否则蒸馏 LoRA 在错误高步数下会产生崩坏伪影。
         仅在 SCAILAdapter / AnimatePlusSCAILAdapter 调用，不波及骨骼路线(蒸馏模型 4-8 步正确)。"""
+        if SCAILAdapter._workflow_has_distill_lora(wf):
+            info("SCAILAdapter", "步数防御: 检测到步数蒸馏 LoRA → 放行原生快速步数(不强制 %s)", target)
+            return wf
         fixed = 0
         for nid, nd in wf.items():
             if not isinstance(nd, dict):
