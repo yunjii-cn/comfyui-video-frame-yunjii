@@ -781,24 +781,25 @@ class SCAILAdapter(DirectAdapter):
     @staticmethod
     def _enforce_min_sampling_steps(wf, min_steps=20, target=25):
         """防御性：SCAIL-2 路线用的 wan2.1_14B_SCAIL_2 是基座模型(非步数蒸馏)，
-        采样步数过低(<=min_steps)会严重欠去噪 → 生成内容高频细节丢失、整体模糊。
-        实测 6 步清晰度≈14、25 步≈57(拉普拉斯方差)。任何 SCAIL 采样节点 steps 低于
-        阈值一律提到 target，避免模板/UI 旧图再次掉回低步数导致模糊。
+        采样步数过低会严重欠去噪 → 生成内容高频细节丢失、整体模糊。
+        实测 4 步清晰度≈14、25 步≈57(拉普拉斯方差)。
+        SCAIL-2 的步数可能挂在采样器(WanAnimatePlus SamplerSettings)或调度器
+        (WanVideoSchedulerv2)上，故按输入键名精确匹配 'steps'(不靠 class_type，
+        否则会漏掉含 Scheduler 的调度器节点)。任何 SCAIL 节点的 steps 低于阈值一律
+        提到 target，避免模板/UI 旧图再次掉回低步数导致模糊。
         仅在 SCAILAdapter / AnimatePlusSCAILAdapter 调用，不波及骨骼路线(蒸馏模型 4-8 步正确)。"""
         fixed = 0
         for nid, nd in wf.items():
             if not isinstance(nd, dict):
                 continue
             ct = nd.get("class_type", "")
-            if not any(k in ct for k in ("Sampler", "Sample", "Settings")):
-                continue
             inp = nd.setdefault("inputs", {})
             for k, v in list(inp.items()):
-                if "step" in k.lower() and isinstance(v, (int, float)) and not isinstance(v, bool):
+                if k.lower() == "steps" and isinstance(v, (int, float)) and not isinstance(v, bool):
                     if int(v) < min_steps:
                         inp[k] = target
                         fixed += 1
-                        warn("SCAILAdapter", "步数防御: node%s(%s) %s=%s → %s", nid, ct, k, v, target)
+                        warn("SCAILAdapter", "步数防御: node%s(%s) steps=%s → %s", nid, ct, v, target)
         if fixed:
             info("SCAILAdapter", "步数防御: 修正 %d 个低步数采样节点 → %s", fixed, target)
         return wf

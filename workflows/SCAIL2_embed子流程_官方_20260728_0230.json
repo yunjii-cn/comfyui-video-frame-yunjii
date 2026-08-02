@@ -1034,7 +1034,7 @@
       },
       "widgets_values": [
         "dpm++_sde",
-        4,
+        25,
         7,
         0,
         -1,
@@ -2790,7 +2790,7 @@
         "Node name for S&R": "WanVideoSamplerv2"
       },
       "widgets_values": [
-        25,
+        6,
         42,
         "fixed",
         true,
