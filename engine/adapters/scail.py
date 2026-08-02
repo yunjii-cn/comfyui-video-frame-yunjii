@@ -381,18 +381,21 @@ class SCAILAdapter(DirectAdapter):
             inp = nd.get("inputs")
             if not isinstance(inp, dict):
                 continue
-            # 模型加载器：钉 model 字段
-            if ct == "WanVideoModelLoader" and target_model and "model" in inp:
+            # 模型加载器：钉 model 字段（覆盖 WanVideo / WanAnimatePlus 两种 ModelLoader）
+            if "ModelLoader" in ct and target_model and "model" in inp:
                 if inp["model"] != target_model:
                     inp["model"] = target_model
                     info("SCAILAdapter", "钉模型: %s → %s", nid, target_model)
-            # LoRA 选择节点：钉 lora/lora_name 字段到真实蒸馏 LoRA
+            # LoRA 选择节点：任何含 'lora' 的输入字段，凡值是 step-distill 即钉到真实蒸馏 LoRA。
+            # 覆盖 WanVideoLoraSelect(lora) / WanVideoLoraSelectByName(lora_name) /
+            # WanAnimatePlus LoraSelectMulti(lora_0..lora_N) 等任意字段命名。
             if target_lora and ("LoraSelect" in ct or "SetLoRA" in ct):
-                for fk in ("lora", "lora_name"):
-                    if isinstance(inp.get(fk), str) and "distill" in inp[fk].lower():
-                        if inp[fk] != target_lora:
-                            inp[fk] = target_lora
-                            info("SCAILAdapter", "钉蒸馏 LoRA: %s.%s → %s", nid, fk, target_lora)
+                for fk, fv in list(inp.items()):
+                    if not (isinstance(fk, str) and "lora" in fk.lower()):
+                        continue
+                    if isinstance(fv, str) and "distill" in fv.lower() and fv != target_lora:
+                        inp[fk] = target_lora
+                        info("SCAILAdapter", "钉蒸馏 LoRA: %s.%s → %s", nid, fk, target_lora)
 
     # ==================================================================
     # 工作流预处理：把官方 SCAIL UI 工作流整理成干净、可提交的 API 工作流。
@@ -866,18 +869,28 @@ class SCAILAdapter(DirectAdapter):
 
     @staticmethod
     def _workflow_has_distill_lora(wf):
-        """判断工作流是否已挂载『步数蒸馏 LoRA』(lightx2v / step_distill 等)。
+        """判断工作流是否已挂载『步数蒸馏 LoRA』(lightx2v step_distill 等)。
         蒸馏 LoRA 为 4 步设计，强行提高步数反而会因 schedule 错配产生结构性
-        伪影(即用户所说的『崩坏』)，故一旦检测到蒸馏 LoRA 就放行原生快速步数。"""
+        伪影(即用户所说的『崩坏』)，故一旦检测到蒸馏 LoRA 就放行原生快速步数。
+
+        关键修正：本机用户实际工作流用 WanAnimatePlus LoraSelectMulti 挂载蒸馏
+        LoRA，字段名是 lora_0/lora_1/...（不是 lora/lora_name）。旧实现只扫
+        lora/lora_name/model_name 三个固定字段名 → 漏检 → 放行失败 → 被
+        _enforce_min_sampling_steps 强制 25 步 → 崩坏依旧。现改为扫描『所有输入
+        值』是否含 step-distill 标识("distill")，覆盖单/多 LoRA 选择节点的任意字段。"""
         for nd in wf.values():
             if not isinstance(nd, dict):
                 continue
             inp = nd.get("inputs", {})
             if not isinstance(inp, dict):
                 continue
-            for fk in ("lora", "lora_name", "model_name"):
-                v = inp.get(fk)
-                if isinstance(v, str) and ("distill" in v.lower() or "lightx2v" in v.lower()):
+            for fk, v in inp.items():
+                # 任意字符串值带 step-distill 标识即命中（lora/lora_0..N/lora_name 等）
+                if isinstance(v, str) and "distill" in v.lower():
+                    return True
+                # 含 'lora' 的字段且值为 distill LoRA 文件名（双保险）
+                if isinstance(fk, str) and "lora" in fk.lower() \
+                        and isinstance(v, str) and "distill" in v.lower():
                     return True
         return False
 
@@ -895,7 +908,20 @@ class SCAILAdapter(DirectAdapter):
         必须放行快速步数——否则蒸馏 LoRA 在错误高步数下会产生崩坏伪影。
         仅在 SCAILAdapter / AnimatePlusSCAILAdapter 调用，不波及骨骼路线(蒸馏模型 4-8 步正确)。"""
         if SCAILAdapter._workflow_has_distill_lora(wf):
-            info("SCAILAdapter", "步数防御: 检测到步数蒸馏 LoRA → 放行原生快速步数(不强制 %s)", target)
+            # 蒸馏 LoRA 路线：不再只是『放行』，而是主动把全部 steps 节点钉到 4 步。
+            # 原因：旧模板/UI 缓存可能仍残留 25 步（用户直跑工作流曾被强制 25），
+            # 纯放行会保留那个 25 → 崩坏依旧。强制 4 步给两条路线(官方子流程 /
+            # WanAnimatePlus)都上安全网，与好片 00017(4 步)一致。
+            fixed = 0
+            for nid, nd in wf.items():
+                if not isinstance(nd, dict):
+                    continue
+                inp = nd.get("inputs")
+                if isinstance(inp, dict) and isinstance(inp.get("steps"), (int, float)) \
+                        and not isinstance(inp.get("steps"), bool) and int(inp["steps"]) != 4:
+                    inp["steps"] = 4
+                    fixed += 1
+            info("SCAILAdapter", "步数防御: 蒸馏 LoRA 路线 → 强制 %d 个 steps 节点=4(快速)", fixed)
             return wf
         fixed = 0
         for nid, nd in wf.items():

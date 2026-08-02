@@ -282,7 +282,11 @@ class AnimatePlusSCAILAdapter(SCAILAdapter):
         if seg.index > 0 and prev_video_path and os.path.isfile(prev_video_path):
             self._inject_prefix(wf, node_map, prev_video_path)
 
-        # 防御：SCAIL 基座模型低步数 → 模糊（详见 _enforce_min_sampling_steps）
+        # 蒸馏 LoRA 路线：钉模型/LoRA 到本机真实文件（覆盖 WanAnimatePlus 系列节点
+        # 的 model / lora_0..N 字段——用户直跑工作流用 WanAnimatePlus LoraSelectMulti
+        # 挂蒸馏 LoRA，旧路径 Wan-Lighting\... 在本机不存在，必须钉到 wan\..._rank256）。
+        self._pin_distill_lora_and_model(wf)
+        # 防御：SCAIL 基座模型低步数 → 模糊；若挂载蒸馏 LoRA 则强制 4 步(见 _enforce 内)
         wf = self._enforce_min_sampling_steps(wf)
         return wf
 
