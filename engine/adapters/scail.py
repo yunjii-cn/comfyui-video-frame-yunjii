@@ -602,6 +602,21 @@ class SCAILAdapter(DirectAdapter):
         return full
 
     @staticmethod
+    def _node_has_distill(node):
+        """判定『完整 UI 格式』节点是否挂载了步数蒸馏 LoRA（文件名含 'distill'）。
+
+        完整格式下 LoRA 选择值存于 widgets_values（list），故主扫 widgets_values；
+        兜底扫 inputs 中已落地的静态字符串值（极少数节点会把 lora 名直接放 inputs）。"""
+        for v in (node.get("widgets_values") or []):
+            if isinstance(v, str) and "distill" in v.lower():
+                return True
+        for inp in (node.get("inputs") or []):
+            if isinstance(inp, dict) and isinstance(inp.get("value"), str) \
+                    and "distill" in inp["value"].lower():
+                return True
+        return False
+
+    @staticmethod
     def _drop_bypassed(full):
         """删除 mode==4（ComfyUI 中『禁用/绕过(bypass)』）的节点，并断开其消费方连线。
 
@@ -617,6 +632,15 @@ class SCAILAdapter(DirectAdapter):
         如 SetLoRAs.lora），语义上等价于用户在 UI 里禁用该节点。"""
         nodes = full.get("nodes", [])
         links = full.get("links", [])
+        # 防御：蒸馏 LoRA 若挂在被禁用(mode=4)的节点上，一旦被丢弃，下游
+        # _workflow_has_distill_lora 就漏检 → 回退 25 步基座模型 → 慢且崩坏。
+        # 故对『含蒸馏 LoRA 的禁用节点』不丢弃，反而自动启用(mode=0)，
+        # 保证蒸馏快速(4 步)路线始终可用，杜绝模板错位导致的静默回归。
+        for n in nodes:
+            if (n.get("mode", 0) == 4) and SCAILAdapter._node_has_distill(n):
+                n["mode"] = 0
+                info("SCAILAdapter", "预处理：蒸馏 LoRA 节点 node%s 虽被禁用(mode=4)，"
+                      "自动启用以避免蒸馏检测失效", n["id"])
         bypass_ids = {str(n["id"]) for n in nodes if (n.get("mode", 0) == 4)}
         if not bypass_ids:
             return full

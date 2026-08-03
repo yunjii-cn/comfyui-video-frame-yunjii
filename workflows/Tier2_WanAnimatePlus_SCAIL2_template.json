@@ -6361,7 +6361,7 @@
       ],
       "flags": {},
       "order": 51,
-      "mode": 0,
+      "mode": 4,
       "inputs": [
         {
           "localized_name": "prev_lora",
@@ -6488,7 +6488,7 @@
       ],
       "flags": {},
       "order": 42,
-      "mode": 4,
+      "mode": 0,
       "inputs": [
         {
           "localized_name": "prev_lora",
@@ -6636,14 +6636,14 @@
         }
       },
       "widgets_values": [
-        "Wan-NSFW\\Wan2.1 - T2V - Wan NSFW Posing Nude_14b_v1.safetensors",
+        "none",
         0,
-        "Wan-Lighting\\Wan2.1 - lightx2v_I2V_14B_480p_cfg_step_distill_rank256_bf16.safetensors",
+        "wan\\lightx2v_I2V_14B_480p_cfg_step_distill_rank256_bf16.safetensors",
         1,
-        "Scail2\\wan2.1_SCAIL_2_DPO_lora_bf16.safetensors",
-        1,
-        "Wan-Action\\Wan2.2 - I2V -Slop Bounce-Low-i2v.safetensors",
-        0.7,
+        "none",
+        0,
+        "none",
+        0,
         "none",
         0.8,
         false,
