@@ -234,7 +234,7 @@ class SCAILAdapter(DirectAdapter):
         inp[key] = value
         return True
 
-    def modify_workflow_for_segment(self, workflow, node_map, seg, ref_image_path, pose_dir="", run_id="", user_ref_path=""):
+    def modify_workflow_for_segment(self, workflow, node_map, seg, ref_image_path, pose_dir="", run_id="", user_ref_path="", prev_video_path=""):
         """
         把一个 SegmentInfo 映射到官方 SCAIL 子流程输入。
         workflow 为 API 格式（链接以 [node, slot] 表示，未链接的 widget 为原始值）。

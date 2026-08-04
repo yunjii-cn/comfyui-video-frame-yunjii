@@ -161,6 +161,7 @@ class YunjiiVideoImitator:
 
         # 1) 生成相位：调用链式执行引擎，效果模块作用于每段 prompt/params
         runner = YunjiiSegmentRunner()
+        执行日志 = ""  # 防御：run() 抛异常时 except 分支需引用，先置空避免 UnboundLocalError 掩盖真实报错
         try:
             执行结果, 执行日志, 完成状态 = runner.run(
                 段落计划, 工作流模板, 执行模式, 最大重试,

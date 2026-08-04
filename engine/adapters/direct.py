@@ -1004,7 +1004,7 @@ class DirectAdapter(GenerationAdapter):
 
         return workflow
 
-    def modify_workflow_for_segment(self, workflow, node_map, seg, ref_image_path, pose_dir="", run_id="", user_ref_path=""):
+    def modify_workflow_for_segment(self, workflow, node_map, seg, ref_image_path, pose_dir="", run_id="", user_ref_path="", prev_video_path=""):
         import folder_paths
         import shutil
 
