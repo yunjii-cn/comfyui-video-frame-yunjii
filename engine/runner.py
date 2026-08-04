@@ -211,12 +211,15 @@ class YunjiiSegmentRunner:
             # 重判模板家族（若上面填了默认，或用户直接粘贴内容）
             is_ap_template = (AP_NODE_MARKER in template_text)
             is_std_scail_template = (SCAIL_NODE_MARKER in template_text)
-            if _strategy == CONTINUITY_WARM_START and not is_ap_template:
-                # 暖启动要求 WanAnimatePlus SCAIL_2 工作流（含 prefix_frames 入口），
-                # 标准 WanVideoWrapper SCAIL 无该入口 → 给出明确指引而非静默降级。
-                return ("", "⚠ 暖启动(Tier2) 需要一个『WanAnimatePlus SCAIL_2』工作流模板"
-                                "（含 WanAnimatePlus SCAIL_2 Embeds 节点）。请在『工作流模板』中"
-                                "粘贴该工作流 JSON 或其文件路径，或确认已放置内置参考工作流。", False)
+            if _strategy == CONTINUITY_WARM_START and not (is_ap_template or is_std_scail_template):
+                # 暖启动两大家族均支持：
+                #  · WanAnimatePlus SCAIL_2 → prefix_frames 帧级硬冻结暖启动
+                #  · 标准 WanVideoWrapper SCAIL → WanVideoSamplerv2.samples latent 暖启动(D-A 方案)
+                # 两者都不是(非 SCAIL 模板)才拒绝，给出明确指引而非静默降级。
+                return ("", "⚠ 暖启动需要一个『SCAIL-2』工作流模板"
+                                "（WanAnimatePlus 含 prefix_frames 入口，或标准 WanVideoWrapper SCAIL 走 latent 暖启动）。"
+                                "请在『工作流模板』中粘贴对应工作流 JSON 或其文件路径，"
+                                "或确认已放置内置参考工作流。", False)
             if _strategy == CONTINUITY_SINGLE_PASS and is_ap_template:
                 warn("Runner", "单遍连贯(方案C) 在 WanAnimatePlus 家族不支持，回退为『多段无缝』运行该模板")
         elif not template_text:

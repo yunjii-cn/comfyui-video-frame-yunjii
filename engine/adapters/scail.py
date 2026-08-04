@@ -44,6 +44,9 @@ SCAIL_REF_IMAGE = "LoadImage"
 SCAIL_SAMPLER = "WanVideoSamplerv2"
 SCAIL_DECODE = "WanVideoDecode"
 SCAIL_COMBINE = "VHS_VideoCombine"
+SCAIL_VAE_LOADER = "WanVideoVAELoader"
+# latent 暖启动(video2video 续写)用到的编码节点
+SCAIL_ENCODE = "WanVideoEncode"
 
 # 核心 SCAIL 链路节点：预处理时即使有必填输入悬空也绝不自动删除，
 # 只把悬空输入置空，交给下游回退（如 pose_images 接驱动帧）。
@@ -77,6 +80,7 @@ class SCAILNodeMap:
         self.sampler = ""
         self.decode = ""
         self.combine = ""
+        self.vae = ""   # VAE 加载节点（latent 暖启动编码用）
 
     def to_dict(self):
         return {k: v for k, v in self.__dict__.items() if v}
@@ -196,6 +200,11 @@ class SCAILAdapter(DirectAdapter):
                 title = (ndata.get("title") or ndata.get("_meta", {}).get("title") or "")
                 if "reference" in title.lower():
                     nm.reference_image = nid
+            elif ct == SCAIL_VAE_LOADER and not nm.vae:
+                # VAE 加载节点：latent 暖启动(WanVideoEncode)编码上段成片时需要。
+                # 官方子流程里 WanVideoVAELoader 经 Set/Get 注入各节点；
+                # prepare_workflow._rewire_setget 已把 GetNode 重连到本节点，故直接认 class_type。
+                nm.vae = nid
 
         # 主输出：剔除 onetotall_pose 等姿态/骨架预览节点，优先 save_output=True 的真实成片
         nm.combine = DirectAdapter._select_primary_vhs(vhs_candidates)
@@ -327,8 +336,97 @@ class SCAILAdapter(DirectAdapter):
                         info("SCAILAdapter", "蒸馏 LoRA 路线: %s(%s) 步数→4(快速)", nid, ct)
             self._pin_distill_lora_and_model(wf)
 
+        # D-A 方案：标准真骨架路线 + latent 暖启动(video2video 续写)。
+        # 仅当策略为暖启动(由 runner 传入 prev_video_path)且非首段时注入；
+        # 单独调用本适配器(多段无缝)时 prev_video_path 为空 → 不注入，等价 A 路径。
+        if prev_video_path:
+            wf = self._inject_latent_warmstart(wf, node_map, prev_video_path, seg)
+
         # 防御：SCAIL 基座模型低步数 → 模糊（详见 _enforce_min_sampling_steps）
         wf = self._enforce_min_sampling_steps(wf)
+        return wf
+
+    @staticmethod
+    def _alloc_node_ids(wf, n):
+        """在 API 格式工作流 wf 中分配 n 个不重复的节点 id（字符串数字，接续最大现有 id）。"""
+        used = set(str(k) for k in wf.keys())
+        nums = [int(k) for k in used if str(k).lstrip("-").isdigit()]
+        base = (max(nums) + 1) if nums else 1001
+        out = []
+        for _ in range(n):
+            while str(base) in used:
+                base += 1
+            out.append(str(base))
+            used.add(str(base))
+            base += 1
+        return out
+
+    def _inject_latent_warmstart(self, wf, node_map, prev_video_path, seg):
+        """D-A 方案核心：标准 SCAIL 真骨架路线 + WanVideoSamplerv2.samples latent 暖启动。
+
+        动作节奏断裂(stitcher 重叠混合只治位置跳变、治不了节奏)的根治手段：
+        把上一段成片用 VHS_LoadVideo 加载 → WanVideoEncode 编码成 LATENT → 注入
+        WanVideoSamplerv2.samples 并 add_noise_to_samples=True，做 video2video 续写，
+        使新段在生成时就锚定上段的动作/姿态，节奏自然衔接。
+
+        帧数天然对齐：planner 固定每段 81 帧，上段成片也是 81 帧 → encode 出 81 帧
+        latent，与本次 num_frames=81 完全一致，无需裁切。
+
+        纯 best-effort：任一前置条件不满足或异常 → 吞异常、回退无暖启动(等价 A 路径
+        多段独立生成)，绝不因暖启动失败而中断整段生成。"""
+        try:
+            if seg.index <= 0:
+                return wf
+            if not prev_video_path or not os.path.isfile(prev_video_path):
+                return wf
+            if not node_map.vae or node_map.vae not in wf:
+                warn("SCAILAdapter", "latent 暖启动跳过：未找到 VAE 加载节点")
+                return wf
+            if not node_map.sampler or node_map.sampler not in wf:
+                return wf
+            dv = wf.get(node_map.driving_video)
+            if not dv:
+                warn("SCAILAdapter", "latent 暖启动跳过：未找到驱动视频节点(作 VHS 模板)")
+                return wf
+            fname = self._copy_to_input(prev_video_path)
+            if not fname:
+                warn("SCAILAdapter", "latent 暖启动跳过：上段成片复制失败")
+                return wf
+
+            # 1) 复制驱动视频节点输入结构作模板，保证 VHS 版本字段一致；
+            #    指向『上段成片』并加载全部帧(=本次段长)作 video2video init。
+            vhs_inputs = json.loads(json.dumps(dv.get("inputs", {})))
+            vhs_inputs["video"] = fname
+            vhs_inputs["skip_first_frames"] = 0
+            vhs_inputs["frame_load_cap"] = seg.target_frames
+            if "select_every_nth" in vhs_inputs:
+                vhs_inputs["select_every_nth"] = 1
+            vhs_id, enc_id = self._alloc_node_ids(wf, 2)
+            wf[vhs_id] = {"class_type": SCAIL_DRIVING_VIDEO, "inputs": vhs_inputs}
+
+            # 2) WanVideoEncode：vae<-VAE 加载节点输出，image<-上段成片帧(IMAGE, slot0)
+            enc_inputs = {
+                "vae": [node_map.vae, 0],
+                "image": [vhs_id, 0],
+                "enable_vae_tiling": False,
+                "tile_x": 272,
+                "tile_y": 272,
+                "tile_stride_x": 144,
+                "tile_stride_y": 128,
+                "noise_aug_strength": 0.0,
+                "latent_strength": 1.0,
+            }
+            wf[enc_id] = {"class_type": SCAIL_ENCODE, "inputs": enc_inputs}
+
+            # 3) 注入采样器：samples<-encode 输出；add_noise_to_samples=True
+            #    (WanVideoEncode 产出干净 latent，需加噪后再去噪以生成新内容、保持连续性)
+            samp_in = wf[node_map.sampler].setdefault("inputs", {})
+            samp_in["samples"] = [enc_id, 0]
+            samp_in["add_noise_to_samples"] = True
+            info("SCAILAdapter", "latent 暖启动注入: prev=%s → VHS(%s)+Encode(%s) → Sampler.samples(+noise)",
+                 fname, vhs_id, enc_id)
+        except Exception as e:
+            warn("SCAILAdapter", "latent 暖启动注入失败，回退无暖启动: %s", e)
         return wf
 
     @staticmethod
