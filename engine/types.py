@@ -149,6 +149,7 @@ class NodeMap:
 
 STITCH_HARD_CUT = "hard_cut"
 STITCH_CROSS_DISSOLVE = "cross_dissolve"
+# 真·一镜到底（潜空间拼接）：各段 latent 接缝交叉淡化后合并解码 → 无硬切、无像素双重曝光，过渡最自然。
 STITCH_LATENT_BLEND = "latent_blend"
 STITCH_TRANSITION = "transition"
 STITCH_AUTO = "auto"
@@ -166,7 +167,7 @@ STITCH_LABELS = [
     (STITCH_AUTO,           "自动"),
     (STITCH_SEAMLESS,       "无缝一镜到底(零转场)"),
     (STITCH_SEAMLESS_BLEND, "无缝一镜到底(重叠混合)"),
-    (STITCH_LATENT_BLEND,   "潜空间拼接"),
+    (STITCH_LATENT_BLEND,   "真·一镜到底（潜空间拼接）"),
     (STITCH_TRANSITION,     "ffmpeg转场"),
 ]
 STITCH_LABEL_TO_VALUE = {label: value for value, label in STITCH_LABELS}

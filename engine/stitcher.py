@@ -230,6 +230,14 @@ class YunjiiSegmentStitcher:
                     xfade_duration = 0.5
             info("Stitcher", "已应用效果模块: %s", effect_pipeline.describe())
 
+        # 自动模式：若各段 latent 已落盘（潜空间拼接可用），优先升级为真·一镜到底（潜空间），
+        # 过渡最自然；否则沿用像素级无缝近似（_stitch_videos 内部 STITCH_AUTO 逻辑）。
+        if 拼接模式 == STITCH_AUTO:
+            _latents = [vi.get("latent_path", "") or "" for vi in video_items]
+            if _latents and all(_latents):
+                info("Stitcher", "自动模式: 各段 latent 可用，升级为真·一镜到底（潜空间拼接）")
+                拼接模式 = STITCH_LATENT_BLEND
+
         try:
             if 拼接模式 == STITCH_LATENT_BLEND:
                 # 潜空间拼接：加载各段 latent → 接缝交叉淡化 → 合并解码，过渡最自然。
