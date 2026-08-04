@@ -33,6 +33,7 @@ from .engine.planner import YunjiiSegmentPlanner
 from .engine.runner import YunjiiSegmentRunner
 from .engine.stitcher import YunjiiSegmentStitcher
 from .engine.composer import YunjiiVideoImitator
+from .engine.latent_nodes import YunjiiSaveLatent, YunjiiLoadLatent
 
 _detection_dir = os.path.join(os.path.dirname(_comfyui_root), "models", "detection")
 if not os.path.isdir(_detection_dir):
@@ -48,6 +49,8 @@ NODE_CLASS_MAPPINGS.update({
     "YunjiiSegmentRunner": YunjiiSegmentRunner,
     "YunjiiSegmentStitcher": YunjiiSegmentStitcher,
     "YunjiiVideoImitator": YunjiiVideoImitator,
+    "YunjiiSaveLatent": YunjiiSaveLatent,
+    "YunjiiLoadLatent": YunjiiLoadLatent,
 })
 
 NODE_DISPLAY_NAME_MAPPINGS.update({
@@ -55,6 +58,8 @@ NODE_DISPLAY_NAME_MAPPINGS.update({
     "YunjiiSegmentRunner": "链式执行 ⛓ (Yunjii V2V)",
     "YunjiiSegmentStitcher": "无缝拼接 🎞 (Yunjii V2V)",
     "YunjiiVideoImitator": "完美模仿一键 ⚡ (Yunjii V2V)",
+    "YunjiiSaveLatent": "Latent 落盘 💾 (Yunjii V2V)",
+    "YunjiiLoadLatent": "Latent 读取 📂 (Yunjii V2V)",
 })
 
 WEB_DIRECTORY = "./js"

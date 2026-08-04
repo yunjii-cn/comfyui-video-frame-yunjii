@@ -105,6 +105,9 @@ class SegmentResult:
     duration_sec: float = 0.0
     # 与前一段的重叠帧数（一镜到底链式生成时 >0）。拼接阶段据此去重重叠帧，实现零转场。
     overlap_prev: int = 0
+    # 潜空间拼接：本段 latent 落盘路径（STITCH_LATENT_BLEND 模式用于合并+解码）。
+    # 由 runner 按 run_id/seg 索引确定性构造（与适配器 _latent_save_path 一致）。
+    latent_path: str = ""
 
     def to_dict(self):
         return {
@@ -116,6 +119,7 @@ class SegmentResult:
             "error": self.error,
             "duration_sec": self.duration_sec,
             "overlap_prev": self.overlap_prev,
+            "latent_path": self.latent_path,
         }
 
 
@@ -162,6 +166,7 @@ STITCH_LABELS = [
     (STITCH_AUTO,           "自动"),
     (STITCH_SEAMLESS,       "无缝一镜到底(零转场)"),
     (STITCH_SEAMLESS_BLEND, "无缝一镜到底(重叠混合)"),
+    (STITCH_LATENT_BLEND,   "潜空间拼接"),
     (STITCH_TRANSITION,     "ffmpeg转场"),
 ]
 STITCH_LABEL_TO_VALUE = {label: value for value, label in STITCH_LABELS}

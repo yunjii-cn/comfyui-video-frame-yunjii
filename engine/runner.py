@@ -383,6 +383,14 @@ class YunjiiSegmentRunner:
                                 last_frame = self._extract_last_frame(output_path, run_id)
 
                             seg_duration = time.time() - seg_start_time
+                            # 潜空间拼接：若适配器支持 latent 落盘(标准 SCAIL / AnimatePlus 均继承)，
+                            # 取与适配器一致的确定性路径；stitcher 在 latent_blend 模式下消费，缺失则回退像素拼接。
+                            latent_path = ""
+                            if run_id and hasattr(gen_adapter, "_latent_save_path"):
+                                try:
+                                    latent_path = gen_adapter._latent_save_path(run_id, seg.index)
+                                except Exception:
+                                    latent_path = ""
                             seg_result = SegmentResult(
                                 segment_index=seg.index,
                                 video_path=output_path,
@@ -391,6 +399,7 @@ class YunjiiSegmentRunner:
                                 prompt_id=result.get("prompt_id", ""),
                                 duration_sec=seg_duration,
                                 overlap_prev=seg.overlap_prev,
+                                latent_path=latent_path,
                             )
                             results.append(seg_result)
 

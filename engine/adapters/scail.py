@@ -29,6 +29,7 @@ cleanup_executor / _copy_to_input / _extract_video_from_history 等），只重�
 import os
 import json
 import glob
+import folder_paths
 
 from .direct import DirectAdapter
 from ..debug_log import info, warn, error as log_error
@@ -342,6 +343,13 @@ class SCAILAdapter(DirectAdapter):
         if prev_video_path:
             wf = self._inject_latent_warmstart(wf, node_map, prev_video_path, seg)
 
+        # 潜空间拼接基建：每段把 WanVideoSamplerv2 输出的 latent 落盘
+        # (插在 sampler→decode 之间，透传零改动)，供 STITCH_LATENT_BLEND 合并+解码用。
+        # 仅当 run_id 存在时落盘（确定性路径 run_id/seg_索引，runner 据此贯穿 latent_path）。
+        if run_id:
+            wf = self._inject_save_latent(wf, node_map, run_id, seg)
+            self._extract_decode_template(wf, node_map, run_id)
+
         # 防御：SCAIL 基座模型低步数 → 模糊（详见 _enforce_min_sampling_steps）
         wf = self._enforce_min_sampling_steps(wf)
         return wf
@@ -360,6 +368,76 @@ class SCAILAdapter(DirectAdapter):
             used.add(str(base))
             base += 1
         return out
+
+    @staticmethod
+    def _latent_save_path(run_id, seg_index):
+        """每段 latent 落盘的确定性路径；runner 用同一规则构造 latent_path 贯穿到 stitcher。"""
+        out_dir = folder_paths.get_output_directory()
+        d = os.path.join(out_dir, "yunjii_v2v", run_id)
+        return os.path.join(d, f"seg_{seg_index}_latent.pt")
+
+    def _inject_save_latent(self, wf, node_map, run_id, seg):
+        """潜空间拼接基建：在 WanVideoSamplerv2(sampler) → WanVideoDecode 之间插入
+        YunjiiSaveLatent 透传落盘节点。生成零改动（decode 仍拿到原 latent）。
+
+        仅当 run_id 存在且 decode 节点有效时执行。best-effort：任何异常吞掉，绝不阻断生成。
+        """
+        try:
+            if not node_map.decode or node_map.decode not in wf:
+                return wf
+            dec = wf[node_map.decode]
+            dinp = dec.setdefault("inputs", {})
+            src = dinp.get("samples")  # [src_node, src_slot] 或 None
+            if not isinstance(src, (list, tuple)) or len(src) < 1:
+                return wf
+            src_node = src[0]
+            src_slot = src[1] if len(src) > 1 else 0
+            save_id = SCAILAdapter._alloc_node_ids(wf, 1)[0]
+            save_path = self._latent_save_path(run_id, seg.index)
+            wf[save_id] = {
+                "class_type": "YunjiiSaveLatent",
+                "inputs": {
+                    "samples": [src_node, src_slot],
+                    "save_path": save_path,
+                },
+            }
+            # rewire：decode.samples 改接 save 节点输出（save 透传原 latent）
+            dinp["samples"] = [save_id, 0]
+            info("SCAILAdapter", "注入 latent 落盘: node=%s -> %s", save_id, save_path)
+        except Exception as e:
+            warn("SCAILAdapter", "latent 落盘注入失败(忽略): %s", e)
+        return wf
+
+    def _extract_decode_template(self, wf, node_map, run_id):
+        """抽取解码子图(VAE 加载器 + WanVideoDecode + VHS_VideoCombine 及其参数)，
+        存为 decode_template.json，供 stitcher 的潜空间拼接复用**原装**解码链路。
+
+        Decode.samples 原指向 sampler（不在子图内），stitcher 会重连到 YunjiiLoadLatent(合并 latent)。
+        best-effort：失败仅告警，不影响生成。
+        """
+        try:
+            if not node_map.decode or node_map.decode not in wf:
+                return
+            ids = set()
+            dec = wf[node_map.decode]
+            ids.add(node_map.decode)
+            vae_src = dec.get("inputs", {}).get("vae")
+            if isinstance(vae_src, (list, tuple)) and vae_src and vae_src[0] in wf:
+                ids.add(vae_src[0])
+            if node_map.combine and node_map.combine in wf:
+                ids.add(node_map.combine)
+            sub = {i: wf[i] for i in ids if i in wf}
+            if len(sub) < 2:
+                return
+            out_dir = folder_paths.get_output_directory()
+            d = os.path.join(out_dir, "yunjii_v2v", run_id)
+            os.makedirs(d, exist_ok=True)
+            tmpl = {"nodes": sub, "decode_id": node_map.decode, "vhs_id": node_map.combine}
+            with open(os.path.join(d, "decode_template.json"), "w", encoding="utf-8") as f:
+                json.dump(tmpl, f, ensure_ascii=False)
+            info("SCAILAdapter", "抽取解码模板: %s (%d 节点)", os.path.join(d, "decode_template.json"), len(sub))
+        except Exception as e:
+            warn("SCAILAdapter", "解码模板抽取失败(忽略): %s", e)
 
     def _inject_latent_warmstart(self, wf, node_map, prev_video_path, seg):
         """D-A 方案核心：标准 SCAIL 真骨架路线 + WanVideoSamplerv2.samples latent 暖启动。

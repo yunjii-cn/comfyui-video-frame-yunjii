@@ -124,7 +124,7 @@ class YunjiiSegmentStitcher:
                 "执行结果": ("STRING", {"default": "", "tooltip": "来自链式执行引擎的执行结果JSON"}),
                 "拼接模式": (
                     [label for _, label in STITCH_LABELS],
-                    {"default": "ffmpeg转场", "tooltip": "硬切=直接拼接(一镜到底会被防呆回退重叠混合); 交叉淡化=像素级平滑过渡; 自动=根据内容选择(一镜到底落重叠混合); 无缝一镜到底(零转场)=硬切去重零转场; 无缝一镜到底(重叠混合)=接缝短窗交叉溶解软化跳变; ffmpeg转场=视频级高级转场(选「转场类型」生效，一镜到底可用作0.5s平滑接缝)"},
+                    {"default": "ffmpeg转场", "tooltip": "硬切=直接拼接(一镜到底会被防呆回退重叠混合); 交叉淡化=像素级平滑过渡; 自动=根据内容选择(一镜到底落重叠混合); 无缝一镜到底(零转场)=硬切去重零转场; 无缝一镜到底(重叠混合)=接缝短窗像素交叉溶解软化跳变; 潜空间拼接=加载各段 latent 在 latent 空间交叉淡化再解码(过渡最自然,保留每段真骨架高保真,需生成时已落盘 latent); ffmpeg转场=视频级高级转场(选「转场类型」生效，一镜到底可用作0.5s平滑接缝)"},
                 ),
                 "淡化帧数": ("INT", {"default": 8, "min": 2, "max": 30, "step": 1,
                     "tooltip": "交叉淡化过渡帧数（仅 交叉淡化 模式生效）"}),
@@ -164,7 +164,7 @@ class YunjiiSegmentStitcher:
             segments = results_data
 
         videos = []
-        # 携带每段重叠帧数(overlap_prev)，供 seamless / auto 去重使用
+        # 携带每段重叠帧数(overlap_prev)与 latent 路径，供 seamless / latent_blend 使用
         video_items = []
         for item in segments:
             if isinstance(item, dict) and item.get("status") == "success":
@@ -175,6 +175,7 @@ class YunjiiSegmentStitcher:
                         "path": vp,
                         "overlap_prev": int(item.get("overlap_prev", 0) or 0),
                         "segment_index": item.get("segment_index", len(video_items)),
+                        "latent_path": item.get("latent_path", "") or "",
                     })
 
         if not videos:
@@ -230,10 +231,16 @@ class YunjiiSegmentStitcher:
             info("Stitcher", "已应用效果模块: %s", effect_pipeline.describe())
 
         try:
-            output_path = self._stitch_videos(
-                video_items, 拼接模式, 淡化帧数, 输出文件名, report_lines, run_id,
-                xfade=xfade, xfade_duration=xfade_duration,
-            )
+            if 拼接模式 == STITCH_LATENT_BLEND:
+                # 潜空间拼接：加载各段 latent → 接缝交叉淡化 → 合并解码，过渡最自然。
+                # 任意失败(缺 latent/解码异常)自动回退像素重叠混合，保证不丢输出。
+                output_path = self._stitch_videos_latent(
+                    video_items, 输出文件名, report_lines, run_id)
+            else:
+                output_path = self._stitch_videos(
+                    video_items, 拼接模式, 淡化帧数, 输出文件名, report_lines, run_id,
+                    xfade=xfade, xfade_duration=xfade_duration,
+                )
         except Exception as e:
             logger.error("Stitch failed: %s", e)
             return ("", f"⚠ 拼接失败: {e}")
@@ -431,6 +438,131 @@ class YunjiiSegmentStitcher:
         else:
             report.append(f"✨ 已用 ffmpeg xfade 转场（{xfade}，{dur:.2f}s）")
         return output_path
+
+    def _stitch_videos_latent(self, video_items, output_prefix, report, run_id=""):
+        """潜空间拼接（STITCH_LATENT_BLEND）：
+
+        1) 加载各段 latent（YunjiiSaveLatent 落盘的 .pt，含 samples 等全部键）；
+        2) 段间接缝处做 latent 空间线性交叉淡化（VAE 时间压缩≈4x，按 overlap_prev 映射 latent 重叠窗），
+           生成连贯中间 latent（VAE 解码即连贯中间帧，优于像素叠化）；
+        3) 合并 latent 落盘，经 ComfyUI 解码子工作流（原装 WanVideoDecode+VAE）解码为视频；
+        4) 任意环节失败 → 回退像素重叠混合（_stitch_videos STITCH_SEAMLESS_BLEND），保证不丢输出。
+        """
+        import torch
+        # 收集有效 latent
+        valid = [v for v in video_items if v.get("latent_path") and os.path.isfile(v["latent_path"])]
+        if len(valid) < 2:
+            report.append("⚠ latent 文件不足(<2)，回退像素重叠混合")
+            return self._stitch_videos(video_items, STITCH_SEAMLESS_BLEND, 8, output_prefix, report, run_id)
+
+        try:
+            loaded = [torch.load(v["latent_path"], map_location="cpu", weights_only=False) for v in valid]
+            tensors = [d["samples"] for d in loaded]
+            if any(not isinstance(t, torch.Tensor) or t.dim() != 5 for t in tensors):
+                raise ValueError("latent samples 不是 [1,C,T,H,W] 张量")
+            # 逐段交叉淡化拼接（累加式）
+            merged = tensors[0]
+            for i in range(1, len(tensors)):
+                cur = tensors[i]
+                O = int(valid[i].get("overlap_prev", 0) or 0)
+                T_prev, T_cur = merged.shape[2], cur.shape[2]
+                b = max(1, round((O - 1) / 4.0) + 1) if O > 0 else 0  # VAE 时间压缩≈4x
+                b = min(b, T_prev - 1, T_cur - 1)
+                if b <= 0:
+                    merged = torch.cat([merged, cur], dim=2)
+                    report.append(f"  段{valid[i]['segment_index']}: 无重叠，直接拼接")
+                    continue
+                prev_tail = merged[:, :, -b:, :, :]
+                cur_head = cur[:, :, :b, :, :]
+                w = torch.linspace(0.0, 1.0, b).view(1, 1, b, 1, 1)
+                blended = (1.0 - w) * prev_tail + w * cur_head
+                merged = torch.cat([merged[:, :, :-b, :, :], blended, cur[:, :, b:, :, :]], dim=2)
+                report.append(f"  段{valid[i]['segment_index']}: latent 重叠淡化 {b} 帧(像素重叠{O})")
+            report.append(f"  合并 latent: T={merged.shape[2]}, 形状={list(merged.shape)}")
+        except Exception as e:
+            logger.warning("Stitcher latent 合并失败，回退像素: %s", e)
+            report.append(f"⚠ latent 合并失败({e})，回退像素重叠混合")
+            return self._stitch_videos(video_items, STITCH_SEAMLESS_BLEND, 8, output_prefix, report, run_id)
+
+        # 落盘合并 latent 并解码
+        output_dir = folder_paths.get_output_directory()
+        sub_dir = run_id if run_id else time.strftime("%Y%m%d_%H%M%S")
+        yunjii_dir = os.path.join(output_dir, "yunjii_v2v", sub_dir)
+        os.makedirs(yunjii_dir, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        merged_path = os.path.join(yunjii_dir, f"{output_prefix}_{timestamp}_merged.pt")
+        try:
+            torch.save({"samples": merged.cpu().contiguous()}, merged_path)
+        except Exception as e:
+            logger.warning("Stitcher 合并 latent 落盘失败: %s", e)
+            report.append(f"⚠ 合并 latent 落盘失败，回退像素重叠混合")
+            return self._stitch_videos(video_items, STITCH_SEAMLESS_BLEND, 8, output_prefix, report, run_id)
+
+        decoded = self._decode_latent_via_comfyui(merged_path, run_id, output_prefix, report)
+        if decoded and os.path.isfile(decoded):
+            report.append(f"✨ 潜空间拼接解码完成: {os.path.basename(decoded)}")
+            return decoded
+        report.append("⚠ 潜空间解码失败，回退像素重叠混合")
+        return self._stitch_videos(video_items, STITCH_SEAMLESS_BLEND, 8, output_prefix, report, run_id)
+
+    def _decode_latent_via_comfyui(self, merged_path, run_id, output_prefix, report):
+        """把合并 latent 经 ComfyUI 解码子工作流解码为视频（复用生成时的原装 WanVideoDecode+VAE）。
+
+        解码模板 decode_template.json 由适配器在生成时从真实工作流抽取（VAE 加载器+Decode+VHS 节点
+        及参数全保留），本方法仅插入 YunjiiLoadLatent 并把 Decode.samples 重连到它。失败返回 None。
+        """
+        try:
+            output_dir = folder_paths.get_output_directory()
+            tmpl_path = os.path.join(output_dir, "yunjii_v2v", run_id, "decode_template.json")
+            if not os.path.isfile(tmpl_path):
+                logger.warning("Stitcher 缺少 decode 模板: %s", tmpl_path)
+                return None
+            with open(tmpl_path, encoding="utf-8") as f:
+                tmpl = json.load(f)
+            nodes = {str(k): v for k, v in tmpl.get("nodes", {}).items()}
+            decode_id = str(tmpl.get("decode_id", ""))
+            if decode_id not in nodes:
+                return None
+            # 插入 YunjiiLoadLatent
+            nums = [int(k) for k in nodes if str(k).lstrip("-").isdigit()]
+            load_id = str((max(nums) + 1) if nums else 9001)
+            nodes[load_id] = {"class_type": "YunjiiLoadLatent",
+                              "inputs": {"load_path": merged_path}}
+            # 重连 Decode.samples -> LoadLatent
+            nodes[decode_id].setdefault("inputs", {})["samples"] = [load_id, 0]
+            wf = {"prompt": nodes}
+
+            import urllib.request
+            op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            req = urllib.request.Request(
+                "http://127.0.0.1:8188/prompt",
+                data=json.dumps(wf).encode("utf-8"),
+                headers={"Content-Type": "application/json"})
+            with op.open(req, timeout=30) as r:
+                pid = json.loads(r.read()).get("prompt_id")
+            if not pid:
+                return None
+            # 轮询 history
+            for _ in range(600):
+                time.sleep(2)
+                try:
+                    with op.open(f"http://127.0.0.1:8188/history/{pid}", timeout=10) as h:
+                        hj = json.loads(h.read())
+                    if pid in hj:
+                        outputs = hj[pid].get("outputs", {})
+                        for node_out in outputs.values():
+                            for g in node_out.get("gifs", []):
+                                fn = g.get("filename", "")
+                                sub = g.get("subfolder", "")
+                                if fn:
+                                    return os.path.join(output_dir, sub, fn) if sub else os.path.join(output_dir, fn)
+                        return None
+                except Exception:
+                    continue
+            return None
+        except Exception as e:
+            logger.warning("Stitcher 潜空间解码异常: %s", e)
+            return None
 
     def _read_all_frames(self, video_path, target_w, target_h):
         frames = []
