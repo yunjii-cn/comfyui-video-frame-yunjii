@@ -87,17 +87,22 @@ class YunjiiSegmentRunner:
                 "连贯策略": (
                     ["多段无缝(默认)", "单遍连贯(方案C)", "暖启动(Tier2)"],
                     {"default": "多段无缝(默认)",
-                     "tooltip": "生成侧时序连续性方案(与拼接模式正交)：多段无缝=分段独立+接缝混合(默认,仅化妆); 单遍连贯(方案C)=整片一次去噪(latent连续)但长视频画质软; 暖启动(Tier2)=WanAnimatePlus多段+上段真实帧喂回prefix_frames(连续+画质兼得)。需对应工作流模板支持"},
+                     "tooltip": "生成侧时序连续性方案(与拼接模式正交)：多段无缝=标准SCAIL真骨架每段独立高保真生成(推荐,配合Stitcher『真·一镜到底(潜空间拼接)』可得连贯自然接缝); 单遍连贯(方案C)=整片一次去噪但长视频画质软; 暖启动(Tier2)=WanAnimatePlus多段+上段真实帧喂回prefix_frames——实测模仿力与画质弱于多段无缝,非推荐。需对应工作流模板支持"},
                 ),
                 "模型精度": (
                     ["fp8", "fp16"],
                     {"default": "fp8",
                      "tooltip": "SCAIL-2 路线模型精度：fp8(默认,省显存,RTX3090稳定); fp16(更精细,吃显存,需对应权重文件)。仅 SCAIL-2 路线生效"},
                 ),
+                "生成质量模式": (
+                    ["标准 SCAIL 真骨架（推荐）", "WanAnimatePlus 暖启动(Tier2)"],
+                    {"default": "标准 SCAIL 真骨架（推荐）",
+                     "tooltip": "显式强制生成质量路线(与『连贯策略』正交)：标准 SCAIL 真骨架=每段独立按真骨架(逐帧姿态)高保真生成,配合Stitcher『真·一镜到底(潜空间拼接)』得连贯自然接缝(推荐,默认); WanAnimatePlus 暖启动(Tier2)=上段末帧喂回prefix续写——实测模仿力与画质弱于标准真骨架,非推荐。标准真骨架模式下 WanAnimatePlus 模板也走真骨架多段(禁用暖启动续写),不会退化成 Tier2"},
+                ),
             },
         }
 
-    def run(self, 段落计划, 工作流模板, 执行模式, 最大重试, 生成后端="骨骼路线(WanVideo)", 视频路径="", 参考图=None, 姿态图=None, 人物参考图="", 起始段=0, 效果模块="", ComfyUI地址="127.0.0.1:8188", 连贯策略="", 模型精度="fp8"):
+    def run(self, 段落计划, 工作流模板, 执行模式, 最大重试, 生成后端="骨骼路线(WanVideo)", 视频路径="", 参考图=None, 姿态图=None, 人物参考图="", 起始段=0, 效果模块="", ComfyUI地址="127.0.0.1:8188", 连贯策略="", 模型精度="fp8", 生成质量模式="标准 SCAIL 真骨架（推荐）"):
         node_start("Runner", 执行模式=执行模式, 最大重试=最大重试, ComfyUI地址=ComfyUI地址)
         info("Runner", "参数诊断: 段落计划类型=%s, 工作流模板类型=%s, 视频路径='%s', 参考图类型=%s, 姿态图类型=%s, 人物参考图='%s', 起始段=%s, ComfyUI地址='%s'",
              type(段落计划).__name__, type(工作流模板).__name__,
@@ -211,6 +216,13 @@ class YunjiiSegmentRunner:
             # 重判模板家族（若上面填了默认，或用户直接粘贴内容）
             is_ap_template = (AP_NODE_MARKER in template_text)
             is_std_scail_template = (SCAIL_NODE_MARKER in template_text)
+            # 显式『生成质量模式』开关：默认『标准 SCAIL 真骨架』= 强制真骨架多段
+            # (禁用暖启动续写)。仅当模板为 WanAnimatePlus 家族且用户显式选
+            # 『WanAnimatePlus 暖启动(Tier2)』时才允许暖启动；用户真实 WanAnimatePlus
+            # 模板选默认即走真骨架多段(高保真,非 Tier2 续写)。
+            _quality = 生成质量模式 or "标准 SCAIL 真骨架（推荐）"
+            if _quality == "标准 SCAIL 真骨架（推荐）" and is_ap_template:
+                _strategy = CONTINUITY_MULTI_SEG
             if _strategy == CONTINUITY_WARM_START and not (is_ap_template or is_std_scail_template):
                 # 暖启动两大家族均支持：
                 #  · WanAnimatePlus SCAIL_2 → prefix_frames 帧级硬冻结暖启动
@@ -239,11 +251,15 @@ class YunjiiSegmentRunner:
 
         if 生成后端 == "SCAIL-2 路线":
             # SCAIL-2 路线含两大家族，按模板自动选适配器：
-            #  · WanAnimatePlus SCAIL_2  → AnimatePlusSCAILAdapter（支持暖启动 prefix）
+            #  · WanAnimatePlus SCAIL_2  → AnimatePlusSCAILAdapter（支持潜空间拼接；
+            #    『标准 SCAIL 真骨架』模式下强制 multi_seg 真骨架多段，禁用暖启动续写）
             #  · 标准 WanVideoWrapper SCAIL → SCAILAdapter（多段 / 单遍方案C）
             if is_ap_template:
                 gen_adapter = AnimatePlusSCAILAdapter(folder_paths.get_output_directory())
-                backend_name = "SCAIL-2 路线(WanAnimatePlus/Tier2)"
+                if _quality == "标准 SCAIL 真骨架（推荐）":
+                    backend_name = "SCAIL-2 路线(WanAnimatePlus/真骨架多段)"
+                else:
+                    backend_name = "SCAIL-2 路线(WanAnimatePlus/Tier2暖启动)"
             else:
                 gen_adapter = SCAILAdapter(folder_paths.get_output_directory())
                 backend_name = "SCAIL-2 路线"

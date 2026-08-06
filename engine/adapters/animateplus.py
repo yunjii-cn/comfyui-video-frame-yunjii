@@ -61,6 +61,13 @@ class AnimatePlusNodeMap:
         self.driving_video = ""
         self.ref_image = ""
         self.video_combine = ""
+        # 潜空间拼接基建复用：SCAILAdapter._inject_save_latent / _extract_decode_template
+        # 依赖 node_map.decode 与 node_map.combine。AnimatePlus 家族原 NodeMap 缺这俩字段，
+        # 导致 WanAnimatePlus 路线的 latent 落盘/解码模板抽取静默失败(AttributeError 被吞)，
+        # 潜空间拼接永远回退像素拼接。此处补齐，使『真骨架多段 + 潜空间拼接』在 WanAnimatePlus
+        # 模板上也能生效(与标准 SCAIL 一致)。
+        self.decode = ""
+        self.combine = ""
 
     def to_dict(self):
         return {
@@ -120,6 +127,9 @@ class AnimatePlusSCAILAdapter(SCAILAdapter):
             elif ct == AP_VIDEO_COMBINE:
                 prefix, save_out = self._vhs_meta(ndata)
                 vhs_candidates.append((nid, prefix, save_out))
+            elif ct in ("WanVideoDecode", "WanAnimatePlus Decode") and not nm.decode:
+                # 解码节点（端口 samples/vae 与标准 WanVideoDecode 一致），供潜空间拼接落盘/解码
+                nm.decode = nid
 
         # 驱动视频：沿 embeds.pose_images 向上回溯，找第一个 VHS_LoadVideo
         if nm.animate_embeds and nm.animate_embeds in workflow:
@@ -131,6 +141,8 @@ class AnimatePlusSCAILAdapter(SCAILAdapter):
                 workflow, nm.animate_embeds, "ref_image", AP_LOADIMAGE)
 
         nm.video_combine = self._select_primary_vhs(vhs_candidates)
+        # 供 SCAILAdapter 潜空间落盘/解码复用：combine 取主成片 VHS，decode 取解码节点
+        nm.combine = nm.video_combine
         if not nm.is_valid():
             miss = [n for n, v in [
                 ("WanAnimatePlus SCAIL_2 Embeds", nm.animate_embeds),

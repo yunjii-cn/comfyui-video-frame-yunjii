@@ -44,6 +44,9 @@ SCAIL_DRIVING_VIDEO = "VHS_LoadVideo"
 SCAIL_REF_IMAGE = "LoadImage"
 SCAIL_SAMPLER = "WanVideoSamplerv2"
 SCAIL_DECODE = "WanVideoDecode"
+# WanAnimatePlus 路线(Tier2)的解码节点：端口名(samples/vae)与原装 WanVideoDecode 一致，
+# 故潜空间拼接基建(落盘+模板抽取)可直接复用，仅此处需一并识别。
+SCAIL_DECODE_WANANIMATE = "WanAnimatePlus Decode"
 SCAIL_COMBINE = "VHS_VideoCombine"
 SCAIL_VAE_LOADER = "WanVideoVAELoader"
 # latent 暖启动(video2video 续写)用到的编码节点
@@ -191,7 +194,7 @@ class SCAILAdapter(DirectAdapter):
                 nm.driving_video = nid
             elif ct == SCAIL_SAMPLER and not nm.sampler:
                 nm.sampler = nid
-            elif ct == SCAIL_DECODE and not nm.decode:
+            elif ct in (SCAIL_DECODE, SCAIL_DECODE_WANANIMATE) and not nm.decode:
                 nm.decode = nid
             elif ct == SCAIL_COMBINE:
                 # 收集所有 VHS，最后统一挑选真实成片（剔除姿态/骨架预览节点）

@@ -10,7 +10,8 @@ import folder_paths
 from .types import (
     SegmentResult,
     STITCH_HARD_CUT, STITCH_CROSS_DISSOLVE, STITCH_AUTO, STITCH_SEAMLESS,
-    STITCH_SEAMLESS_BLEND, STITCH_TRANSITION, STITCH_LABELS, STITCH_LABEL_TO_VALUE,
+    STITCH_SEAMLESS_BLEND, STITCH_LATENT_BLEND, STITCH_TRANSITION,
+    STITCH_LABELS, STITCH_LABEL_TO_VALUE,
 )
 
 # ffmpeg xfade 转场：中文显示名 -> ffmpeg transition 名（仅 ffmpeg转场 拼接模式生效）。
@@ -538,6 +539,11 @@ class YunjiiSegmentStitcher:
                               "inputs": {"load_path": merged_path}}
             # 重连 Decode.samples -> LoadLatent
             nodes[decode_id].setdefault("inputs", {})["samples"] = [load_id, 0]
+            # 重连 VHS.images -> Decode 输出：抽取模板里 VHS 的 images 可能记了被丢弃的
+            # 中间节点 id（如 323），导致 POST 时引用幽灵节点、ComfyUI 校验 400。统一改为直连 Decode。
+            vhs_id = str(tmpl.get("vhs_id", ""))
+            if vhs_id in nodes:
+                nodes[vhs_id].setdefault("inputs", {})["images"] = [decode_id, 0]
             wf = {"prompt": nodes}
 
             import urllib.request
