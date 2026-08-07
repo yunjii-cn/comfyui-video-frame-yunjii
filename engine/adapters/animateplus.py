@@ -214,7 +214,8 @@ class AnimatePlusSCAILAdapter(SCAILAdapter):
     # ------------------------------------------------------------------
     def modify_workflow_for_segment(self, workflow, node_map, seg, ref_image_path,
                                     pose_dir="", run_id="", user_ref_path="",
-                                    prev_video_path=""):
+                                    prev_video_path="", prev_latent_path="",
+                                    latent_warmstart=False):
         wf = json.loads(json.dumps(workflow))
         char_ref = user_ref_path or ref_image_path
 
@@ -290,8 +291,15 @@ class AnimatePlusSCAILAdapter(SCAILAdapter):
             if "quantization" in ml:
                 ml["quantization"] = "disabled"
 
-        # 7) prefix_frames 暖启动（seg>0）：上段成片末帧 → 硬冻结到本段 latent 开头
-        if seg.index > 0 and prev_video_path and os.path.isfile(prev_video_path):
+        # 7) 跨段动作连续性（根治 方案C）：
+        #    · 『标准 SCAIL 真骨架(推荐)』模式(latent_warmstart=True)：改用 latent 视频续写
+        #      —— 直接加载上段落盘 latent 喂 WanAnimatePlus SamplerSettings.samples + add_noise，
+        #      与上段动作在采样时共享 latent 上下文，从架构层消除相位断裂(同 SCAILAdapter 机制)。
+        #      不再用会拖画质的像素 prefix_frames 末帧冻结。
+        #    · 仅 Tier2 暖启动模式(用户显式选 Tier2)保留像素 prefix_frames 冻结(原行为)。
+        if latent_warmstart and prev_latent_path and os.path.isfile(prev_latent_path):
+            self._inject_latent_warmstart_ap(wf, node_map, prev_latent_path, seg)
+        elif seg.index > 0 and prev_video_path and os.path.isfile(prev_video_path):
             self._inject_prefix(wf, node_map, prev_video_path)
 
         # 蒸馏 LoRA 路线：钉模型/LoRA 到本机真实文件（覆盖 WanAnimatePlus 系列节点
@@ -300,6 +308,14 @@ class AnimatePlusSCAILAdapter(SCAILAdapter):
         self._pin_distill_lora_and_model(wf)
         # 防御：SCAIL 基座模型低步数 → 模糊；若挂载蒸馏 LoRA 则强制 4 步(见 _enforce 内)
         wf = self._enforce_min_sampling_steps(wf)
+
+        # 潜空间拼接基建 + 根治 方案C 前提：每段把采样器输出 latent 落盘并抽取解码模板。
+        # 落盘 latent 既是 STITCH_LATENT_BLEND 合并解码所需，也是下段『latent 视频续写』
+        # 读取上段上下文的前提(无落盘则根治路径静默跳过)。与标准 SCAIL 路线一致。
+        if run_id:
+            wf = self._inject_save_latent(wf, node_map, run_id, seg)
+            self._extract_decode_template(wf, node_map, run_id)
+
         return wf
 
     # ------------------------------------------------------------------
@@ -351,6 +367,36 @@ class AnimatePlusSCAILAdapter(SCAILAdapter):
             info("AnimatePlusAdapter", "prefix_frames 注入: 上段成片%s → 末%d帧暖启动", prev_video_path, n)
         except Exception as e:
             warn("AnimatePlusAdapter", "prefix_frames 注入异常(已跳过，不影响主生成): %s", str(e)[:200])
+
+    # ------------------------------------------------------------------
+    # latent 视频续写（根治 方案C，替代像素 prefix 冻结）
+    # ------------------------------------------------------------------
+    def _inject_latent_warmstart_ap(self, wf, node_map, prev_latent_path, seg):
+        """根治(方案C) AnimatePlus 版：直接加载上段落盘的 latent(seg_{i-1}_latent.pt)，
+        经 YunjiiLoadLatent 喂入 WanAnimatePlus SamplerSettings.samples + add_noise_to_samples=True，
+        做 latent 视频2video 续写 —— 本段在采样时即与上段动作共享 latent 上下文，
+        彻底消除段边界动作相位断裂(同 SCAILAdapter._inject_latent_warmstart 的机制，
+        但 AnimatePlus 直接复用已落盘 latent，无需重新编码视频)。
+
+        best-effort：任一前置条件不满足或异常 → 吞异常、回退无暖启动(等价多段独立生成)，
+        绝不因暖启动失败而中断整段生成。"""
+        try:
+            if not node_map.sampler_settings or node_map.sampler_settings not in wf:
+                warn("AnimatePlusAdapter", "latent 暖启动跳过：未找到 WanAnimatePlus SamplerSettings")
+                return wf
+            load_id = self._alloc_node_ids(wf, 1)[0]
+            wf[load_id] = {
+                "class_type": "YunjiiLoadLatent",
+                "inputs": {"latent_path": prev_latent_path},
+            }
+            ss = wf[node_map.sampler_settings].setdefault("inputs", {})
+            ss["samples"] = [load_id, 0]
+            ss["add_noise_to_samples"] = True
+            info("AnimatePlusAdapter", "latent 暖启动注入(根治): %s → YunjiiLoadLatent(%s) → SamplerSettings.samples(+noise)",
+                 prev_latent_path, load_id)
+        except Exception as e:
+            warn("AnimatePlusAdapter", "latent 暖启动注入失败，回退无暖启动: %s", str(e)[:200])
+        return wf
 
     # ------------------------------------------------------------------
     # 工具

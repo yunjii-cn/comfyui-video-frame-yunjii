@@ -347,7 +347,8 @@ class YunjiiSegmentRunner:
         results = []
         prev_context = SegmentContext(last_frame_path=ref_image_path)
         all_success = True
-        prev_video_path = ""  # 上一段成片视频路径（暖启动 Tier2 用于 prefix 注入）
+        prev_video_path = ""  # 上一段成片视频路径（暖启动 Tier2 用于 pixel prefix 注入）
+        prev_latent_path = ""  # 上一段落盘 latent 路径（根治 方案C：latent 视频续写跨段共享上下文）
 
         start_from = 起始段 if 起始段 > 0 else 0
 
@@ -372,12 +373,22 @@ class YunjiiSegmentRunner:
                     current_ref = ref_image_path
                     log_lines.append(f"  👤 使用用户参考图")
 
-                # 暖启动(Tier2)：仅当策略为 warm_start 时把上段成片注入 prefix；
-                # 其余策略不传，避免无谓的 prefix 注入。
-                _prev_vp = prev_video_path if _strategy == CONTINUITY_WARM_START else ""
+                # 根治(方案C)：跨段 latent 上下文共享，从架构层消除动作相位断裂。
+                # 触发条件：
+                #   · 暖启动(Tier2)：沿用上段成片做 pixel prefix 注入（原行为）；
+                #   · 标准 SCAIL 真骨架(推荐)：对 seg>0 启用 latent 视频续写——
+                #     SCAILAdapter 用上段视频重编码 latent；AnimatePlus 直接加载上段
+                #     落盘 latent，二者均在采样时与上段动作共享 latent 上下文。
+                _prev_vp = prev_video_path if (seg.index > 0 and (
+                    _strategy == CONTINUITY_WARM_START
+                    or _quality == "标准 SCAIL 真骨架（推荐）"
+                )) else ""
+                _latent_warmstart = (_quality == "标准 SCAIL 真骨架（推荐）") and seg.index > 0
                 wf = gen_adapter.modify_workflow_for_segment(
                     workflow, node_map, seg, current_ref, pose_dir, run_id,
-                    user_ref_path=ref_image_path, prev_video_path=_prev_vp)
+                    user_ref_path=ref_image_path, prev_video_path=_prev_vp,
+                    prev_latent_path=(prev_latent_path if _latent_warmstart else ""),
+                    latent_warmstart=_latent_warmstart)
 
                 success = False
                 last_error = ""
@@ -423,9 +434,13 @@ class YunjiiSegmentRunner:
                                 prev_context = SegmentContext(last_frame_path=last_frame)
                                 cp.save(seg.index, last_frame, [r.to_dict() for r in results])
 
-                            # 记录上段成片，供暖启动(Tier2)跨段 prefix 注入
+                            # 记录上段成片 / 落盘 latent，供跨段连续性使用：
+                            #  · prev_video_path → Tier2 像素 prefix 注入
+                            #  · prev_latent_path → 根治 方案C latent 视频续写(共享上段 latent 上下文)
                             if output_path and os.path.isfile(output_path):
                                 prev_video_path = output_path
+                            if latent_path and os.path.isfile(latent_path):
+                                prev_latent_path = latent_path
 
                             log_lines.append(f"  ✅ 完成! 耗时{seg_duration:.1f}s, 输出={output_path}")
                             info("Runner", "段%d: ✅ 完成! 耗时%.1fs", seg.index, seg_duration)

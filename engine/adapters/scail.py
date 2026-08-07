@@ -247,7 +247,7 @@ class SCAILAdapter(DirectAdapter):
         inp[key] = value
         return True
 
-    def modify_workflow_for_segment(self, workflow, node_map, seg, ref_image_path, pose_dir="", run_id="", user_ref_path="", prev_video_path=""):
+    def modify_workflow_for_segment(self, workflow, node_map, seg, ref_image_path, pose_dir="", run_id="", user_ref_path="", prev_video_path="", prev_latent_path="", latent_warmstart=False):
         """
         把一个 SegmentInfo 映射到官方 SCAIL 子流程输入。
         workflow 为 API 格式（链接以 [node, slot] 表示，未链接的 widget 为原始值）。
@@ -341,8 +341,10 @@ class SCAILAdapter(DirectAdapter):
             self._pin_distill_lora_and_model(wf)
 
         # D-A 方案：标准真骨架路线 + latent 暖启动(video2video 续写)。
-        # 仅当策略为暖启动(由 runner 传入 prev_video_path)且非首段时注入；
-        # 单独调用本适配器(多段无缝)时 prev_video_path 为空 → 不注入，等价 A 路径。
+        # 触发条件：runner 在『暖启动(Tier2)』或『标准 SCAIL 真骨架(推荐)』模式下，
+        # 对 seg>0 传入 prev_video_path → 上段成片重新编码为 latent 喂入采样器，
+        # 使本段在生成时锚定上段动作(latent 上下文共享)，从架构层消除动作相位断裂。
+        # 单独多段无缝(非推荐)时 prev_video_path 为空 → 不注入，等价 A 路径。
         if prev_video_path:
             wf = self._inject_latent_warmstart(wf, node_map, prev_video_path, seg)
 
