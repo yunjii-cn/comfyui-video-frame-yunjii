@@ -98,18 +98,17 @@ class YunjiiSegmentPlanner:
         backend = BACKEND_SCAIL2 if 生成后端 == "SCAIL-2 路线" else BACKEND_WANVIDEO
         if backend == BACKEND_SCAIL2 and 生成模式 != SEGMENT_MODE_ONE_SHOT:
             # SCAIL-2 分块：每段固定 81 帧（沿用官方）。
-            # 段间重叠统一抬到地板值 16（原官方5 / 旧默认10），并尊重用户在 UI 设的更高值(≤32)：
-            #   VAE 时间压缩≈4x → 16像素重叠帧≈5 latent帧，32≈8 latent帧。
-            # 目的：加宽潜空间拼接(latent_blend)的重叠混合窗口，对齐猴子工作流
-            #   WanVideoContextOptions 的 8-latent 线性重叠，让段边界交叉淡化更宽更柔。
-            # 单段生成质量(4步蒸馏)不受影响，仅接缝过渡更平滑；用户可在 UI 继续上调至 32。
+            # 段间重叠锁定为 32 像素帧（对齐『三层楼的小肥猴』Wan2.2 Animate 工作流
+            #   WanVideoContextOptions 的 context_overlap=32 → 8 latent 帧）；VAE 时间压缩≈4x
+            #   → 32/4=8 latent 帧。该值已在猴子工作流验证为自然连贯，故直接采用，
+            #   不再地板16（避免用户漏设时混合窗偏窄）。若 UI 设更高值仍尊重(clamp≤32)。
+            # 单段生成质量(4步蒸馏)不受影响，仅接缝 latent 交叉淡化窗加宽到 8 帧更柔。
             每段最大帧数 = 81
             _user_ov = 重叠帧数 if isinstance(重叠帧数, int) else 0
-            _new_ov = min(max(_user_ov, 16), 32)
-            if _user_ov != _new_ov:
-                info("Planner", "SCAIL-2 路线：每段固定81帧；段间重叠从%d抬到%d（地板值，平滑接缝；UI 可设更高≤32）",
-                     _user_ov, _new_ov)
+            _new_ov = min(max(_user_ov, 32), 32)
             重叠帧数 = _new_ov
+            if _user_ov < 32:
+                info("Planner", "SCAIL-2 路线：每段固定81帧；段间重叠锁定为32（对齐猴子工作流验证的自然连贯方案，8 latent帧）")
 
         node_start("Planner", 生成模式=生成模式, 每段最大帧数=每段最大帧数, 重叠帧数=重叠帧数,
                    目标分辨率=目标分辨率, 目标帧率=目标帧率, 生成后端=backend)
