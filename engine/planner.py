@@ -97,15 +97,19 @@ class YunjiiSegmentPlanner:
 
         backend = BACKEND_SCAIL2 if 生成后端 == "SCAIL-2 路线" else BACKEND_WANVIDEO
         if backend == BACKEND_SCAIL2 and 生成模式 != SEGMENT_MODE_ONE_SHOT:
-            # SCAIL-2 分块：每段固定 81 帧（沿用官方）。段间重叠从官方 5 增大到 10，
-            # 目的是加宽拼接时的重叠混合窗口（seamless_blend 的 b=min(重叠, 淡化帧数)），
-            # 软化段边界位置跳变。会偏离官方 81/5/步进76，变为 81/10/步进71；
-            # 单段生成质量(4步蒸馏)不受影响，仅接缝过渡更宽更柔。
-            if 每段最大帧数 != 81 or 重叠帧数 != 10:
-                info("Planner", "SCAIL-2 路线：每段固定81帧；段间重叠已加强为10（原官方5）以平滑接缝，"
-                     "忽略用户设置 每段最大帧数=%d 重叠帧数=%d", 每段最大帧数, 重叠帧数)
+            # SCAIL-2 分块：每段固定 81 帧（沿用官方）。
+            # 段间重叠统一抬到地板值 16（原官方5 / 旧默认10），并尊重用户在 UI 设的更高值(≤32)：
+            #   VAE 时间压缩≈4x → 16像素重叠帧≈5 latent帧，32≈8 latent帧。
+            # 目的：加宽潜空间拼接(latent_blend)的重叠混合窗口，对齐猴子工作流
+            #   WanVideoContextOptions 的 8-latent 线性重叠，让段边界交叉淡化更宽更柔。
+            # 单段生成质量(4步蒸馏)不受影响，仅接缝过渡更平滑；用户可在 UI 继续上调至 32。
             每段最大帧数 = 81
-            重叠帧数 = 10
+            _user_ov = 重叠帧数 if isinstance(重叠帧数, int) else 0
+            _new_ov = min(max(_user_ov, 16), 32)
+            if _user_ov != _new_ov:
+                info("Planner", "SCAIL-2 路线：每段固定81帧；段间重叠从%d抬到%d（地板值，平滑接缝；UI 可设更高≤32）",
+                     _user_ov, _new_ov)
+            重叠帧数 = _new_ov
 
         node_start("Planner", 生成模式=生成模式, 每段最大帧数=每段最大帧数, 重叠帧数=重叠帧数,
                    目标分辨率=目标分辨率, 目标帧率=目标帧率, 生成后端=backend)

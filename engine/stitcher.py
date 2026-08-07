@@ -475,7 +475,7 @@ class YunjiiSegmentStitcher:
                 cur = tensors[i]
                 O = int(valid[i].get("overlap_prev", 0) or 0)
                 T_prev, T_cur = merged.shape[2], cur.shape[2]
-                b = max(1, round((O - 1) / 4.0) + 1) if O > 0 else 0  # VAE 时间压缩≈4x
+                b = (O + 2) // 4 if O > 0 else 0   # VAE 时间压缩≈4x：O像素重叠帧 → (O+2)//4 latent帧
                 b = min(b, T_prev - 1, T_cur - 1)
                 if b <= 0:
                     merged = torch.cat([merged, cur], dim=2)
@@ -483,7 +483,9 @@ class YunjiiSegmentStitcher:
                     continue
                 prev_tail = merged[:, :, -b:, :, :]
                 cur_head = cur[:, :, :b, :, :]
-                w = torch.linspace(0.0, 1.0, b).view(1, 1, b, 1, 1)
+                # 余弦 smoothstep 缓动（两端导数为0），比线性更无痕地把接缝"化开"
+                t = torch.linspace(0.0, 1.0, b).view(1, 1, b, 1, 1)
+                w = 0.5 - 0.5 * torch.cos(torch.pi * t)
                 blended = (1.0 - w) * prev_tail + w * cur_head
                 merged = torch.cat([merged[:, :, :-b, :, :], blended, cur[:, :, b:, :, :]], dim=2)
                 report.append(f"  段{valid[i]['segment_index']}: latent 重叠淡化 {b} 帧(像素重叠{O})")
