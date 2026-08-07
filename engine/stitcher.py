@@ -104,7 +104,11 @@ def _build_output_ui(output_path: str) -> dict:
             preview["frame_rate"] = float(fps)
     except Exception:
         pass
-    return {"gifs": [preview]}
+    # 同时返回 gifs（旧版 ComfyUI 前端）与 videos（新版 ComfyUI 前端）两种键，
+    # 指向同一预览对象，最大化不同版本前端的视频预览渲染兼容性。
+    # ComfyUI 前端对 OUTPUT_NODE 的 ui 处理：早期仅识别 ui.gifs，新版优先识别 ui.videos；
+    # 只返回 gifs 会导致新版前端节点上看不到视频播放器（这正是「前端无法显示输出视频」的主因）。
+    return {"gifs": [preview], "videos": [preview]}
 
 
 class YunjiiSegmentStitcher:
