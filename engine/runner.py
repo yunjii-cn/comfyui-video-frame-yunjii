@@ -16,6 +16,8 @@ from .types import (
     BACKEND_WANVIDEO, BACKEND_SCAIL2,
     CONTINUITY_MULTI_SEG, CONTINUITY_SINGLE_PASS, CONTINUITY_WARM_START,
     CONTINUITY_LABEL_TO_VALUE,
+    SEAMLESS_PLAN_A, SEAMLESS_PLAN_B, SEAMLESS_PLAN_C, SEAMLESS_PLAN_AUTO,
+    SEAMLESS_PLAN_LABEL_TO_VALUE,
 )
 from .adapters.direct import DirectAdapter
 from .adapters.scail import SCAILAdapter
@@ -102,7 +104,7 @@ class YunjiiSegmentRunner:
             },
         }
 
-    def run(self, 段落计划, 工作流模板, 执行模式, 最大重试, 生成后端="骨骼路线(WanVideo)", 视频路径="", 参考图=None, 姿态图=None, 人物参考图="", 起始段=0, 效果模块="", ComfyUI地址="127.0.0.1:8188", 连贯策略="", 模型精度="fp8", 生成质量模式="标准 SCAIL 真骨架（推荐）"):
+    def run(self, 段落计划, 工作流模板, 执行模式, 最大重试, 生成后端="骨骼路线(WanVideo)", 视频路径="", 参考图=None, 姿态图=None, 人物参考图="", 起始段=0, 效果模块="", ComfyUI地址="127.0.0.1:8188", 连贯策略="", 模型精度="fp8", 生成质量模式="标准 SCAIL 真骨架（推荐）", 无缝连贯方案=SEAMLESS_PLAN_AUTO):
         node_start("Runner", 执行模式=执行模式, 最大重试=最大重试, ComfyUI地址=ComfyUI地址)
         info("Runner", "参数诊断: 段落计划类型=%s, 工作流模板类型=%s, 视频路径='%s', 参考图类型=%s, 姿态图类型=%s, 人物参考图='%s', 起始段=%s, ComfyUI地址='%s'",
              type(段落计划).__name__, type(工作流模板).__name__,
@@ -151,7 +153,37 @@ class YunjiiSegmentRunner:
         _precision = 模型精度 or getattr(plan, "model_precision", "") or "fp8"
         if _precision not in ("fp8", "fp16"):
             _precision = "fp8"
-        info("Runner", "连贯策略=%s, 模型精度=%s", _strategy, _precision)
+
+        # —— 无缝连贯方案（A/B/C）归一：用户选无缝档位的主入口，优先于旧连贯策略 ——
+        # 三档共用真·无缝机制(context滑窗+跨段reference_latent续写)，仅目标时长/防漂移增强不同。
+        # A/B 均等价于原『标准 SCAIL 真骨架(推荐)』续写机制；C=单遍(方案C兜底)。
+        # 写回 plan 字段，使下游适配器/拼接按方案生效（即使 planner 未跑、直接拿旧 plan 也能生效）。
+        _seamless = 无缝连贯方案 or getattr(plan, "seamless_plan", "") or SEAMLESS_PLAN_AUTO
+        _seamless = SEAMLESS_PLAN_LABEL_TO_VALUE.get(_seamless, _seamless)
+        if _seamless not in (SEAMLESS_PLAN_A, SEAMLESS_PLAN_B, SEAMLESS_PLAN_C, SEAMLESS_PLAN_AUTO):
+            _seamless = SEAMLESS_PLAN_AUTO
+        if _seamless == SEAMLESS_PLAN_A:
+            _strategy = CONTINUITY_MULTI_SEG
+            plan.seamless_plan = SEAMLESS_PLAN_A
+            plan.long_video_mode = False
+            info("Runner", "无缝连贯方案=A (标准多段无缝, 一般时长≤15s)")
+        elif _seamless == SEAMLESS_PLAN_B:
+            _strategy = CONTINUITY_MULTI_SEG
+            plan.seamless_plan = SEAMLESS_PLAN_B
+            plan.long_video_mode = True
+            info("Runner", "无缝连贯方案=B (超长视频无缝, 长程防漂移启用)")
+        elif _seamless == SEAMLESS_PLAN_C:
+            _strategy = CONTINUITY_SINGLE_PASS
+            plan.seamless_plan = SEAMLESS_PLAN_C
+            plan.long_video_mode = False
+            info("Runner", "无缝连贯方案=C (单遍连贯·旧方案C兜底)")
+        else:
+            # auto：沿用连贯策略已归一出的 _strategy，并同步 plan.seamless_plan 供下游识别
+            plan.seamless_plan = _seamless
+        if _strategy == CONTINUITY_MULTI_SEG:
+            plan.long_video_mode = getattr(plan, "long_video_mode", False)
+        info("Runner", "连贯策略=%s, 无缝连贯方案=%s, 长视频模式=%s, 模型精度=%s",
+             _strategy, plan.seamless_plan, getattr(plan, "long_video_mode", False), _precision)
 
         # 效果管线：生成前对每段 prompt / params 应用已启用模块。
         # 空「效果模块」→ 空管线 → 透传，输出与现状完全一致（零回归）。
@@ -379,11 +411,16 @@ class YunjiiSegmentRunner:
                 #   · 标准 SCAIL 真骨架(推荐)：对 seg>0 启用 latent 视频续写——
                 #     SCAILAdapter 用上段视频重编码 latent；AnimatePlus 直接加载上段
                 #     落盘 latent，二者均在采样时与上段动作共享 latent 上下文。
-                _prev_vp = prev_video_path if (seg.index > 0 and (
-                    _strategy == CONTINUITY_WARM_START
-                    or _quality == "标准 SCAIL 真骨架（推荐）"
-                )) else ""
-                _latent_warmstart = (_quality == "标准 SCAIL 真骨架（推荐）") and seg.index > 0
+                # 无缝连贯方案（A/B/C）→ 启用生成侧连续续写(context_options 跨段 reference_latent)。
+                # 等价于原『标准 SCAIL 真骨架(推荐)』机制：对 seg>0 共享上段 latent 上下文。
+                # C 方案走单遍(_strategy=single_pass，整片一次去噪，不进此多段循环)。
+                _seamless_on = (
+                    (plan.seamless_plan in (SEAMLESS_PLAN_A, SEAMLESS_PLAN_B))
+                    or (_quality == "标准 SCAIL 真骨架（推荐）")
+                    or (_strategy == CONTINUITY_MULTI_SEG)
+                )
+                _prev_vp = prev_video_path if (seg.index > 0 and _strategy == CONTINUITY_WARM_START) else ""
+                _latent_warmstart = _seamless_on and seg.index > 0
                 wf = gen_adapter.modify_workflow_for_segment(
                     workflow, node_map, seg, current_ref, pose_dir, run_id,
                     user_ref_path=ref_image_path, prev_video_path=_prev_vp,

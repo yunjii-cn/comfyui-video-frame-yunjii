@@ -282,6 +282,13 @@ class AnimatePlusSCAILAdapter(SCAILAdapter):
                 except (TypeError, ValueError):
                     cur = 81
                 co["context_frames"] = min(cur, seg.target_frames) if seg.target_frames < cur else cur
+            # 真·无缝：锁 context_overlap=32(8 latent 帧，对齐猴子)，并把 ContextOptions 接进采样器
+            co["context_overlap"] = 32
+            if node_map.sampler_settings and node_map.sampler_settings in wf:
+                ss = wf[node_map.sampler_settings].setdefault("inputs", {})
+                if not ss.get("context_options"):
+                    ss["context_options"] = [node_map.context_options, 0]
+                    info("AnimatePlusAdapter", "采样器接入 ContextOptions(滑窗, overlap=32)")
 
         # 6) 模型精度（仅 fp16 时调整 base_precision；fp8 保持工作流默认）
         if self.model_precision == "fp16" and node_map.model_loader and node_map.model_loader in wf:
@@ -372,15 +379,40 @@ class AnimatePlusSCAILAdapter(SCAILAdapter):
     # latent 视频续写（根治 方案C，替代像素 prefix 冻结）
     # ------------------------------------------------------------------
     def _inject_latent_warmstart_ap(self, wf, node_map, prev_latent_path, seg):
-        """根治(方案C) AnimatePlus 版：直接加载上段落盘的 latent(seg_{i-1}_latent.pt)，
-        经 YunjiiLoadLatent 喂入 WanAnimatePlus SamplerSettings.samples + add_noise_to_samples=True，
-        做 latent 视频2video 续写 —— 本段在采样时即与上段动作共享 latent 上下文，
-        彻底消除段边界动作相位断裂(同 SCAILAdapter._inject_latent_warmstart 的机制，
-        但 AnimatePlus 直接复用已落盘 latent，无需重新编码视频)。
+        """根治(方案C) AnimatePlus 版 —— 真·无缝续写（对齐猴子工作流）。
 
-        best-effort：任一前置条件不满足或异常 → 吞异常、回退无暖启动(等价多段独立生成)，
-        绝不因暖启动失败而中断整段生成。"""
+        **优先路径（有 ContextOptions 节点）**：把上段落盘 latent(seg_{i-1}_latent.pt)
+        经 YunjiiLoadLatent 喂 WanAnimatePlus ContextOptions.reference_latent —— 这是
+        **同一次采样内的条件上下文**，重叠的 8 latent 帧直接参与本次去噪轨迹，
+        下一段头部=上一段尾部，段边界天生消失（硬切即无缝），而非 samples+add_noise 的弱锚定。
+
+        **回退路径（老模板无 ContextOptions）**：保持旧行为 —— samples+add_noise_to_samples=True
+        弱锚定（等价旧 latent 暖启动）。
+
+        best-effort：任一前置不满足或异常 → 吞异常、回退无暖启动，绝不中断整段生成。"""
         try:
+            if seg.index <= 0:
+                return wf
+            if not prev_latent_path or not os.path.isfile(prev_latent_path):
+                return wf
+            # —— 优先：reference_latent 真·续写 ——
+            if (not os.environ.get("YUNJII_DISABLE_REF_LATENT")) and node_map.context_options and node_map.context_options in wf:
+                co = wf[node_map.context_options].setdefault("inputs", {})
+                co["context_overlap"] = 32
+                if node_map.sampler_settings and node_map.sampler_settings in wf:
+                    ss = wf[node_map.sampler_settings].setdefault("inputs", {})
+                    if not ss.get("context_options"):
+                        ss["context_options"] = [node_map.context_options, 0]
+                load_id = self._alloc_node_ids(wf, 1)[0]
+                wf[load_id] = {
+                    "class_type": "YunjiiLoadLatent",
+                    "inputs": {"latent_path": prev_latent_path},
+                }
+                co["reference_latent"] = [load_id, 0]
+                info("AnimatePlusAdapter", "跨段 reference_latent 续写(根治): %s → YunjiiLoadLatent(%s) → ContextOptions.reference_latent",
+                     prev_latent_path, load_id)
+                return wf
+            # —— 回退：老模板无 ContextOptions → samples+add_noise 弱锚定 ——
             if not node_map.sampler_settings or node_map.sampler_settings not in wf:
                 warn("AnimatePlusAdapter", "latent 暖启动跳过：未找到 WanAnimatePlus SamplerSettings")
                 return wf
@@ -392,10 +424,10 @@ class AnimatePlusSCAILAdapter(SCAILAdapter):
             ss = wf[node_map.sampler_settings].setdefault("inputs", {})
             ss["samples"] = [load_id, 0]
             ss["add_noise_to_samples"] = True
-            info("AnimatePlusAdapter", "latent 暖启动注入(根治): %s → YunjiiLoadLatent(%s) → SamplerSettings.samples(+noise)",
+            info("AnimatePlusAdapter", "latent 暖启动注入(旧·samples+noise，无ContextOptions): %s → YunjiiLoadLatent(%s) → SamplerSettings.samples(+noise)",
                  prev_latent_path, load_id)
         except Exception as e:
-            warn("AnimatePlusAdapter", "latent 暖启动注入失败，回退无暖启动: %s", str(e)[:200])
+            warn("AnimatePlusAdapter", "latent 续写注入异常(已跳过，不影响主生成): %s", str(e)[:200])
         return wf
 
     # ------------------------------------------------------------------

@@ -10,6 +10,8 @@ from .types import (
     BACKEND_WANVIDEO, BACKEND_SCAIL2,
     CONTINUITY_MULTI_SEG, CONTINUITY_SINGLE_PASS, CONTINUITY_WARM_START,
     CONTINUITY_AUTO, CONTINUITY_LABEL_TO_VALUE, CONTINUITY_LABELS,
+    SEAMLESS_PLAN_A, SEAMLESS_PLAN_B, SEAMLESS_PLAN_C, SEAMLESS_PLAN_AUTO,
+    SEAMLESS_PLAN_LABELS, SEAMLESS_PLAN_LABEL_TO_VALUE,
 )
 from .debug_log import node_start, node_end, node_error, debug, info, warn
 
@@ -73,6 +75,19 @@ class YunjiiSegmentPlanner:
                                 "单遍连贯(方案C)=整片一次去噪latent连续真·一镜到底,长视频画质软; "
                                 "暖启动(Tier2)=分段+上段真实帧喂回WanAnimatePlus prefix_frames,连续+画质兼得(需SCAIL-2路线+WanAnimatePlus)"},
                 ),
+                "无缝连贯方案": (
+                    [label for _, label in SEAMLESS_PLAN_LABELS],
+                    {"default": "A方案·标准多段无缝(一般时长≤15s) ⭐默认",
+                     "tooltip": "【推荐用此下拉替代旧连贯策略来选无缝档位】三档共用真·无缝机制"
+                                "(context滑窗+跨段reference_latent续写+STITCH_SEAMLESS零转场硬切)，互不冲突：\n"
+                                "· A方案(标准多段无缝)：一般时长≤15s，每段独立高保真，质量最高、显存友好、可分段重试；"
+                                "超长视频(>15~20s)段数多会累积长程漂移。\n"
+                                "· B方案(超长视频无缝)：15~30s+ 长视频，启用长程防漂移(强制SCAIL真骨架+加大重叠冗余+"
+                                "按容量分块≤~9段×81帧)无断点无降级；代价是总耗时随段数线性增加。与MiniMax H3分段参考延长同源但兼容本机SCAIL-2。\n"
+                                "· C方案(单遍连贯·旧方案C)：整片一次去噪latent天然连续，仅作兜底/对比；"
+                                "长视频会被长程稀释画质软、显存峰值高、不可分段重试，不推荐主用。\n"
+                                "选B时拼接模式务必用『无缝一镜到底(零转场·硬切)』而非『潜空间拼接』等转场模式。"},
+                ),
                 "单遍时长上限": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 30.0, "step": 0.5,
                     "tooltip": "方案C单遍最大时长(秒)。>0 时超出则回退多段seamless以抑制长程稀释画质退化；0=不限制(整片单遍)"}),
                 "模型精度": (
@@ -90,7 +105,8 @@ class YunjiiSegmentPlanner:
 
     def plan(self, 分段信息, 运动提示词, 生成模式, 每段最大帧数, 重叠帧数, 目标分辨率,
              目标帧率, 自适应参数, 姿态数据="", 负面提示词="", 生成后端="骨骼路线(WanVideo)",
-             单遍连贯模式=False, 连贯策略=CONTINUITY_AUTO, 单遍时长上限=0.0, 模型精度="fp8"):
+             单遍连贯模式=False, 连贯策略=CONTINUITY_AUTO, 单遍时长上限=0.0, 模型精度="fp8",
+             无缝连贯方案=SEAMLESS_PLAN_AUTO):
 
         # 归一化：旧工作流可能传英文值(one_shot 等)，统一映射为中文常量
         生成模式 = MODE_ALIASES.get(生成模式, 生成模式)
@@ -148,6 +164,30 @@ class YunjiiSegmentPlanner:
         if strategy not in (CONTINUITY_MULTI_SEG, CONTINUITY_SINGLE_PASS, CONTINUITY_WARM_START):
             strategy = CONTINUITY_MULTI_SEG
 
+        # —— 无缝连贯方案（A/B/C）归一：本下拉是用户选无缝档位的主入口，优先于旧连贯策略 ——
+        # 三档共用真·无缝机制(context滑窗+跨段reference_latent续写)，仅目标时长/防漂移增强不同：
+        #   A → 标准多段无缝(strategy=multi_seg, long_video_mode=False)
+        #   B → 超长视频无缝(strategy=multi_seg, long_video_mode=True, 强制真骨架防漂移)
+        #   C → 单遍连贯(strategy=single_pass，即旧方案C兜底)
+        #   auto → 保持上面由连贯策略归一出的 strategy（兼容旧工作流/未选本下拉）
+        _seamless = SEAMLESS_PLAN_LABEL_TO_VALUE.get(无缝连贯方案, 无缝连贯方案)
+        if _seamless not in (SEAMLESS_PLAN_A, SEAMLESS_PLAN_B, SEAMLESS_PLAN_C, SEAMLESS_PLAN_AUTO):
+            _seamless = SEAMLESS_PLAN_AUTO
+        seamless_plan = _seamless
+        long_video_mode = False
+        if seamless_plan == SEAMLESS_PLAN_A:
+            strategy = CONTINUITY_MULTI_SEG
+            long_video_mode = False
+            info("Planner", "无缝连贯方案=A (标准多段无缝, 一般时长≤15s)")
+        elif seamless_plan == SEAMLESS_PLAN_B:
+            strategy = CONTINUITY_MULTI_SEG
+            long_video_mode = True
+            info("Planner", "无缝连贯方案=B (超长视频无缝, 长程防漂移启用: 强制真骨架+加大重叠+按容量分块)")
+        elif seamless_plan == SEAMLESS_PLAN_C:
+            strategy = CONTINUITY_SINGLE_PASS
+            long_video_mode = False
+            info("Planner", "无缝连贯方案=C (单遍连贯·旧方案C兜底)")
+
         single_pass_requested = (
             strategy == CONTINUITY_SINGLE_PASS
             and 生成模式 == SEGMENT_MODE_ONE_SHOT
@@ -169,7 +209,7 @@ class YunjiiSegmentPlanner:
         segments = self._build_segments(
             scenes, backend, 每段最大帧数, 重叠帧数, width, height,
             prompts, 生成模式, 目标帧率, 自适应参数, 负面提示词,
-            single_pass=single_pass,
+            single_pass=single_pass, long_video_mode=long_video_mode,
         )
 
         # 一镜到底长视频默认走「多段 seamless」(质量优先)：每段 81 帧(5s 原生)全质量生成，
@@ -186,6 +226,8 @@ class YunjiiSegmentPlanner:
             backend=backend,
             single_pass=is_single_pass,
             continuity_strategy=strategy,
+            seamless_plan=seamless_plan,
+            long_video_mode=long_video_mode,
             model_precision=模型精度 if backend == BACKEND_SCAIL2 else "fp8",
             single_pass_cap=cap,
         )
@@ -198,10 +240,15 @@ class YunjiiSegmentPlanner:
 
     def _build_segments(self, scenes, backend, 每段最大帧数, 重叠帧数, width, height,
                         prompts, 生成模式, target_fps, 自适应参数=True, 负面提示词="",
-                        single_pass=False):
-        """按指定后端的官方分块规则对 scenes 开窗建段。plan() 与 replan_for_backend() 共用。"""
+                        single_pass=False, long_video_mode=False):
+        """按指定后端的官方分块规则对 scenes 开窗建段。plan() 与 replan_for_backend() 共用。
+        long_video_mode(B 方案)：仅做日志与重叠提示，防漂移主体由生成侧 context_options 续写 + 真骨架承担。"""
         # 防御性归一化：兼容旧 plan JSON 里残存的英文模式值(one_shot 等)
         生成模式 = MODE_ALIASES.get(生成模式, 生成模式)
+        if long_video_mode:
+            info("Planner", "B方案(超长视频无缝): 已启用长程防漂移分块 — 段间重叠=%d 帧(=8 latent), "
+                            "每段81帧, 按容量自动分块(81帧×N段, N≈时长/5s, 9段≈30s+); 防漂移由生成侧"
+                            "context_options跨段reference_latent续写 + SCAIL真骨架(逐帧姿态)承担", 重叠帧数)
         segments = []
 
         # —— 方案C 单遍（仅当用户显式勾选「单遍连贯模式」时 single_pass=True）——

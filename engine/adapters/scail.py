@@ -49,6 +49,7 @@ SCAIL_DECODE = "WanVideoDecode"
 SCAIL_DECODE_WANANIMATE = "WanAnimatePlus Decode"
 SCAIL_COMBINE = "VHS_VideoCombine"
 SCAIL_VAE_LOADER = "WanVideoVAELoader"
+SCAIL_CONTEXT_OPTIONS = "WanVideoContextOptions"
 # latent 暖启动(video2video 续写)用到的编码节点
 SCAIL_ENCODE = "WanVideoEncode"
 
@@ -84,6 +85,7 @@ class SCAILNodeMap:
         self.sampler = ""
         self.decode = ""
         self.combine = ""
+        self.context_options = ""   # WanVideoContextOptions（滑窗续写，真无缝核心）
         self.vae = ""   # VAE 加载节点（latent 暖启动编码用）
 
     def to_dict(self):
@@ -196,6 +198,8 @@ class SCAILAdapter(DirectAdapter):
                 nm.sampler = nid
             elif ct in (SCAIL_DECODE, SCAIL_DECODE_WANANIMATE) and not nm.decode:
                 nm.decode = nid
+            elif ct == SCAIL_CONTEXT_OPTIONS and not nm.context_options:
+                nm.context_options = nid
             elif ct == SCAIL_COMBINE:
                 # 收集所有 VHS，最后统一挑选真实成片（剔除姿态/骨架预览节点）
                 prefix, save_out = DirectAdapter._vhs_meta(ndata)
@@ -340,13 +344,27 @@ class SCAILAdapter(DirectAdapter):
                         info("SCAILAdapter", "蒸馏 LoRA 路线: %s(%s) 步数→4(快速)", nid, ct)
             self._pin_distill_lora_and_model(wf)
 
-        # D-A 方案：标准真骨架路线 + latent 暖启动(video2video 续写)。
-        # 触发条件：runner 在『暖启动(Tier2)』或『标准 SCAIL 真骨架(推荐)』模式下，
-        # 对 seg>0 传入 prev_video_path → 上段成片重新编码为 latent 喂入采样器，
-        # 使本段在生成时锚定上段动作(latent 上下文共享)，从架构层消除动作相位断裂。
-        # 单独多段无缝(非推荐)时 prev_video_path 为空 → 不注入，等价 A 路径。
-        if prev_video_path:
-            wf = self._inject_latent_warmstart(wf, node_map, prev_video_path, seg)
+        # —— 真·无缝根治（对齐『三层楼的小肥猴』WanVideoContextOptions 滑窗 + reference_latent 续写）——
+        # 1) 启用滑窗：把 WanVideoContextOptions 接进采样器，context_overlap 锁 32(=8 latent 帧，
+        #    对齐猴子工作流验证的自然连贯窗)。单段内本身更连贯。
+        # 2) 跨段续写：seg>0 把上段落盘 latent 经 YunjiiLoadLatent 喂 context_options.reference_latent，
+        #    下一段头部=上一段尾部(同一条去噪轨迹) → 段边界消失，硬切即无缝。
+        # 3) 失败安全：reference_latent 注入失败 → 回退旧 latent 暖启动(samples+add_noise 弱锚定)；
+        #    若模板根本无 context_options 节点 → 整段逻辑等价旧行为，绝不比现状更差。
+        if node_map.context_options and node_map.context_options in wf:
+            co = wf[node_map.context_options].setdefault("inputs", {})
+            co["context_overlap"] = 32
+            if node_map.sampler and node_map.sampler in wf:
+                sinp = wf[node_map.sampler].setdefault("inputs", {})
+                if not sinp.get("context_options"):
+                    sinp["context_options"] = [node_map.context_options, 0]
+                    info("SCAILAdapter", "采样器接入 context_options(滑窗, overlap=32)")
+        if seg.index > 0:
+            chained = False
+            if prev_latent_path and os.path.isfile(prev_latent_path):
+                chained = self._inject_reference_latent(wf, node_map, prev_latent_path, seg)
+            if not chained and prev_video_path:
+                wf = self._inject_latent_warmstart(wf, node_map, prev_video_path, seg)
 
         # 潜空间拼接基建：每段把 WanVideoSamplerv2 输出的 latent 落盘
         # (插在 sampler→decode 之间，透传零改动)，供 STITCH_LATENT_BLEND 合并+解码用。
@@ -511,6 +529,42 @@ class SCAILAdapter(DirectAdapter):
         except Exception as e:
             warn("SCAILAdapter", "latent 暖启动注入失败，回退无暖启动: %s", e)
         return wf
+
+    def _inject_reference_latent(self, wf, node_map, prev_latent_path, seg):
+        """真·无缝续写（猴子工作流机制）：把上一段落盘的 latent(seg_{i-1}_latent.pt)
+        经 YunjiiLoadLatent 喂入 WanVideoContextOptions.reference_latent。
+
+        与旧 latent 暖启动(samples+add_noise 重新去噪)的本质区别：reference_latent 是
+        **同一次采样内的条件上下文**——
+        重叠的 8 latent 帧直接参与本次去噪轨迹，下一段头部=上一段尾部，边界天生消失，
+        无需事后混合。这才是"硬切也看不出拼接"的来源。
+
+        best-effort：任一前置不满足或异常 → 返回 False，由调用方回退旧 latent 暖启动；
+        绝不阻断生成、绝不比现状更差。"""
+        try:
+            if seg.index <= 0:
+                return False
+            if not prev_latent_path or not os.path.isfile(prev_latent_path):
+                return False
+            if os.environ.get("YUNJII_DISABLE_REF_LATENT"):
+                # 一键回退开关：跳过 reference_latent，改走旧 samples+add_noise 弱锚定
+                return False
+            if not node_map.context_options or node_map.context_options not in wf:
+                return False
+            co = wf[node_map.context_options].setdefault("inputs", {})
+            co["context_overlap"] = 32
+            load_id = self._alloc_node_ids(wf, 1)[0]
+            wf[load_id] = {
+                "class_type": "YunjiiLoadLatent",
+                "inputs": {"latent_path": prev_latent_path},
+            }
+            co["reference_latent"] = [load_id, 0]
+            info("SCAILAdapter", "跨段 reference_latent 续写(根治): prev=%s → YunjiiLoadLatent(%s) → context_options.reference_latent",
+                 prev_latent_path, load_id)
+            return True
+        except Exception as e:
+            warn("SCAILAdapter", "reference_latent 续写失败，回退 latent 暖启动: %s", str(e)[:200])
+            return False
 
     @staticmethod
     def _pin_distill_lora_and_model(wf):
