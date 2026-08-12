@@ -95,7 +95,14 @@ def _build_output_ui(output_path: str) -> dict:
         output_dir = os.path.abspath(folder_paths.get_output_directory())
         parent = os.path.abspath(os.path.dirname(output_path))
         if parent == output_dir or parent.startswith(output_dir + os.sep):
-            preview["subfolder"] = os.path.relpath(parent, output_dir)
+            _sub = os.path.relpath(parent, output_dir)
+            # 前端 /view 走 URL 查询参数(?subfolder=...)，必须统一为正斜杠。
+            # 我们的成片恒落在 output/yunjii_v2v/{run_id}/ 子目录，Windows 下
+            # os.path.relpath 返回反斜杠(yunjii_v2v\run_id)，经 URL 编码后在
+            # 前端构造 /view 与部分 path_utils 边界处易解析失败(VHS 默认 subfolder=""
+            # 从根目录 serve 不受影响，故此前未暴露)。正斜杠与 ComfyUI 自身
+            # get_save_image_path 的 URL 约定一致，消除该 404 隐患。
+            preview["subfolder"] = _sub.replace(os.sep, "/")
         # 尝试读取 fps 供前端播放器使用（失败不影响主流程）
         cap = cv2.VideoCapture(output_path)
         fps = cap.get(cv2.CAP_PROP_FPS)
