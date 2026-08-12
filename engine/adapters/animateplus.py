@@ -406,7 +406,7 @@ class AnimatePlusSCAILAdapter(SCAILAdapter):
                 load_id = self._alloc_node_ids(wf, 1)[0]
                 wf[load_id] = {
                     "class_type": "YunjiiLoadLatent",
-                    "inputs": {"latent_path": prev_latent_path},
+                    "inputs": {"load_path": prev_latent_path},
                 }
                 co["reference_latent"] = [load_id, 0]
                 info("AnimatePlusAdapter", "跨段 reference_latent 续写(根治): %s → YunjiiLoadLatent(%s) → ContextOptions.reference_latent",
@@ -419,7 +419,7 @@ class AnimatePlusSCAILAdapter(SCAILAdapter):
             load_id = self._alloc_node_ids(wf, 1)[0]
             wf[load_id] = {
                 "class_type": "YunjiiLoadLatent",
-                "inputs": {"latent_path": prev_latent_path},
+                "inputs": {"load_path": prev_latent_path},
             }
             ss = wf[node_map.sampler_settings].setdefault("inputs", {})
             ss["samples"] = [load_id, 0]

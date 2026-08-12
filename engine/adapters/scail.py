@@ -556,7 +556,7 @@ class SCAILAdapter(DirectAdapter):
             load_id = self._alloc_node_ids(wf, 1)[0]
             wf[load_id] = {
                 "class_type": "YunjiiLoadLatent",
-                "inputs": {"latent_path": prev_latent_path},
+                "inputs": {"load_path": prev_latent_path},
             }
             co["reference_latent"] = [load_id, 0]
             info("SCAILAdapter", "跨段 reference_latent 续写(根治): prev=%s → YunjiiLoadLatent(%s) → context_options.reference_latent",
