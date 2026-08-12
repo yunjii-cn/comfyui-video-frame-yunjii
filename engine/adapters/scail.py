@@ -344,6 +344,13 @@ class SCAILAdapter(DirectAdapter):
                         info("SCAILAdapter", "蒸馏 LoRA 路线: %s(%s) 步数→4(快速)", nid, ct)
             self._pin_distill_lora_and_model(wf)
 
+        # context 滑窗注入（对齐 direct.py + 『三层楼的小肥猴』真因）：
+        # 模板无 WanVideoContextOptions 节点时程序化创建并接进采样器。
+        # 方案C 单遍(全长视频) / 超长段 —— target_frames > 81(context_frames) 即接，
+        # 采样器内部按 81 帧一窗、重叠 32 帧潜空间 fuse → 真·无缝，且显存只压一个窗。
+        # multi_seg 每段≤81 帧不接(行为等同旧版，绝不比现状更差)。
+        wf = self._inject_context_options(wf, node_map, seg)
+
         # —— 真·无缝根治（对齐『三层楼的小肥猴』WanVideoContextOptions 滑窗 + reference_latent 续写）——
         # 1) 启用滑窗：把 WanVideoContextOptions 接进采样器，context_overlap 锁 32(=8 latent 帧，
         #    对齐猴子工作流验证的自然连贯窗)。单段内本身更连贯。
@@ -528,6 +535,58 @@ class SCAILAdapter(DirectAdapter):
                  fname, vhs_id, enc_id)
         except Exception as e:
             warn("SCAILAdapter", "latent 暖启动注入失败，回退无暖启动: %s", e)
+        return wf
+
+    def _inject_context_options(self, wf, node_map, seg):
+        """对齐 direct.py：把 WanVideoContextOptions 接进采样器，使长视频被 context 滑窗
+        切窗 + 重叠区潜空间 fuse（真·无缝核心）。
+
+        关键修复：此前生产模板不含该节点 → discover_nodes 时 node_map.context_options 永远为空
+        → 既有"真·无缝根治"代码被 `if node_map.context_options` 短路、从未生效，实际是分段独立
+        去噪 + 末端硬切。本方法在模板缺失时程序化创建节点（避免手工改 JSON 出错），让方案C 单遍
+        全长视频真正走滑窗；multi_seg 每段≤81 帧则不接（无窗口可滑，行为等同旧版）。
+
+        仅当 target_frames > context_frames(81) 时接：
+          · 方案C 单遍：段覆盖全长(total_frames>121) → 必接 → 全长视频单轨迹滑窗真无缝。
+          · 骨骼路线超长段(每段最大帧数>81) → 接 → 跨段 reference_latent 续写也可命中。
+          · multi_seg(每条81) → 不接 → 不变。
+        """
+        if not node_map.sampler or node_map.sampler not in wf:
+            return wf
+        sinp = wf[node_map.sampler].setdefault("inputs", {})
+        if sinp.get("context_options"):
+            # 已链接：仅确保重叠=32（对齐猴子验证的自然连贯窗）
+            co_id = sinp["context_options"][0]
+            if co_id in wf:
+                wf[co_id].setdefault("inputs", {})["context_overlap"] = 32
+            return wf
+
+        n = seg.target_frames or 0
+        context_frames = 81
+        if n <= context_frames:
+            return wf
+
+        co_id = "yunjii_context_options"
+        if co_id in wf:
+            co_id = self._alloc_node_ids(wf, 1)[0]
+        wf[co_id] = {
+            "class_type": "WanVideoContextOptions",
+            "inputs": {
+                "context_schedule": "uniform_standard",
+                "context_frames": context_frames,
+                "context_stride": 4,
+                "context_overlap": 32,
+                "freenoise": True,
+                "verbose": False,
+                "fuse_method": "linear",
+            },
+        }
+        sinp["context_options"] = [co_id, 0]
+        # 让 discover 阶段漏掉的 node_map.context_options 也指向它，
+        # 使既有跨段 reference_latent 续写(对 seg>0 且 n>81 的长段)可命中同一节点。
+        node_map.context_options = co_id
+        info("SCAILAdapter", "注入ContextOptions(滑窗): %s frames=%d stride=4 overlap=32 (段帧数=%d)",
+             co_id, context_frames, n)
         return wf
 
     def _inject_reference_latent(self, wf, node_map, prev_latent_path, seg):
