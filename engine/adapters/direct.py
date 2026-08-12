@@ -358,9 +358,10 @@ class DirectAdapter(GenerationAdapter):
                 "workflow": os.path.basename(_first) if _first else None,
                 "fullpath": video_path,
             }
+            node_ui = {"gifs": [preview], "videos": [preview]}
             outputs = {}
             for onid in execute_outputs:
-                outputs[onid] = {"gifs": [preview], "videos": [preview]}
+                outputs[onid] = node_ui
 
             pq = getattr(server, "prompt_queue", None)
             if pq is not None and hasattr(pq, "history"):
@@ -396,14 +397,20 @@ class DirectAdapter(GenerationAdapter):
                 }, None)
             except Exception:
                 pass
-            try:
-                server.send_sync("executed", {
-                    "prompt_id": prompt_id,
-                    "node": execute_outputs[0] if execute_outputs else None,
-                    "output": outputs,
-                }, None)
-            except Exception:
-                pass
+            # 对照 execution.py:577-578 标准格式：executed 的 output 必须是「单个节点」的
+            # ui 字典({"gifs":[...],"videos":[...]})，而非按节点分组的 history 结构。
+            # 先前误发 outputs(={onid:{...}}) → 前端 msg.output.gifs 为 undefined → 节点/画廊全白。
+            # 每个输出节点各发一条 executed，使画布预览与画廊都能正确渲染。
+            for onid in execute_outputs:
+                try:
+                    server.send_sync("executed", {
+                        "prompt_id": prompt_id,
+                        "node": onid,
+                        "display_node": onid,
+                        "output": node_ui,
+                    }, None)
+                except Exception:
+                    pass
             info("DirectAdapter", "已注册结果到前端历史 prompt_id=%s file=%s subfolder=%s",
                  prompt_id, fname, subfolder)
         except Exception as e:

@@ -183,11 +183,11 @@ STITCH_SEAMLESS_BLEND = "seamless_blend"
 # 显示用中文，比较/存储仍用英文值；旧已保存的英文值（auto/transition...）仍兼容。
 # 📌 标签后缀标注 [转场] 以直观提示用户：凡标 [转场] 的都是事后混合、非真无缝。
 STITCH_LABELS = [
-    (STITCH_SEAMLESS,       "无缝一镜到底(零转场·硬切) ⭐推荐"),
+    (STITCH_LATENT_BLEND,   "真·一镜到底（潜空间拼接）⭐推荐[转场]"),
+    (STITCH_SEAMLESS,       "无缝一镜到底(零转场·硬切)"),
     (STITCH_HARD_CUT,       "硬切"),
     (STITCH_AUTO,           "自动"),
     (STITCH_SEAMLESS_BLEND, "无缝一镜到底(重叠混合)[转场]"),
-    (STITCH_LATENT_BLEND,   "真·一镜到底（潜空间拼接）[转场]"),
     (STITCH_CROSS_DISSOLVE, "交叉淡化[转场]"),
     (STITCH_TRANSITION,     "ffmpeg转场"),
 ]

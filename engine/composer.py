@@ -21,7 +21,7 @@ from .runner import YunjiiSegmentRunner
 from .stitcher import YunjiiSegmentStitcher, _build_output_ui, XFADE_NAME_MAP
 from .types import (
     SEGMENT_MODE_ONE_SHOT, STITCH_HARD_CUT, STITCH_SEAMLESS, STITCH_SEAMLESS_BLEND,
-    STITCH_TRANSITION, STITCH_LABELS, STITCH_LABEL_TO_VALUE,
+    STITCH_LATENT_BLEND, STITCH_TRANSITION, STITCH_LABELS, STITCH_LABEL_TO_VALUE,
 )
 from .debug_log import node_start, node_end, node_error, info, warn
 
@@ -155,6 +155,12 @@ class YunjiiVideoImitator:
         if _plan_mode == SEGMENT_MODE_ONE_SHOT and 拼接模式 == STITCH_HARD_CUT:
             info("Imitator", "生成模式=一镜到底，硬切会暴露段边界跳变，强制回退「无缝一镜到底(重叠混合)」")
             拼接模式 = STITCH_SEAMLESS_BLEND
+        elif (not _plan_single_pass) and 拼接模式 == STITCH_SEAMLESS:
+            # 多段(A/B)默认零转场硬切会把段边界跳变暴露给用户(实测：硬切+画面跳)。
+            # 升级为潜空间交叉淡化：加载各段 latent 在 latent 空间交叉溶解再解码，过渡最自然；
+            # latent 缺失时 stitcher 自动回退像素重叠混合，仍优于生硬硬切。
+            info("Imitator", "多段拼接默认硬切暴露段边界，升级为「真·一镜到底(潜空间拼接)」交叉淡化")
+            拼接模式 = STITCH_LATENT_BLEND
 
         # —— 单一效果模块，份传给两侧（本节点核心价值）——
         effects = 效果模块 or ""
