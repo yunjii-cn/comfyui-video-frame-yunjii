@@ -76,46 +76,57 @@ def _build_xfade_filter(durations, xfade, dur):
 
 
 def _build_output_ui(output_path: str) -> dict:
-    """构造 ComfyUI 前端预览 + 资产管理器即时入库所需的 ui 字段。
+    """构造 ComfyUI 前端预览所需的 ui 字段，1:1 对齐 VHS_VideoCombine 黄金标准。
 
-    返回形如 {"gifs": [{"filename":..., "subfolder":..., "type":"output", "format":"video/h264-mp4"}]} 的字典，
-    供节点 return {"ui": _build_output_ui(...), "result": (...)} 使用。
-    - 前端通过 ui.gifs 在节点上显示视频播放器（与 VHS VideoCombine 同机制）。
-    - main.py 的 _collect_output_absolute_paths 会识别 {filename, subfolder, type:"output"} 结构，
-      自动调用 register_output_files() 把成片即时注册到「已生成」资产面板。
-    路径不在 output 目录下时，subfolder 为空字符串，type 仍为 output（前端按相对路径回退）。
+    返回 {"gifs": [...], "videos": [...], "images": [...]}：
+    - gifs / videos：前端在节点上渲染视频播放器（VHS 只返回 gifs；新版 fork 也认 videos）。
+    - images：成片首帧封面兜底——即便视频播放器因个别字段缺失不渲染，节点上也能看到成片。
+    - preview 含 workflow(首帧图名) 与 fullpath：前端加载视频前先显示封面，/view 可直接定位。
+    字段缺失是「前端节点看不到输出视频」的主因，故这里保证 frame_rate 必有值、workflow/fullpath 必填。
     """
     preview = {
         "filename": os.path.basename(output_path),
         "subfolder": "",
         "type": "output",
         "format": "video/h264-mp4",
+        "frame_rate": 16.0,  # 失败时兜底数字，避免缺字段导致前端视频组件不渲染
     }
+    first_png = ""
     try:
         output_dir = os.path.abspath(folder_paths.get_output_directory())
         parent = os.path.abspath(os.path.dirname(output_path))
         if parent == output_dir or parent.startswith(output_dir + os.sep):
             _sub = os.path.relpath(parent, output_dir)
             # 前端 /view 走 URL 查询参数(?subfolder=...)，必须统一为正斜杠。
-            # 我们的成片恒落在 output/yunjii_v2v/{run_id}/ 子目录，Windows 下
-            # os.path.relpath 返回反斜杠(yunjii_v2v\run_id)，经 URL 编码后在
-            # 前端构造 /view 与部分 path_utils 边界处易解析失败(VHS 默认 subfolder=""
-            # 从根目录 serve 不受影响，故此前未暴露)。正斜杠与 ComfyUI 自身
-            # get_save_image_path 的 URL 约定一致，消除该 404 隐患。
+            # 成片恒落在 output/yunjii_v2v/{run_id}/ 子目录，Windows 下 os.path.relpath
+            # 返回反斜杠，经 URL 编码后前端构造 /view 易解析失败。正斜杠与 ComfyUI
+            # get_save_image_path 的 URL 约定一致，消除 404 隐患。
             preview["subfolder"] = _sub.replace(os.sep, "/")
-        # 尝试读取 fps 供前端播放器使用（失败不影响主流程）
+        # 读取首帧作为封面(workflow) + 取实际 fps
         cap = cv2.VideoCapture(output_path)
         fps = cap.get(cv2.CAP_PROP_FPS)
+        ret, frame = cap.read()
         cap.release()
         if fps and fps > 0:
             preview["frame_rate"] = float(fps)
+        if ret and frame is not None:
+            _stem = os.path.splitext(os.path.basename(output_path))[0]
+            first_png = os.path.join(parent, _stem + "_first.png")
+            try:
+                cv2.imwrite(first_png, frame)
+            except Exception:
+                first_png = ""
+        preview["fullpath"] = output_path
     except Exception:
         pass
-    # 同时返回 gifs（旧版 ComfyUI 前端）与 videos（新版 ComfyUI 前端）两种键，
-    # 指向同一预览对象，最大化不同版本前端的视频预览渲染兼容性。
-    # ComfyUI 前端对 OUTPUT_NODE 的 ui 处理：早期仅识别 ui.gifs，新版优先识别 ui.videos；
-    # 只返回 gifs 会导致新版前端节点上看不到视频播放器（这正是「前端无法显示输出视频」的主因）。
-    return {"gifs": [preview], "videos": [preview]}
+    # 首帧封面(workflow) + images 兜底，对齐 VHS 黄金标准，最大化前端渲染兼容
+    images = []
+    if first_png and os.path.isfile(first_png):
+        _sub = preview.get("subfolder", "")
+        preview["workflow"] = os.path.basename(first_png)
+        images.append({"filename": os.path.basename(first_png),
+                       "subfolder": _sub, "type": "output"})
+    return {"gifs": [preview], "videos": [preview], "images": images}
 
 
 class YunjiiSegmentStitcher:

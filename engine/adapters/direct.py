@@ -330,18 +330,37 @@ class DirectAdapter(GenerationAdapter):
             rel = os.path.relpath(d, out_dir) if d.startswith(out_dir) else ""
             subfolder = "" if rel in (".", "") else rel.replace(os.sep, "/")
 
+            # 对齐 VHS 黄金标准：video/h264-mp4 + 实际 fps + 首帧封面 + 同时返回 gifs/videos，
+            # 与 _build_output_ui 保持完全一致，避免画廊/历史里视频同样不渲染。
+            _fps = None
+            _first = ""
+            try:
+                import cv2 as _cv2
+                _cap = _cv2.VideoCapture(video_path)
+                _fps = _cap.get(_cv2.CAP_PROP_FPS)
+                _r, _frm = _cap.read()
+                _cap.release()
+                if _r and _frm is not None:
+                    _fs = os.path.splitext(fname)[0]
+                    _first = os.path.join(os.path.dirname(video_path), _fs + "_first.png")
+                    try:
+                        _cv2.imwrite(_first, _frm)
+                    except Exception:
+                        _first = ""
+            except Exception:
+                pass
             preview = {
                 "filename": fname,
                 "subfolder": subfolder,
                 "type": "output",
-                "format": "video/mp4",
-                "frame_rate": None,
-                "workflow": None,
+                "format": "video/h264-mp4",
+                "frame_rate": float(_fps) if _fps and _fps > 0 else 16.0,
+                "workflow": os.path.basename(_first) if _first else None,
                 "fullpath": video_path,
             }
             outputs = {}
             for onid in execute_outputs:
-                outputs[onid] = {"gifs": [preview]}
+                outputs[onid] = {"gifs": [preview], "videos": [preview]}
 
             pq = getattr(server, "prompt_queue", None)
             if pq is not None and hasattr(pq, "history"):
