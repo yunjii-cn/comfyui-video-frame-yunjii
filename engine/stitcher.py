@@ -491,6 +491,16 @@ class YunjiiSegmentStitcher:
             tensors = [d["samples"] for d in loaded]
             if any(not isinstance(t, torch.Tensor) or t.dim() != 5 for t in tensors):
                 raise ValueError("latent samples 不是 [1,C,T,H,W] 张量")
+            # 段间必须真实重叠(overlap_prev>0)潜空间交叉淡化才有意义；多段独立去噪时
+            # overlap_prev=0 → 任一接缝 b=0 → torch.cat 纯硬切。此时潜空间混合无意义，
+            # 整体回退像素交叉溶解(用 8 帧淡化)，保证不出现硬切跳变。
+            _all_overlap = all(
+                int(valid[i].get("overlap_prev", 0) or 0) > 0
+                for i in range(1, len(valid))
+            )
+            if not _all_overlap:
+                report.append("⚠ 段间无真实重叠(独立生成)，潜空间混合退化为硬切 → 回退像素交叉溶解")
+                return self._stitch_videos(video_items, STITCH_CROSS_DISSOLVE, 8, output_prefix, report, run_id)
             # 逐段交叉淡化拼接（累加式）
             merged = tensors[0]
             for i in range(1, len(tensors)):
