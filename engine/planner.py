@@ -75,6 +75,14 @@ class YunjiiSegmentPlanner:
                                 "单遍连贯(方案C)=整片一次去噪latent连续真·一镜到底,长视频画质软; "
                                 "暖启动(Tier2)=分段+上段真实帧喂回WanAnimatePlus prefix_frames,连续+画质兼得(需SCAIL-2路线+WanAnimatePlus)"},
                 ),
+                "单遍时长上限": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 30.0, "step": 0.5,
+                    "tooltip": "方案C单遍最大时长(秒)。>0 时超出则回退多段seamless以抑制长程稀释画质退化；0=不限制(整片单遍)"}),
+                "模型精度": (
+                    ["fp8", "fp16"],
+                    {"default": "fp8", "tooltip": "SCAIL-2 扩散模型精度：fp8(默认,省显存,略软); fp16(更精细,吃显存,需本机有fp16权重或显存充足)"},
+                ),
+                # —— 注意：新增大下拉务必放 optional 末尾，避免已有工作流 widgets_values 位置错位 ——
+                # （历史教训：曾把本下拉插在中段，导致后续 FLOAT 槽 单遍时长上限 收到 模型精度 的 "fp8" 而校验崩溃）
                 "无缝连贯方案": (
                     [label for _, label in SEAMLESS_PLAN_LABELS],
                     {"default": "A方案·标准多段无缝(一般时长≤15s) ⭐默认",
@@ -87,12 +95,6 @@ class YunjiiSegmentPlanner:
                                 "· C方案(单遍连贯·旧方案C)：整片一次去噪latent天然连续，仅作兜底/对比；"
                                 "长视频会被长程稀释画质软、显存峰值高、不可分段重试，不推荐主用。\n"
                                 "选B时拼接模式务必用『无缝一镜到底(零转场·硬切)』而非『潜空间拼接』等转场模式。"},
-                ),
-                "单遍时长上限": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 30.0, "step": 0.5,
-                    "tooltip": "方案C单遍最大时长(秒)。>0 时超出则回退多段seamless以抑制长程稀释画质退化；0=不限制(整片单遍)"}),
-                "模型精度": (
-                    ["fp8", "fp16"],
-                    {"default": "fp8", "tooltip": "SCAIL-2 扩散模型精度：fp8(默认,省显存,略软); fp16(更精细,吃显存,需本机有fp16权重或显存充足)"},
                 ),
             },
         }
