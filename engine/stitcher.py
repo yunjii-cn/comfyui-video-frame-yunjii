@@ -75,7 +75,7 @@ def _build_xfade_filter(durations, xfade, dur):
     return ";".join(parts), labels[-1]
 
 
-def _build_output_ui(output_path: str) -> dict:
+def _build_output_ui(output_path: str, first_png: str = "") -> dict:
     """构造 ComfyUI 前端预览所需的 ui 字段，1:1 对齐 VHS_VideoCombine 黄金标准。
 
     返回 {"gifs": [...], "videos": [...], "images": [...]}：
@@ -102,24 +102,31 @@ def _build_output_ui(output_path: str) -> dict:
             # 返回反斜杠，经 URL 编码后前端构造 /view 易解析失败。正斜杠与 ComfyUI
             # get_save_image_path 的 URL 约定一致，消除 404 隐患。
             preview["subfolder"] = _sub.replace(os.sep, "/")
-        # 读取首帧作为封面(workflow) + 取实际 fps
-        cap = cv2.VideoCapture(output_path)
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        ret, frame = cap.read()
-        cap.release()
-        if fps and fps > 0:
-            preview["frame_rate"] = float(fps)
-        if ret and frame is not None:
-            _stem = os.path.splitext(os.path.basename(output_path))[0]
-            first_png = os.path.join(parent, _stem + "_first.png")
+        # 首帧封面：用 ffmpeg 稳健抽取（画廊只认 images，不读 gifs/videos；
+        # cv2 抽帧在 ffmpeg 编码的成片上可能失败，导致画廊空白）。cv2 仅作兜底。
+        # first_png 可由调用方预计算并传入（避免重复抽帧）；为空时此处现抽。
+        if not first_png:
             try:
-                cv2.imwrite(first_png, frame)
+                from .poster import extract_poster_png
+                first_png = extract_poster_png(output_path)
             except Exception:
                 first_png = ""
+        # 实际 fps 覆盖兜底值
+        try:
+            import cv2 as _cv2
+            _cap = _cv2.VideoCapture(output_path)
+            _fps = _cap.get(_cv2.CAP_PROP_FPS)
+            _cap.release()
+            if _fps and _fps > 0:
+                preview["frame_rate"] = float(_fps)
+        except Exception:
+            pass
         preview["fullpath"] = output_path
     except Exception:
-        pass
-    # 首帧封面(workflow) + images 兜底，对齐 VHS 黄金标准，最大化前端渲染兼容
+        first_png = ""
+    # 首帧封面(workflow) + images 兜底，对齐 VHS 黄金标准，最大化前端渲染兼容。
+    # images 是画廊(底部 Queue Gallery)唯一消费的字段——标准 SaveImage/PreviewImage
+    # 也正是往 images 写一张图，因此本节点填上 images 即等价于标准输出节点。
     images = []
     if first_png and os.path.isfile(first_png):
         _sub = preview.get("subfolder", "")
@@ -132,13 +139,23 @@ def _build_output_ui(output_path: str) -> dict:
 class YunjiiSegmentStitcher:
     CATEGORY = "Yunjii/Video/Engine"
     FUNCTION = "stitch"
-    RETURN_TYPES = ("STRING", "STRING")
-    RETURN_NAMES = ("最终视频路径", "拼接报告")
+    # 末尾追加 IMAGE(封面帧)：本节点成为一等公民「标准输出节点」，
+    # 画廊(Queue Gallery)经 images 字段显示封面、节点上经 videos 播放成片，
+    # 同时额外吐出一个 IMAGE 张量供下游节点消费。IMAGE 置于末尾，旧连线(视频路径/报告)不受影响。
+    RETURN_TYPES = ("STRING", "STRING", "IMAGE")
+    RETURN_NAMES = ("最终视频路径", "拼接报告", "封面帧")
     OUTPUT_NODE = True
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
         return float("nan")
+
+    @staticmethod
+    def _make_cover(output_path):
+        """抽取成片首帧并转为 ComfyUI 标准 IMAGE 张量（封面帧）。返回 (first_png, cover_tensor)。"""
+        from .poster import extract_poster_png, poster_to_image_tensor
+        first_png = extract_poster_png(output_path)
+        return first_png, poster_to_image_tensor(first_png)
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -172,12 +189,12 @@ class YunjiiSegmentStitcher:
         if not 执行结果.strip():
             node_error("Stitcher", "未提供执行结果")
             node_end("Stitcher", "未提供执行结果")
-            return ("", "⚠ 未提供执行结果")
+            return ("", "⚠ 未提供执行结果", self._make_cover("")[1])
 
         try:
             results_data = json.loads(执行结果)
         except json.JSONDecodeError as e:
-            return ("", f"⚠ 解析执行结果失败: {e}")
+            return ("", f"⚠ 解析执行结果失败: {e}", self._make_cover("")[1])
 
         run_id = ""
         if isinstance(results_data, dict):
@@ -203,15 +220,16 @@ class YunjiiSegmentStitcher:
 
         if not videos:
             node_end("Stitcher", "没有成功生成的视频片段")
-            return ("", "⚠ 没有成功生成的视频片段可拼接")
+            return ("", "⚠ 没有成功生成的视频片段可拼接", self._make_cover("")[1])
 
         if len(videos) == 1:
             output_path = self._copy_to_output(videos[0], 输出文件名, run_id)
             info("Stitcher", "仅1段视频，直接复制: %s", output_path)
             node_end("Stitcher", f"输出: {output_path}")
+            first_png, cover = self._make_cover(output_path)
             return {
-                "ui": _build_output_ui(output_path),
-                "result": (output_path, f"✅ 仅1段视频，无需拼接\n输出: {output_path}"),
+                "ui": _build_output_ui(output_path, first_png),
+                "result": (output_path, f"✅ 仅1段视频，无需拼接\n输出: {output_path}", cover),
             }
 
         report_lines = []
@@ -274,7 +292,7 @@ class YunjiiSegmentStitcher:
                 )
         except Exception as e:
             logger.error("Stitch failed: %s", e)
-            return ("", f"⚠ 拼接失败: {e}")
+            return ("", f"⚠ 拼接失败: {e}", self._make_cover("")[1])
 
         if output_path and 音频源 and os.path.isfile(音频源):
             try:
@@ -294,9 +312,10 @@ class YunjiiSegmentStitcher:
         report_lines.append(f"\n✅ 最终输出: {output_path}")
         info("Stitcher", "拼接完成: %s", output_path)
         node_end("Stitcher", f"输出: {output_path}")
+        first_png, cover = self._make_cover(output_path)
         return {
-            "ui": _build_output_ui(output_path),
-            "result": (output_path, "\n".join(report_lines)),
+            "ui": _build_output_ui(output_path, first_png),
+            "result": (output_path, "\n".join(report_lines), cover),
         }
 
     def _stitch_videos(self, video_items, mode, fade_frames, output_prefix, report, run_id="",

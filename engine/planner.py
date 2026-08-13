@@ -12,6 +12,7 @@ from .types import (
     CONTINUITY_AUTO, CONTINUITY_LABEL_TO_VALUE, CONTINUITY_LABELS,
     SEAMLESS_PLAN_A, SEAMLESS_PLAN_B, SEAMLESS_PLAN_C, SEAMLESS_PLAN_AUTO,
     SEAMLESS_PLAN_LABELS, SEAMLESS_PLAN_LABEL_TO_VALUE,
+    UNIFIED_PLAN_DEFAULT, UNIFIED_PLAN_LABELS, resolve_unified_plan,
 )
 from .debug_log import node_start, node_end, node_error, debug, info, warn
 
@@ -43,9 +44,16 @@ class YunjiiSegmentPlanner:
             "required": {
                 "分段信息": ("STRING", {"default": "", "tooltip": "来自运动分析节点的分段信息"}),
                 "运动提示词": ("STRING", {"default": "", "tooltip": "来自运动分析节点的运动提示词"}),
-                "生成模式": (
-                    [SEGMENT_MODE_ONE_SHOT, SEGMENT_MODE_SMART_SPLIT, SEGMENT_MODE_SLIDING_WINDOW],
-                    {"default": SEGMENT_MODE_ONE_SHOT, "tooltip": "一镜到底=零转场连续长镜头(SCAIL-2长视频自动单次超长生成,context滑窗覆盖全帧); 智能分段=转场编排; 滑动窗口=超长视频"},
+                "连贯方案": (
+                    [label for _, label in UNIFIED_PLAN_LABELS],
+                    {"default": "短视频·多段无缝（≤15秒，每段画质最好）⭐默认",
+                     "tooltip": "一镜到底动作模仿的连贯方案（唯一入口，已合并旧『生成模式/连贯策略/无缝连贯方案』三个下拉）。\n"
+                                "按你的视频长度和需求选一项即可：\n"
+                                "· 短视频·多段无缝（默认）：做 ≤15秒 的短片。分成几段各自生成、再无缝拼起来，每段画质最好，某段不满意还能单独重做。\n"
+                                "· 长视频·单遍真无缝：做 15~30秒以上 的长片。整段一次性生成，画面从头到尾真正连续、不断裂也不发糊（⭐长片推荐）。\n"
+                                "· 兜底·单遍旧方案：老方案，长视频画质会偏软，一般不用。\n"
+                                "· 暖启动·帧续写：高级玩法，用上一段的最后一帧接着生成下一段（需 WanAnimatePlus 模板）。\n"
+                                "· 分段转场·重叠混合：每段独立生成、段与段之间做叠化转场，适合需要明显转场效果的视频（不是一镜到底连续）。"},
                 ),
                 "每段最大帧数": ("INT", {"default": 81, "min": 9, "max": 257, "step": 4,
                     "tooltip": "4k+1格式: 41/61/81/85/89/121"}),
@@ -66,54 +74,33 @@ class YunjiiSegmentPlanner:
                     {"default": "骨骼路线(WanVideo)",
                      "tooltip": "SCAIL-2 路线自动改用「每段81帧/重叠5/步进76」的官方分块规则；需与执行节点的后端选择一致"},
                 ),
-                "单遍连贯模式": ("BOOLEAN", {"default": False,
-                    "tooltip": "【已并入连贯策略】旧开关，等价连贯策略=单遍连贯(方案C)。建议改用下方「连贯策略」下拉。"}),
-                "连贯策略": (
-                    [label for _, label in CONTINUITY_LABELS],
-                    {"default": "多段无缝(默认)",
-                     "tooltip": "生成侧时序连续性方案：多段无缝(默认,接缝化妆)=分段独立I2V+混合; "
-                                "单遍连贯(方案C)=整片一次去噪latent连续真·一镜到底,长视频画质软; "
-                                "暖启动(Tier2)=分段+上段真实帧喂回WanAnimatePlus prefix_frames,连续+画质兼得(需SCAIL-2路线+WanAnimatePlus)"},
-                ),
                 "单遍时长上限": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 30.0, "step": 0.5,
                     "tooltip": "方案C单遍最大时长(秒)。>0 时超出则回退多段seamless以抑制长程稀释画质退化；0=不限制(整片单遍)"}),
                 "模型精度": (
                     ["fp8", "fp16"],
                     {"default": "fp8", "tooltip": "SCAIL-2 扩散模型精度：fp8(默认,省显存,略软); fp16(更精细,吃显存,需本机有fp16权重或显存充足)"},
                 ),
-                # —— 注意：新增大下拉务必放 optional 末尾，避免已有工作流 widgets_values 位置错位 ——
-                # （历史教训：曾把本下拉插在中段，导致后续 FLOAT 槽 单遍时长上限 收到 模型精度 的 "fp8" 而校验崩溃）
-                "无缝连贯方案": (
-                    [label for _, label in SEAMLESS_PLAN_LABELS],
-                    {"default": "A方案·标准多段无缝(独立生成+平滑过渡, ≤15s) ⭐默认",
-                     "tooltip": "【推荐用此下拉替代旧连贯策略来选无缝档位】三档机制各不相同：\n"
-                                "· A方案(标准多段无缝)：一般时长≤15s，多段独立生成、接缝交叉溶解平滑过渡；"
-                                "每段质量最高、显存友好、可分段重试。段边界为平滑过渡(非真连续)。\n"
-                                "· B方案(超长视频无缝)：15~30s+ 长视频，单遍连续采样+context滑窗覆盖全帧"
-                                "(81帧一窗/重叠32潜空间fuse)=真·零接缝、长视频无劣化(⭐长片推荐)；"
-                                "代价是显存峰值更高、不可分段重试、耗时随总长线性增长。\n"
-                                "· C方案(单遍兜底)：整片一次去噪、不注入滑窗，>5s画质软，仅作对比/兜底，不推荐主用。\n"
-                                "选B/C时拼接模式可保持默认(单遍无需拼接)；选A时接缝由交叉溶解平滑处理。"},
-                ),
             },
         }
 
     @classmethod
     def VALIDATE_INPUTS(cls, **kwargs):
-        # 兼容旧工作流：早期「生成模式」存英文值(one_shot 等)，节点 COMBO 现仅接受中文。
-        # 定义本方法让 ComfyUI 跳过默认 COMBO 成员校验，由 plan() 内部归一化。
+        # 兼容旧工作流：早期「生成模式」存英文值(one_shot 等)或旧中文值，现已合并进
+        # 『连贯方案』下拉；定义本方法让 ComfyUI 跳过默认 COMBO 成员校验，由
+        # resolve_unified_plan() 内部归一化（含旧生成模式值→统一方案）。
         return True
 
-    def plan(self, 分段信息, 运动提示词, 生成模式, 每段最大帧数, 重叠帧数, 目标分辨率,
+    def plan(self, 分段信息, 运动提示词, 连贯方案, 每段最大帧数, 重叠帧数, 目标分辨率,
              目标帧率, 自适应参数, 姿态数据="", 负面提示词="", 生成后端="骨骼路线(WanVideo)",
-             单遍连贯模式=False, 连贯策略=CONTINUITY_AUTO, 单遍时长上限=0.0, 模型精度="fp8",
-             无缝连贯方案=SEAMLESS_PLAN_AUTO):
+             单遍时长上限=0.0, 模型精度="fp8"):
 
-        # 归一化：旧工作流可能传英文值(one_shot 等)，统一映射为中文常量
-        生成模式 = MODE_ALIASES.get(生成模式, 生成模式)
+        # 统一「连贯方案」下拉：解析出 (strategy, seamless_plan, mode)。
+        # mode 即派生「生成模式」(一镜到底/智能分段)，驱动参考链策略与拼接方式；
+        # 旧工作流残留的 生成模式 值(一镜到底/智能分段/滑动窗口/英文)在此被归一。
+        _strategy_from_unified, seamless_plan, mode = resolve_unified_plan(连贯方案)
 
         backend = BACKEND_SCAIL2 if 生成后端 == "SCAIL-2 路线" else BACKEND_WANVIDEO
-        if backend == BACKEND_SCAIL2 and 生成模式 != SEGMENT_MODE_ONE_SHOT:
+        if backend == BACKEND_SCAIL2 and mode != SEGMENT_MODE_ONE_SHOT:
             # SCAIL-2 分块：每段固定 81 帧（沿用官方）。
             # 段间重叠锁定为 32 像素帧（对齐『三层楼的小肥猴』Wan2.2 Animate 工作流
             #   WanVideoContextOptions 的 context_overlap=32 → 8 latent 帧）；VAE 时间压缩≈4x
@@ -127,7 +114,7 @@ class YunjiiSegmentPlanner:
             if _user_ov < 32:
                 info("Planner", "SCAIL-2 路线：每段固定81帧；段间重叠锁定为32（对齐猴子工作流验证的自然连贯方案，8 latent帧）")
 
-        node_start("Planner", 生成模式=生成模式, 每段最大帧数=每段最大帧数, 重叠帧数=重叠帧数,
+        node_start("Planner", 生成模式=mode, 每段最大帧数=每段最大帧数, 重叠帧数=重叠帧数,
                    目标分辨率=目标分辨率, 目标帧率=目标帧率, 生成后端=backend)
 
         if not 分段信息.strip():
@@ -157,49 +144,33 @@ class YunjiiSegmentPlanner:
         total_frames = (max(e for _, e, _ in scenes) - min(s for s, _, _ in scenes)) if scenes else 0
         total_seconds = total_frames / max(目标帧率, 1)
 
-        # 连贯策略归一：显式选择(非auto)优先；否则回退旧「单遍连贯模式」bool
-        _raw_strategy = 连贯策略
-        if not _raw_strategy or _raw_strategy == CONTINUITY_AUTO:
-            _raw_strategy = CONTINUITY_SINGLE_PASS if 单遍连贯模式 else CONTINUITY_MULTI_SEG
-        strategy = CONTINUITY_LABEL_TO_VALUE.get(_raw_strategy, _raw_strategy)
-        if strategy not in (CONTINUITY_MULTI_SEG, CONTINUITY_SINGLE_PASS, CONTINUITY_WARM_START):
-            strategy = CONTINUITY_MULTI_SEG
-
-        # —— 无缝连贯方案（A/B/C）归一：本下拉是用户选无缝档位的主入口，优先于旧连贯策略 ——
-        # 三档机制各不相同：
-        #   A → 标准多段无缝(strategy=multi_seg, 每段独立+交叉溶解平滑过渡, 适用≤15s)
-        #   B → 超长视频无缝(strategy=single_pass, 单遍连续采样+context滑窗真·无缝, 适用15~30s+)
-        #   C → 单遍连贯兜底(strategy=single_pass, 不注入滑窗, >5s画质软, 仅对比/兜底)
-        #   auto → 保持上面由连贯策略归一出的 strategy（兼容旧工作流/未选本下拉）
-        _seamless = SEAMLESS_PLAN_LABEL_TO_VALUE.get(无缝连贯方案, 无缝连贯方案)
-        if _seamless not in (SEAMLESS_PLAN_A, SEAMLESS_PLAN_B, SEAMLESS_PLAN_C, SEAMLESS_PLAN_AUTO):
-            _seamless = SEAMLESS_PLAN_AUTO
-        seamless_plan = _seamless
+        # —— 统一「连贯方案」下拉已在上部解析为 (strategy, seamless_plan, mode) ——
+        # B/C 的 single_pass 现因 mode 恒为「一镜到底」而稳定生效，不再因生成模式非一镜到底而静默降级。
         long_video_mode = False
-        if seamless_plan == SEAMLESS_PLAN_A:
+        if _strategy_from_unified == CONTINUITY_WARM_START:
+            strategy = CONTINUITY_WARM_START
+            info("Planner", "连贯方案=暖启动·帧续写: 分段 + 上段真实帧喂回 WanAnimatePlus prefix_frames")
+        elif seamless_plan == SEAMLESS_PLAN_A:
             strategy = CONTINUITY_MULTI_SEG
-            long_video_mode = False
-            info("Planner", "无缝连贯方案=A (标准多段无缝, 一般时长≤15s)")
+            info("Planner", "连贯方案=短视频·多段无缝(默认): 分段各自生成+无缝拼接, 一般≤15s")
         elif seamless_plan == SEAMLESS_PLAN_B:
             # B 方案：超长视频无缝 = 单遍连续采样 + context 滑窗覆盖全帧。
             # 整片作为一条去噪轨迹、按 81 帧一窗重叠 32 潜空间 fuse → 真·无漂移、真无缝，
-            # 长视频(15~30s+) 无劣化。与 C 同为 single_pass 规划，但 B 注入滑窗(真无缝)、
-            # C 不注入(旧兜底, >5s 画质软)。仅一镜到底+SCAIL-2 路线适用滑窗；否则退化多段平滑。
+            # 长视频(15~30s+) 无劣化。仅一镜到底+SCAIL-2 路线适用滑窗；否则退化多段平滑。
             long_video_mode = True
-            if 生成模式 == SEGMENT_MODE_ONE_SHOT and backend == BACKEND_SCAIL2:
+            if mode == SEGMENT_MODE_ONE_SHOT and backend == BACKEND_SCAIL2:
                 strategy = CONTINUITY_SINGLE_PASS
-                info("Planner", "无缝连贯方案=B (超长视频无缝: 单遍连续采样+context滑窗覆盖全帧, 真·无漂移)")
+                info("Planner", "连贯方案=长视频·单遍真无缝: 单遍连续采样+context滑窗覆盖全帧, 真·无漂移")
             else:
                 strategy = CONTINUITY_MULTI_SEG
-                info("Planner", "无缝连贯方案=B 退化为多段无缝(非一镜到底/非SCAIL2, 滑窗不适用)")
+                info("Planner", "连贯方案=长视频·单遍真无缝 退化为多段无缝(非一镜到底/非SCAIL2, 滑窗不适用)")
         elif seamless_plan == SEAMLESS_PLAN_C:
             strategy = CONTINUITY_SINGLE_PASS
-            long_video_mode = False
-            info("Planner", "无缝连贯方案=C (单遍连贯·旧方案C兜底)")
+            info("Planner", "连贯方案=兜底·单遍旧方案(旧方案C, 长视频画质偏软)")
 
         single_pass_requested = (
             strategy == CONTINUITY_SINGLE_PASS
-            and 生成模式 == SEGMENT_MODE_ONE_SHOT
+            and mode == SEGMENT_MODE_ONE_SHOT
             and backend == BACKEND_SCAIL2
             and total_frames > 每段最大帧数 * 1.5
         )
@@ -216,7 +187,7 @@ class YunjiiSegmentPlanner:
             single_pass = False
             strategy = CONTINUITY_MULTI_SEG  # 回退为 A 式多段平滑
         if single_pass:
-            info("Planner", "单遍连贯模式启用：%s长视频(%d帧) 改为单次超长生成(%s)",
+            info("Planner", "连贯方案=单遍：%s长视频(%d帧) 改为单次超长生成(%s)",
                  "B超长" if seamless_plan == SEAMLESS_PLAN_B else "C",
                  total_frames,
                  "context滑窗真无缝" if seamless_plan != SEAMLESS_PLAN_C else "不滑窗·旧兜底(画质软)")
@@ -225,7 +196,7 @@ class YunjiiSegmentPlanner:
 
         segments = self._build_segments(
             scenes, backend, 每段最大帧数, 重叠帧数, width, height,
-            prompts, 生成模式, 目标帧率, 自适应参数, 负面提示词,
+            prompts, mode, 目标帧率, 自适应参数, 负面提示词,
             single_pass=single_pass, long_video_mode=long_video_mode,
         )
 
@@ -235,7 +206,7 @@ class YunjiiSegmentPlanner:
         # 暖启动(Tier2) 仍为多段，但由适配器注入上段末帧作 prefix，段间连续+画质兼得。
         is_single_pass = single_pass
         plan = SegmentPlan(
-            mode=生成模式,
+            mode=mode,
             total_segments=len(segments),
             resolution=[width, height],
             target_fps=目标帧率,
@@ -250,7 +221,7 @@ class YunjiiSegmentPlanner:
         )
 
         plan_json = plan.to_json()
-        info("Planner", "规划完成: %d段, 模式=%s, 分辨率=%s", len(segments), 生成模式, 目标分辨率)
+        info("Planner", "规划完成: %d段, 模式=%s, 分辨率=%s", len(segments), mode, 目标分辨率)
         node_end("Planner", f"{len(segments)}段")
         summary = self._build_summary(plan)
         return (plan_json, len(segments), summary)

@@ -18,6 +18,7 @@ from .types import (
     CONTINUITY_LABEL_TO_VALUE,
     SEAMLESS_PLAN_A, SEAMLESS_PLAN_B, SEAMLESS_PLAN_C, SEAMLESS_PLAN_AUTO,
     SEAMLESS_PLAN_LABEL_TO_VALUE,
+    UNIFIED_PLAN_LABELS, resolve_unified_plan,
 )
 from .adapters.direct import DirectAdapter
 from .adapters.scail import SCAILAdapter
@@ -86,10 +87,14 @@ class YunjiiSegmentRunner:
                 "起始段": ("INT", {"default": 0, "min": 0, "max": 100}),
                 "效果模块": ("STRING", {"default": "", "multiline": True,
                     "tooltip": "可选效果管线模块列表(JSON数组或逗号分隔)，如 [\"mimic\"]。为空=不启用任何效果，行为与现状完全一致。支持: mimic, cinematic, enhance, creative（cinematic 可设 xfade 高级转场）"}),
-                "连贯策略": (
-                    ["多段无缝(默认)", "单遍连贯(方案C)", "暖启动(Tier2)"],
-                    {"default": "多段无缝(默认)",
-                     "tooltip": "生成侧时序连续性方案(与拼接模式正交)：多段无缝=标准SCAIL真骨架每段独立高保真生成(推荐,配合Stitcher『真·一镜到底(潜空间拼接)』可得连贯自然接缝); 单遍连贯(方案C)=整片一次去噪但长视频画质软; 暖启动(Tier2)=WanAnimatePlus多段+上段真实帧喂回prefix_frames——实测模仿力与画质弱于多段无缝,非推荐。需对应工作流模板支持"},
+                "连贯方案": (
+                    [label for _, label in UNIFIED_PLAN_LABELS],
+                    {"default": "A·标准多段无缝(≤15s) ⭐默认",
+                     "tooltip": "一镜到底动作模仿的连贯档位（单一入口，已合并旧『连贯策略』+『无缝连贯方案』两个下拉）：\n"
+                                "· A 标准多段无缝(默认)：一般≤15s，多段独立生成、接缝交叉溶解平滑；每段质量最高、可分段重试。\n"
+                                "· B 超长视频无缝：15~30s+，单遍连续采样+context滑窗覆盖全帧=真·零接缝、长视频不劣化(⭐长片推荐)；显存峰值更高、不可分段重试。\n"
+                                "· C 单遍兜底：整片一次去噪、不注入滑窗，>5s画质软，仅对比/兜底。\n"
+                                "· 暖启动(Tier2)：WanAnimatePlus多段+上段真实帧喂回prefix_frames（需SCAIL-2路线+WanAnimatePlus模板）。"},
                 ),
                 "模型精度": (
                     ["fp8", "fp16"],
@@ -104,7 +109,7 @@ class YunjiiSegmentRunner:
             },
         }
 
-    def run(self, 段落计划, 工作流模板, 执行模式, 最大重试, 生成后端="骨骼路线(WanVideo)", 视频路径="", 参考图=None, 姿态图=None, 人物参考图="", 起始段=0, 效果模块="", ComfyUI地址="127.0.0.1:8188", 连贯策略="", 模型精度="fp8", 生成质量模式="标准 SCAIL 真骨架（推荐）", 无缝连贯方案=SEAMLESS_PLAN_AUTO):
+    def run(self, 段落计划, 工作流模板, 执行模式, 最大重试, 生成后端="骨骼路线(WanVideo)", 视频路径="", 参考图=None, 姿态图=None, 人物参考图="", 起始段=0, 效果模块="", ComfyUI地址="127.0.0.1:8188", 模型精度="fp8", 生成质量模式="标准 SCAIL 真骨架（推荐）", 连贯方案=SEAMLESS_PLAN_AUTO):
         node_start("Runner", 执行模式=执行模式, 最大重试=最大重试, ComfyUI地址=ComfyUI地址)
         info("Runner", "参数诊断: 段落计划类型=%s, 工作流模板类型=%s, 视频路径='%s', 参考图类型=%s, 姿态图类型=%s, 人物参考图='%s', 起始段=%s, ComfyUI地址='%s'",
              type(段落计划).__name__, type(工作流模板).__name__,
@@ -143,49 +148,49 @@ class YunjiiSegmentRunner:
                 return ("", f"⚠ 后端不匹配且自动重规划失败：{e}\n"
                             f"请确认「分段规划器」与「完美模仿」节点的生成后端选择一致。", False)
 
-        # —— 连贯策略归一（与拼接模式正交的生成侧时序连续性方案）——
-        # 优先用显式传入的 连贯策略 参数；为空则从计划内 continuity_strategy 推导；
-        # 仍为空则默认多段无缝。中文标签 → 英文值。
-        _strategy = 连贯策略 or getattr(plan, "continuity_strategy", "") or CONTINUITY_MULTI_SEG
-        _strategy = CONTINUITY_LABEL_TO_VALUE.get(_strategy, _strategy)
-        if _strategy not in (CONTINUITY_MULTI_SEG, CONTINUITY_SINGLE_PASS, CONTINUITY_WARM_START):
-            _strategy = CONTINUITY_MULTI_SEG
         _precision = 模型精度 or getattr(plan, "model_precision", "") or "fp8"
         if _precision not in ("fp8", "fp16"):
             _precision = "fp8"
 
-        # —— 无缝连贯方案（A/B/C）归一：用户选无缝档位的主入口，优先于旧连贯策略 ——
-        # 三档共用真·无缝机制(context滑窗+跨段reference_latent续写)，仅目标时长/防漂移增强不同。
-        # A/B 均等价于原『标准 SCAIL 真骨架(推荐)』续写机制；C=单遍(方案C兜底)。
+        # —— 统一「连贯方案」下拉归一（合并旧 连贯策略 / 无缝连贯方案 为一个）——
+        # 用户只面对一个选择：A 标准多段无缝 / B 超长视频无缝 / C 单遍兜底 / 暖启动(Tier2)。
         # 写回 plan 字段，使下游适配器/拼接按方案生效（即使 planner 未跑、直接拿旧 plan 也能生效）。
-        _seamless = 无缝连贯方案 or getattr(plan, "seamless_plan", "") or SEAMLESS_PLAN_AUTO
-        _seamless = SEAMLESS_PLAN_LABEL_TO_VALUE.get(_seamless, _seamless)
+        _strategy_from_unified, _seamless, _mode_u = resolve_unified_plan(连贯方案)
         if _seamless not in (SEAMLESS_PLAN_A, SEAMLESS_PLAN_B, SEAMLESS_PLAN_C, SEAMLESS_PLAN_AUTO):
             _seamless = SEAMLESS_PLAN_AUTO
-        if _seamless == SEAMLESS_PLAN_A:
+        if _strategy_from_unified == CONTINUITY_WARM_START:
+            _strategy = CONTINUITY_WARM_START
+            plan.seamless_plan = SEAMLESS_PLAN_AUTO
+            plan.long_video_mode = False
+            info("Runner", "连贯方案=暖启动(Tier2): 分段 + 上段真实帧喂回 WanAnimatePlus prefix_frames")
+        elif _seamless == SEAMLESS_PLAN_A:
             _strategy = CONTINUITY_MULTI_SEG
             plan.seamless_plan = SEAMLESS_PLAN_A
             plan.long_video_mode = False
-            info("Runner", "无缝连贯方案=A (标准多段无缝, 一般时长≤15s)")
+            info("Runner", "连贯方案=A (标准多段无缝, 一般时长≤15s)")
         elif _seamless == SEAMLESS_PLAN_B:
             # B 方案：超长视频无缝 = 单遍连续采样(single_pass 规划) + context 滑窗。
             # 与 C 同为 single_pass，但 B 注入滑窗(真无缝)、C 不注入(兜底劣化)。
             _strategy = CONTINUITY_SINGLE_PASS
             plan.seamless_plan = SEAMLESS_PLAN_B
             plan.long_video_mode = True
-            info("Runner", "无缝连贯方案=B (超长视频无缝: 单遍连续采样+context滑窗, 真·无漂移)")
+            info("Runner", "连贯方案=B (超长视频无缝: 单遍连续采样+context滑窗, 真·无漂移)")
         elif _seamless == SEAMLESS_PLAN_C:
             _strategy = CONTINUITY_SINGLE_PASS
             plan.seamless_plan = SEAMLESS_PLAN_C
             plan.long_video_mode = False
-            info("Runner", "无缝连贯方案=C (单遍连贯·旧方案C兜底)")
+            info("Runner", "连贯方案=C (单遍连贯·旧方案C兜底)")
         else:
-            # auto：沿用连贯策略已归一出的 _strategy，并同步 plan.seamless_plan 供下游识别
-            plan.seamless_plan = _seamless
+            # auto：沿用计划内 continuity_strategy / seamless_plan（兼容旧 plan JSON）
+            _strategy = getattr(plan, "continuity_strategy", "") or CONTINUITY_MULTI_SEG
+            _strategy = CONTINUITY_LABEL_TO_VALUE.get(_strategy, _strategy)
+            if _strategy not in (CONTINUITY_MULTI_SEG, CONTINUITY_SINGLE_PASS, CONTINUITY_WARM_START):
+                _strategy = CONTINUITY_MULTI_SEG
+            plan.seamless_plan = getattr(plan, "seamless_plan", "") or SEAMLESS_PLAN_AUTO
         if _strategy == CONTINUITY_MULTI_SEG:
             plan.long_video_mode = getattr(plan, "long_video_mode", False)
-        info("Runner", "连贯策略=%s, 无缝连贯方案=%s, 长视频模式=%s, 模型精度=%s",
-             _strategy, plan.seamless_plan, getattr(plan, "long_video_mode", False), _precision)
+        info("Runner", "连贯方案=%s, 长视频模式=%s, 模型精度=%s",
+             plan.seamless_plan, getattr(plan, "long_video_mode", False), _precision)
 
         # 效果管线：生成前对每段 prompt / params 应用已启用模块。
         # 空「效果模块」→ 空管线 → 透传，输出与现状完全一致（零回归）。

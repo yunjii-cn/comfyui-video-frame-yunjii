@@ -245,6 +245,7 @@ SEAMLESS_PLAN_A = "seamless_A"        # 标准多段无缝（一般时长）
 SEAMLESS_PLAN_B = "seamless_B"        # 超长视频无缝（长程防漂移增强）
 SEAMLESS_PLAN_C = "seamless_C"        # 单遍连贯（旧方案C，兜底）
 SEAMLESS_PLAN_AUTO = "seamless_auto"  # 兼容旧：按连贯策略归一
+SEAMLESS_PLAN_SMART_SPLIT = "seamless_smart_split"  # 智能分段(转场编排)：独立分段+重叠混合过渡
 
 SEAMLESS_PLAN_LABELS = [
     (SEAMLESS_PLAN_A, "A方案·标准多段无缝(独立生成+平滑过渡, ≤15s) ⭐默认"),
@@ -253,4 +254,83 @@ SEAMLESS_PLAN_LABELS = [
 ]
 SEAMLESS_PLAN_LABEL_TO_VALUE = {label: value for value, label in SEAMLESS_PLAN_LABELS}
 SEAMLESS_PLAN_LABEL_TO_VALUE.update({value: value for value, _ in SEAMLESS_PLAN_LABELS})
+
+
+# —— 统一「连贯方案」下拉：合并旧 生成模式 / 单遍连贯模式(bool) / 连贯策略 / 无缝连贯方案 为一组 ——
+# 用户只面对一个选择：A 标准多段无缝 / B 超长视频无缝 / C 单遍兜底 / 暖启动(Tier2) / 智能分段(转场编排)。
+#   每个选项自洽地派生 (strategy, seamless_plan, mode)，不再有隐藏闸门或孤儿选项：
+#   A → multi_seg + seamless_A + mode=一镜到底（每段独立+硬切去重零转场，≤15s，质量最高、可分段重试）
+#   B → single_pass(仅一镜到底+SCAIL2) + seamless_B + mode=一镜到底（单遍滑窗真·无缝，15~30s+ 不劣化 ⭐长片推荐）
+#   C → single_pass + seamless_C + mode=一镜到底（不滑窗，>5s画质软，仅对比/兜底）
+#   暖启动 → warm_start + seamless_auto + mode=一镜到底（WanAnimatePlus 多段+上段真实帧喂回 prefix_frames）
+#   智能分段(转场编排) → multi_seg + seamless_A + mode=智能分段（独立分段+重叠混合过渡，明确要转场时用，非一镜到底）
+# 旧「生成模式」中文/英文值(一镜到底/智能分段/滑动窗口/one_shot/smart_split/sliding_window)由 resolve 归一：
+#   一镜到底/one_shot→A；智能分段/smart_split→智能分段；滑动窗口/sliding_window→B（滑窗无缝）。
+UNIFIED_PLAN_DEFAULT = SEAMLESS_PLAN_A
+# 显示名设计原则（面向小白）：① 以「身份词」开头，5 项一眼可区分；② 紧跟用途(时长/场景)；
+# ③ 末尾点明关键特征或代价；④ 默认/推荐用 ⭐ 标注。内部值(SEAMLESS_PLAN_*)保持不变以兼容旧工作流。
+UNIFIED_PLAN_LABELS = [
+    (SEAMLESS_PLAN_A,           "短视频·多段无缝（≤15秒，每段画质最好）⭐默认"),
+    (SEAMLESS_PLAN_B,           "长视频·单遍真无缝（15~30秒+，全程不断裂不劣化）"),
+    (SEAMLESS_PLAN_C,           "兜底·单遍旧方案（长视频画质偏软，不推荐）"),
+    (CONTINUITY_WARM_START,     "暖启动·帧续写（上一段末帧接下一段，WanAnimatePlus）"),
+    (SEAMLESS_PLAN_SMART_SPLIT, "分段转场·重叠混合（每段独立，适合做转场效果）"),
+]
+UNIFIED_PLAN_LABEL_TO_VALUE = {label: value for value, label in UNIFIED_PLAN_LABELS}
+UNIFIED_PLAN_LABEL_TO_VALUE.update({value: value for value, _ in UNIFIED_PLAN_LABELS})
+
+# 旧版下拉标签 → 当前值：旧工作流 widgets_values 里存的是改名前的标签串，需仍能正确归一，
+# 否则会静默回退到默认 A。覆盖历次改名（A·/A方案· 前缀、Tier2、转场编排 等写法）。
+_LEGACY_UNIFIED_LABELS = {
+    "A·标准多段无缝(≤15s) ⭐默认":                          SEAMLESS_PLAN_A,
+    "A方案·标准多段无缝(独立生成+平滑过渡, ≤15s) ⭐默认":     SEAMLESS_PLAN_A,
+    "B·超长视频无缝(15~30s+ 单遍滑窗真·无缝)":              SEAMLESS_PLAN_B,
+    "B方案·超长视频无缝(单遍滑窗真·无缝, 15~30s+ ⭐长片推荐)": SEAMLESS_PLAN_B,
+    "C·单遍兜底(不滑窗, >5s画质软)":                        SEAMLESS_PLAN_C,
+    "C方案·单遍兜底(不滑窗, >5s画质软)":                    SEAMLESS_PLAN_C,
+    "暖启动(Tier2)·WanAnimatePlus上段末帧续写":             CONTINUITY_WARM_START,
+    "智能分段(转场编排)·独立分段+重叠混合过渡":              SEAMLESS_PLAN_SMART_SPLIT,
+    "智能分段(转场编排)":                                   SEAMLESS_PLAN_SMART_SPLIT,
+}
+UNIFIED_PLAN_LABEL_TO_VALUE.update(_LEGACY_UNIFIED_LABELS)
+
+
+# 旧「生成模式」(独立下拉时代) 中文/英文值 → 对应统一方案值。
+# 一镜到底/one_shot → A；智能分段/smart_split → 智能分段(转场编排)；
+# 滑动窗口/sliding_window → B（滑窗无缝，旧孤儿选项在此获得真实语义）。
+_LEGACY_MODE_TO_UNIFIED = {
+    SEGMENT_MODE_ONE_SHOT:       SEAMLESS_PLAN_A,
+    "one_shot":                  SEAMLESS_PLAN_A,
+    SEGMENT_MODE_SMART_SPLIT:    SEAMLESS_PLAN_SMART_SPLIT,
+    "smart_split":               SEAMLESS_PLAN_SMART_SPLIT,
+    SEGMENT_MODE_SLIDING_WINDOW: SEAMLESS_PLAN_B,
+    "sliding_window":            SEAMLESS_PLAN_B,
+}
+
+
+def resolve_unified_plan(value):
+    """把统一『连贯方案』下拉值解析为 (strategy, seamless_plan, mode)。
+
+    - strategy: 生成侧时序连续性方案(multi_seg/single_pass/warm_start)；
+                A/B/C 返回 None 表示由调用方结合 backend/mode 继续推导。
+    - seamless_plan: A/B/C/auto，供下游适配器/拼接识别。
+    - mode: 派生的「生成模式」(一镜到底 / 智能分段)，驱动参考链策略与拼接方式。
+
+    归一顺序：① 旧「生成模式」中文/英文值 → 统一方案；② 统一下拉中文标签 → 值；
+    ③ 未知值兜底为 A(一镜到底)。故旧工作流残留的 生成模式 值也能正确升级，无冲突。
+    """
+    # ① 旧「生成模式」值(独立下拉时代) → 对应统一方案
+    v = _LEGACY_MODE_TO_UNIFIED.get(value, value)
+    # ② 统一下拉的中文标签 → 值
+    v = UNIFIED_PLAN_LABEL_TO_VALUE.get(v, v)
+    if v == CONTINUITY_WARM_START:
+        return CONTINUITY_WARM_START, SEAMLESS_PLAN_AUTO, SEGMENT_MODE_ONE_SHOT
+    if v == SEAMLESS_PLAN_SMART_SPLIT:
+        return None, SEAMLESS_PLAN_A, SEGMENT_MODE_SMART_SPLIT
+    if v == SEAMLESS_PLAN_B:
+        return None, SEAMLESS_PLAN_B, SEGMENT_MODE_ONE_SHOT
+    if v == SEAMLESS_PLAN_C:
+        return None, SEAMLESS_PLAN_C, SEGMENT_MODE_ONE_SHOT
+    # 未知 / seamless_A / seamless_auto → 默认 A(一镜到底)
+    return None, SEAMLESS_PLAN_A, SEGMENT_MODE_ONE_SHOT
 

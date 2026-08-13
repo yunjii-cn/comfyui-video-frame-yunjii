@@ -18,10 +18,12 @@ import json
 import os
 
 from .runner import YunjiiSegmentRunner
-from .stitcher import YunjiiSegmentStitcher, _build_output_ui, XFADE_NAME_MAP
+from .stitcher import YunjiiSegmentStitcher, _build_output_ui, _make_cover, XFADE_NAME_MAP
 from .types import (
     SEGMENT_MODE_ONE_SHOT, STITCH_HARD_CUT, STITCH_SEAMLESS, STITCH_SEAMLESS_BLEND,
     STITCH_LATENT_BLEND, STITCH_CROSS_DISSOLVE, STITCH_TRANSITION, STITCH_LABELS, STITCH_LABEL_TO_VALUE,
+    CONTINUITY_MULTI_SEG, CONTINUITY_SINGLE_PASS, CONTINUITY_WARM_START,
+    SEAMLESS_PLAN_A, SEAMLESS_PLAN_B, SEAMLESS_PLAN_C, SEAMLESS_PLAN_AUTO,
 )
 from .debug_log import node_start, node_end, node_error, info, warn
 
@@ -54,8 +56,10 @@ def _coerce_int(v, default):
 class YunjiiVideoImitator:
     CATEGORY = "Yunjii/Video/Engine"
     FUNCTION = "imitate"
-    RETURN_TYPES = ("STRING", "STRING", "BOOLEAN")
-    RETURN_NAMES = ("最终视频路径", "拼接报告", "完成状态")
+    # 末尾追加 IMAGE(封面帧)：与 Stitcher 一致，成为标准输出节点。IMAGE 置于末尾，
+    # 旧连线(视频路径/报告/完成状态)不受影响。
+    RETURN_TYPES = ("STRING", "STRING", "BOOLEAN", "IMAGE")
+    RETURN_NAMES = ("最终视频路径", "拼接报告", "完成状态", "封面帧")
     OUTPUT_NODE = True
 
     @classmethod
@@ -133,19 +137,28 @@ class YunjiiVideoImitator:
         try:
             _plan_mode = ""
             _plan_single_pass = False
-            _plan_continuity = ""
+            _plan_seamless = ""
             _plan_precision = "fp8"
             _plan_raw = 段落计划.strip()
             if _plan_raw:
                 _pd = json.loads(_plan_raw)
                 _plan_mode = _pd.get("mode", "")
                 _plan_single_pass = bool(_pd.get("single_pass", False))
-                _plan_continuity = _pd.get("continuity_strategy", "")
+                # 统一『连贯方案』后，以 seamless_plan 为权威；旧 plan 缺该字段时
+                # 由 continuity_strategy 反推（multi_seg→A / single_pass→C / warm_start→暖启动）。
+                _plan_seamless = _pd.get("seamless_plan", "")
+                if not _plan_seamless:
+                    _c = _pd.get("continuity_strategy", "")
+                    _plan_seamless = {
+                        CONTINUITY_MULTI_SEG: SEAMLESS_PLAN_A,
+                        CONTINUITY_SINGLE_PASS: SEAMLESS_PLAN_C,
+                        CONTINUITY_WARM_START: CONTINUITY_WARM_START,
+                    }.get(_c, SEAMLESS_PLAN_A)
                 _plan_precision = _pd.get("model_precision", "fp8")
         except Exception:
             _plan_mode = ""
             _plan_single_pass = False
-            _plan_continuity = ""
+            _plan_seamless = ""
             _plan_precision = "fp8"
         # —— 一镜到底：拼接模式防呆（仅拦截真正破坏连贯的「硬切」）——
         # 一镜到底=连续长镜头；硬切会暴露段边界跳变，故强制回退 重叠混合。
@@ -176,7 +189,7 @@ class YunjiiVideoImitator:
                 段落计划, 工作流模板, 执行模式, 最大重试,
                 生成后端=生成后端, 视频路径=视频路径, 参考图=参考图, 姿态图=姿态图,
                 人物参考图=人物参考图, 起始段=起始段, 效果模块=effects, ComfyUI地址=ComfyUI地址,
-                连贯策略=_plan_continuity, 模型精度=_plan_precision,
+                连贯方案=_plan_seamless, 模型精度=_plan_precision,
             )
         except Exception as _exc:
             import traceback as _tb
@@ -185,20 +198,20 @@ class YunjiiVideoImitator:
             node_error("Imitator", "生成阶段异常: %s" % _detail)
             info("Imitator", "异常堆栈:\n%s", _stack)
             node_end("Imitator", "生成失败(异常)")
-            return ("", f"{执行日志}\n[异常] {_detail}", False)
+            return ("", f"{执行日志}\n[异常] {_detail}", False, _make_cover("")[1])
 
         # 仅规划：runner 已返回计划摘要，直接短路，不做拼接
         if 执行模式 == "仅规划":
             info("Imitator", "仅规划模式，跳过生成与拼接")
             node_end("Imitator", "仅规划")
-            return ("", 执行日志, 完成状态)
+            return ("", 执行日志, 完成状态, _make_cover("")[1])
 
         if not 完成状态:
             # 透传 runner 返回的真实错误信息（执行结果里含具体原因），不再笼统吞掉
             _err_msg = (执行结果 or "未知原因").strip()
             node_error("Imitator", "生成阶段失败: %s" % _err_msg)
             node_end("Imitator", "生成失败")
-            return ("", f"{执行日志}\n[生成失败] {_err_msg}", False)
+            return ("", f"{执行日志}\n[生成失败] {_err_msg}", False, _make_cover("")[1])
 
         # 一镜到底单次超长(方案C)：单段即成片，无需拼接，直接返回该段视频
         if _plan_single_pass:
@@ -223,14 +236,15 @@ class YunjiiVideoImitator:
                             warn("Imitator", "单遍音频混流失败(不影响成片): %s", e)
                     info("Imitator", "一镜到底单次超长成片(方案C): %s (单次生成无需拼接)", _final)
                     node_end("Imitator", "单次超长完成")
-                    return {"ui": _build_output_ui(_final),
-                            "result": (_final, f"{执行日志}\n---\n✅ 一镜到底单次超长生成，单段即成片，无需拼接", True)}
+                    _first, _cover = _make_cover(_final)
+                    return {"ui": _build_output_ui(_final, _first),
+                            "result": (_final, f"{执行日志}\n---\n✅ 一镜到底单次超长生成，单段即成片，无需拼接", True, _cover)}
             except Exception as e:
                 warn("Imitator", "单次超长结果解析失败，回退拼接: %s", e)
 
         # 2) 拼接相位：调用无缝拼接，效果模块作用于成片（超分/插帧/调色等）
         stitcher = YunjiiSegmentStitcher()
-        最终视频路径, 拼接报告 = stitcher.stitch(
+        最终视频路径, 拼接报告, _stitcher_cover = stitcher.stitch(
             执行结果, 拼接模式, 淡化帧数, 输出文件名,
             音频源=音频源, 效果模块=effects,
             转场类型=转场类型, 转场时长=转场时长,
@@ -239,13 +253,14 @@ class YunjiiVideoImitator:
         if not 最终视频路径:
             node_error("Imitator", "拼接阶段未产出视频")
             node_end("Imitator", "拼接失败")
-            return ("", f"{执行日志}\n---\n{拼接报告}", False)
+            return ("", f"{执行日志}\n---\n{拼接报告}", False, _make_cover("")[1])
 
         # 合并两侧日志，便于一次查看全链路
         combined = f"{执行日志}\n---\n{拼接报告}" if 执行日志 else 拼接报告
         info("Imitator", "完美模仿完成: %s", 最终视频路径)
         node_end("Imitator", "完成")
+        _first, _cover = _make_cover(最终视频路径)
         return {
-            "ui": _build_output_ui(最终视频路径),
-            "result": (最终视频路径, combined, True),
+            "ui": _build_output_ui(最终视频路径, _first),
+            "result": (最终视频路径, combined, True, _cover),
         }

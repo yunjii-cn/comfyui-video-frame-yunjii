@@ -14,6 +14,10 @@ _archive/
 
 # 运行时日志（引擎执行产生，不入库）
 yunjii_logs/
+logs/
+
+# Windows 重定向残留（nul 设备名文件，非源码）
+nul
 
 # 备份文件（工作流/前端 .bak*）
 *.bak*

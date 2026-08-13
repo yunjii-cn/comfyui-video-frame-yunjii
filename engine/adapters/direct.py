@@ -338,17 +338,16 @@ class DirectAdapter(GenerationAdapter):
                 import cv2 as _cv2
                 _cap = _cv2.VideoCapture(video_path)
                 _fps = _cap.get(_cv2.CAP_PROP_FPS)
-                _r, _frm = _cap.read()
                 _cap.release()
-                if _r and _frm is not None:
-                    _fs = os.path.splitext(fname)[0]
-                    _first = os.path.join(os.path.dirname(video_path), _fs + "_first.png")
-                    try:
-                        _cv2.imwrite(_first, _frm)
-                    except Exception:
-                        _first = ""
             except Exception:
                 pass
+            # 首帧封面：ffmpeg 稳健抽取（画廊只认 images；cv2 抽帧在 ffmpeg 编码的
+            # 成片上可能失败，导致画廊空白）。cv2 仅作兜底。
+            try:
+                from ..poster import extract_poster_png
+                _first = extract_poster_png(video_path)
+            except Exception:
+                _first = ""
             preview = {
                 "filename": fname,
                 "subfolder": subfolder,
@@ -358,7 +357,13 @@ class DirectAdapter(GenerationAdapter):
                 "workflow": os.path.basename(_first) if _first else None,
                 "fullpath": video_path,
             }
-            node_ui = {"gifs": [preview], "videos": [preview]}
+            # images 是画廊(底部 Queue Gallery)唯一消费的字段；对齐 _build_output_ui，
+            # 让内联执行出片也以标准输出节点形态出现在画廊里。
+            images = []
+            if _first and os.path.isfile(_first):
+                images.append({"filename": os.path.basename(_first),
+                               "subfolder": subfolder, "type": "output"})
+            node_ui = {"gifs": [preview], "videos": [preview], "images": images}
             outputs = {}
             for onid in execute_outputs:
                 outputs[onid] = node_ui
