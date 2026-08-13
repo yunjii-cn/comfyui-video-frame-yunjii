@@ -168,10 +168,12 @@ class YunjiiSegmentRunner:
             plan.long_video_mode = False
             info("Runner", "无缝连贯方案=A (标准多段无缝, 一般时长≤15s)")
         elif _seamless == SEAMLESS_PLAN_B:
-            _strategy = CONTINUITY_MULTI_SEG
+            # B 方案：超长视频无缝 = 单遍连续采样(single_pass 规划) + context 滑窗。
+            # 与 C 同为 single_pass，但 B 注入滑窗(真无缝)、C 不注入(兜底劣化)。
+            _strategy = CONTINUITY_SINGLE_PASS
             plan.seamless_plan = SEAMLESS_PLAN_B
             plan.long_video_mode = True
-            info("Runner", "无缝连贯方案=B (超长视频无缝, 长程防漂移启用)")
+            info("Runner", "无缝连贯方案=B (超长视频无缝: 单遍连续采样+context滑窗, 真·无漂移)")
         elif _seamless == SEAMLESS_PLAN_C:
             _strategy = CONTINUITY_SINGLE_PASS
             plan.seamless_plan = SEAMLESS_PLAN_C
@@ -425,7 +427,8 @@ class YunjiiSegmentRunner:
                     workflow, node_map, seg, current_ref, pose_dir, run_id,
                     user_ref_path=ref_image_path, prev_video_path=_prev_vp,
                     prev_latent_path=(prev_latent_path if _latent_warmstart else ""),
-                    latent_warmstart=_latent_warmstart)
+                    latent_warmstart=_latent_warmstart,
+                    seamless_plan=plan.seamless_plan)
 
                 success = False
                 last_error = ""

@@ -85,16 +85,15 @@ class YunjiiSegmentPlanner:
                 # （历史教训：曾把本下拉插在中段，导致后续 FLOAT 槽 单遍时长上限 收到 模型精度 的 "fp8" 而校验崩溃）
                 "无缝连贯方案": (
                     [label for _, label in SEAMLESS_PLAN_LABELS],
-                    {"default": "A方案·标准多段无缝(一般时长≤15s) ⭐默认",
-                     "tooltip": "【推荐用此下拉替代旧连贯策略来选无缝档位】三档共用真·无缝机制"
-                                "(context滑窗+跨段reference_latent续写+STITCH_SEAMLESS零转场硬切)，互不冲突：\n"
-                                "· A方案(标准多段无缝)：一般时长≤15s，每段独立高保真，质量最高、显存友好、可分段重试；"
-                                "超长视频(>15~20s)段数多会累积长程漂移。\n"
-                                "· B方案(超长视频无缝)：15~30s+ 长视频，启用长程防漂移(强制SCAIL真骨架+加大重叠冗余+"
-                                "按容量分块≤~9段×81帧)无断点无降级；代价是总耗时随段数线性增加。与MiniMax H3分段参考延长同源但兼容本机SCAIL-2。\n"
-                                "· C方案(单遍连贯·旧方案C)：整片一次去噪latent天然连续，仅作兜底/对比；"
-                                "长视频会被长程稀释画质软、显存峰值高、不可分段重试，不推荐主用。\n"
-                                "选B时拼接模式务必用『无缝一镜到底(零转场·硬切)』而非『潜空间拼接』等转场模式。"},
+                    {"default": "A方案·标准多段无缝(独立生成+平滑过渡, ≤15s) ⭐默认",
+                     "tooltip": "【推荐用此下拉替代旧连贯策略来选无缝档位】三档机制各不相同：\n"
+                                "· A方案(标准多段无缝)：一般时长≤15s，多段独立生成、接缝交叉溶解平滑过渡；"
+                                "每段质量最高、显存友好、可分段重试。段边界为平滑过渡(非真连续)。\n"
+                                "· B方案(超长视频无缝)：15~30s+ 长视频，单遍连续采样+context滑窗覆盖全帧"
+                                "(81帧一窗/重叠32潜空间fuse)=真·零接缝、长视频无劣化(⭐长片推荐)；"
+                                "代价是显存峰值更高、不可分段重试、耗时随总长线性增长。\n"
+                                "· C方案(单遍兜底)：整片一次去噪、不注入滑窗，>5s画质软，仅作对比/兜底，不推荐主用。\n"
+                                "选B/C时拼接模式可保持默认(单遍无需拼接)；选A时接缝由交叉溶解平滑处理。"},
                 ),
             },
         }
@@ -167,10 +166,10 @@ class YunjiiSegmentPlanner:
             strategy = CONTINUITY_MULTI_SEG
 
         # —— 无缝连贯方案（A/B/C）归一：本下拉是用户选无缝档位的主入口，优先于旧连贯策略 ——
-        # 三档共用真·无缝机制(context滑窗+跨段reference_latent续写)，仅目标时长/防漂移增强不同：
-        #   A → 标准多段无缝(strategy=multi_seg, long_video_mode=False)
-        #   B → 超长视频无缝(strategy=multi_seg, long_video_mode=True, 强制真骨架防漂移)
-        #   C → 单遍连贯(strategy=single_pass，即旧方案C兜底)
+        # 三档机制各不相同：
+        #   A → 标准多段无缝(strategy=multi_seg, 每段独立+交叉溶解平滑过渡, 适用≤15s)
+        #   B → 超长视频无缝(strategy=single_pass, 单遍连续采样+context滑窗真·无缝, 适用15~30s+)
+        #   C → 单遍连贯兜底(strategy=single_pass, 不注入滑窗, >5s画质软, 仅对比/兜底)
         #   auto → 保持上面由连贯策略归一出的 strategy（兼容旧工作流/未选本下拉）
         _seamless = SEAMLESS_PLAN_LABEL_TO_VALUE.get(无缝连贯方案, 无缝连贯方案)
         if _seamless not in (SEAMLESS_PLAN_A, SEAMLESS_PLAN_B, SEAMLESS_PLAN_C, SEAMLESS_PLAN_AUTO):
@@ -182,9 +181,17 @@ class YunjiiSegmentPlanner:
             long_video_mode = False
             info("Planner", "无缝连贯方案=A (标准多段无缝, 一般时长≤15s)")
         elif seamless_plan == SEAMLESS_PLAN_B:
-            strategy = CONTINUITY_MULTI_SEG
+            # B 方案：超长视频无缝 = 单遍连续采样 + context 滑窗覆盖全帧。
+            # 整片作为一条去噪轨迹、按 81 帧一窗重叠 32 潜空间 fuse → 真·无漂移、真无缝，
+            # 长视频(15~30s+) 无劣化。与 C 同为 single_pass 规划，但 B 注入滑窗(真无缝)、
+            # C 不注入(旧兜底, >5s 画质软)。仅一镜到底+SCAIL-2 路线适用滑窗；否则退化多段平滑。
             long_video_mode = True
-            info("Planner", "无缝连贯方案=B (超长视频无缝, 长程防漂移启用: 强制真骨架+加大重叠+按容量分块)")
+            if 生成模式 == SEGMENT_MODE_ONE_SHOT and backend == BACKEND_SCAIL2:
+                strategy = CONTINUITY_SINGLE_PASS
+                info("Planner", "无缝连贯方案=B (超长视频无缝: 单遍连续采样+context滑窗覆盖全帧, 真·无漂移)")
+            else:
+                strategy = CONTINUITY_MULTI_SEG
+                info("Planner", "无缝连贯方案=B 退化为多段无缝(非一镜到底/非SCAIL2, 滑窗不适用)")
         elif seamless_plan == SEAMLESS_PLAN_C:
             strategy = CONTINUITY_SINGLE_PASS
             long_video_mode = False
@@ -199,12 +206,20 @@ class YunjiiSegmentPlanner:
         # 方案C 画质增强：单遍时长上限。超出则回退多段seamless(抑制长程稀释)
         cap = float(单遍时长上限) if 单遍时长上限 else 0.0
         single_pass = single_pass_requested
+        # B 方案：一镜到底+SCAIL-2 场景强制单遍连续采样（即便短视频也走连续轨迹，滑窗在窗口内无副作用）；
+        # 长视频正是 B 主场(真无缝无劣化)。非适用场景 B 已退化 multi_seg，此处不强制。
+        if seamless_plan == SEAMLESS_PLAN_B and strategy == CONTINUITY_SINGLE_PASS:
+            single_pass = True
         if single_pass and cap > 0 and total_seconds > cap:
-            warn("Planner", "方案C 单遍被「单遍时长上限=%.1fs」截断(%d帧≈%.1fs)，回退多段seamless 抑制画质退化",
+            warn("Planner", "单遍被「单遍时长上限=%.1fs」截断(%d帧≈%.1fs)，回退多段seamless(平滑过渡)抑制画质退化",
                  cap, total_frames, total_seconds)
             single_pass = False
+            strategy = CONTINUITY_MULTI_SEG  # 回退为 A 式多段平滑
         if single_pass:
-            info("Planner", "方案C 单遍连贯模式启用：一镜到底长视频(%d帧) 改为单次超长生成(真·一镜到底)", total_frames)
+            info("Planner", "单遍连贯模式启用：%s长视频(%d帧) 改为单次超长生成(%s)",
+                 "B超长" if seamless_plan == SEAMLESS_PLAN_B else "C",
+                 total_frames,
+                 "context滑窗真无缝" if seamless_plan != SEAMLESS_PLAN_C else "不滑窗·旧兜底(画质软)")
         elif strategy == CONTINUITY_WARM_START:
             info("Planner", "暖启动(Tier2) 启用：分段 + 上段真实帧喂回 WanAnimatePlus prefix_frames（需SCAIL-2路线+WanAnimatePlus）")
 

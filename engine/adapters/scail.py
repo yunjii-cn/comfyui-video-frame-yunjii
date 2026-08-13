@@ -33,6 +33,7 @@ import folder_paths
 
 from .direct import DirectAdapter
 from ..debug_log import info, warn, error as log_error
+from ..types import SEAMLESS_PLAN_C
 
 # 官方子流程用到的 class_type
 SCAIL_REF_EMBEDS = "WanVideoAddSCAILReferenceEmbeds"
@@ -251,7 +252,7 @@ class SCAILAdapter(DirectAdapter):
         inp[key] = value
         return True
 
-    def modify_workflow_for_segment(self, workflow, node_map, seg, ref_image_path, pose_dir="", run_id="", user_ref_path="", prev_video_path="", prev_latent_path="", latent_warmstart=False):
+    def modify_workflow_for_segment(self, workflow, node_map, seg, ref_image_path, pose_dir="", run_id="", user_ref_path="", prev_video_path="", prev_latent_path="", latent_warmstart=False, seamless_plan="seamless_auto"):
         """
         把一个 SegmentInfo 映射到官方 SCAIL 子流程输入。
         workflow 为 API 格式（链接以 [node, slot] 表示，未链接的 widget 为原始值）。
@@ -349,7 +350,7 @@ class SCAILAdapter(DirectAdapter):
         # 方案C 单遍(全长视频) / 超长段 —— target_frames > 81(context_frames) 即接，
         # 采样器内部按 81 帧一窗、重叠 32 帧潜空间 fuse → 真·无缝，且显存只压一个窗。
         # multi_seg 每段≤81 帧不接(行为等同旧版，绝不比现状更差)。
-        wf = self._inject_context_options(wf, node_map, seg)
+        wf = self._inject_context_options(wf, node_map, seg, seamless_plan)
 
         # —— 真·无缝根治（对齐『三层楼的小肥猴』WanVideoContextOptions 滑窗 + reference_latent 续写）——
         # 1) 启用滑窗：把 WanVideoContextOptions 接进采样器，context_overlap 锁 32(=8 latent 帧，
@@ -537,7 +538,7 @@ class SCAILAdapter(DirectAdapter):
             warn("SCAILAdapter", "latent 暖启动注入失败，回退无暖启动: %s", e)
         return wf
 
-    def _inject_context_options(self, wf, node_map, seg):
+    def _inject_context_options(self, wf, node_map, seg, seamless_plan="seamless_auto"):
         """对齐 direct.py：把 WanVideoContextOptions 接进采样器，使长视频被 context 滑窗
         切窗 + 重叠区潜空间 fuse（真·无缝核心）。
 
@@ -564,6 +565,11 @@ class SCAILAdapter(DirectAdapter):
         n = seg.target_frames or 0
         context_frames = 81
         if n <= context_frames:
+            return wf
+        if seamless_plan == SEAMLESS_PLAN_C:
+            # C 方案(单遍兜底)：不注入 context 滑窗，整片一次去噪 → >5s 画质软，仅作对比/兜底。
+            # B 方案同样 single_pass 但会注入滑窗(真无缝)；A 多段每段≤81 自然不滑窗。
+            info("SCAILAdapter", "跳过ContextOptions注入(C方案兜底: 不滑窗, 整片一次去噪)")
             return wf
 
         co_id = "yunjii_context_options"

@@ -215,7 +215,7 @@ class AnimatePlusSCAILAdapter(SCAILAdapter):
     def modify_workflow_for_segment(self, workflow, node_map, seg, ref_image_path,
                                     pose_dir="", run_id="", user_ref_path="",
                                     prev_video_path="", prev_latent_path="",
-                                    latent_warmstart=False):
+                                    latent_warmstart=False, seamless_plan="seamless_auto"):
         wf = json.loads(json.dumps(workflow))
         char_ref = user_ref_path or ref_image_path
 
