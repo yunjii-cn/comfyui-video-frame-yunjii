@@ -13,7 +13,7 @@ import folder_paths
 from .types import (
     SegmentPlan, SegmentResult, SegmentContext,
     SEGMENT_MODE_ONE_SHOT, REF_STRATEGY_PREV_LAST_FRAME,
-    BACKEND_WANVIDEO, BACKEND_SCAIL2,
+    BACKEND_WANVIDEO, BACKEND_SCAIL2, BACKEND_SCAIL2_NATIVE,
     CONTINUITY_MULTI_SEG, CONTINUITY_SINGLE_PASS, CONTINUITY_WARM_START,
     CONTINUITY_LABEL_TO_VALUE,
     SEAMLESS_PLAN_A, SEAMLESS_PLAN_B, SEAMLESS_PLAN_C, SEAMLESS_PLAN_AUTO,
@@ -74,8 +74,8 @@ class YunjiiSegmentRunner:
                     {"default": "执行", "tooltip": "执行=完整运行; 仅规划=只输出计划; 续跑=从断点继续"},
                 ),
                 "生成后端": (
-                    ["骨骼路线(WanVideo)", "SCAIL-2 路线"],
-                    {"default": "骨骼路线(WanVideo)", "tooltip": "骨骼路线=现有WanVideo分段链式; SCAIL-2路线=无骨架端到端动作迁移(需SCAIL-2节点与14B权重)"},
+                    ["骨骼路线(WanVideo)", "SCAIL-2 路线", "原生 SCAIL-2 长视频(一镜到底)"],
+                    {"default": "骨骼路线(WanVideo)", "tooltip": "骨骼路线=现有WanVideo分段链式; SCAIL-2路线=无骨架端到端动作迁移(需SCAIL-2节点与14B权重); 原生 SCAIL-2 长视频=直驱 comfyui_scail2_multi_cond 长视频调度节点(一镜到底动作模仿，需已安装该包)"},
                 ),
                 "最大重试": ("INT", {"default": 3, "min": 0, "max": 10}),
             },
@@ -133,20 +133,31 @@ class YunjiiSegmentRunner:
         # 这样用户只需在 Imitator 切一个「生成后端」开关即可切换路线，不必手动同步
         # 上游 Planner 的「生成后端」widget（旧设计的两个独立 widget 容易造成不一致）。
         plan_backend = getattr(plan, "backend", BACKEND_WANVIDEO)
-        exec_backend = BACKEND_SCAIL2 if 生成后端 == "SCAIL-2 路线" else BACKEND_WANVIDEO
+        if 生成后端 == "原生 SCAIL-2 长视频(一镜到底)":
+            exec_backend = BACKEND_SCAIL2_NATIVE
+        elif 生成后端 == "SCAIL-2 路线":
+            exec_backend = BACKEND_SCAIL2
+        else:
+            exec_backend = BACKEND_WANVIDEO
         if plan_backend != exec_backend:
-            plan_label = "SCAIL-2 路线" if plan_backend == BACKEND_SCAIL2 else "骨骼路线(WanVideo)"
-            exec_label = "SCAIL-2 路线" if exec_backend == BACKEND_SCAIL2 else "骨骼路线(WanVideo)"
-            warn("Runner", "后端不一致：计划按[%s]规划，本次执行[%s]，将自动按执行后端重规划",
-                 plan_label, exec_label)
-            try:
-                from .planner import replan_for_backend
-                plan = replan_for_backend(plan, exec_backend)
-                info("Runner", "已自动重规划为[%s]，共 %d 段", exec_label, plan.total_segments)
-            except Exception as e:
-                node_error("Runner", f"后端不一致且自动重规划失败: {e}")
-                return ("", f"⚠ 后端不匹配且自动重规划失败：{e}\n"
-                            f"请确认「分段规划器」与「完美模仿」节点的生成后端选择一致。", False)
+            if exec_backend == BACKEND_SCAIL2_NATIVE:
+                # 原生 SCAIL-2 长视频节点内部自行调度分段，不依赖 yunjii 的段帧规则，
+                # 故不触发 replan_for_backend（该接口未实现 native 重规划）。
+                plan.backend = BACKEND_SCAIL2_NATIVE
+                info("Runner", "原生 SCAIL-2 后端：跳过按段重规划（原生节点内部分段调度）")
+            else:
+                plan_label = "SCAIL-2 路线" if plan_backend == BACKEND_SCAIL2 else "骨骼路线(WanVideo)"
+                exec_label = "SCAIL-2 路线" if exec_backend == BACKEND_SCAIL2 else "骨骼路线(WanVideo)"
+                warn("Runner", "后端不一致：计划按[%s]规划，本次执行[%s]，将自动按执行后端重规划",
+                     plan_label, exec_label)
+                try:
+                    from .planner import replan_for_backend
+                    plan = replan_for_backend(plan, exec_backend)
+                    info("Runner", "已自动重规划为[%s]，共 %d 段", exec_label, plan.total_segments)
+                except Exception as e:
+                    node_error("Runner", f"后端不一致且自动重规划失败: {e}")
+                    return ("", f"⚠ 后端不匹配且自动重规划失败：{e}\n"
+                                f"请确认「分段规划器」与「完美模仿」节点的生成后端选择一致。", False)
 
         _precision = 模型精度 or getattr(plan, "model_precision", "") or "fp8"
         if _precision not in ("fp8", "fp16"):
@@ -215,6 +226,13 @@ class YunjiiSegmentRunner:
             for seg in plan.segments:
                 summary += f"  段{seg.index}: 帧{seg.start_frame}-{seg.end_frame}, {seg.target_frames}帧, 参考={seg.ref_strategy}\n"
             return (段落计划, summary, True)
+
+        # —— 原生 SCAIL-2 长视频后端：直驱 comfyui_scail2_multi_cond 调度节点（一镜到底动作模仿）——
+        # 与既有「骨骼/SCAIL-2 路线」(模板工作流 + 分段循环) 完全正交：原生节点内部自行调度分段，
+        # 故不走下面的模板预处理/分段循环，单独构造自包含 prompt 后交给内联执行器。
+        if 生成后端 == "原生 SCAIL-2 长视频(一镜到底)":
+            return self._run_native_scail2(
+                plan, 视频路径, 参考图, 人物参考图, _precision, 连贯方案, 执行模式, 最大重试, ComfyUI地址)
 
         template_text = (工作流模板 or "").strip()
         # 若是文件路径，先读成内容；后续所有家族判定都基于内容而非路径
@@ -535,6 +553,95 @@ class YunjiiSegmentRunner:
         node_end("Runner", f"{ok}/{total}段成功")
 
         return (results_json, "\n".join(log_lines), all_success)
+
+    def _run_native_scail2(self, plan, 视频路径, 参考图, 人物参考图, _precision, 连贯方案, 执行模式, 最大重试, ComfyUI地址):
+        """原生 SCAIL-2 长视频后端：构造自包含 prompt 并交给内联执行器（一镜到底动作模仿）。
+
+        与既有「骨骼/SCAIL-2 路线」正交——原生节点内部自行调度分段，不走模板预处理/分段循环。
+        未安装 comfyui_scail2_multi_cond 时明确报错，不静默降级。
+        """
+        node_start("Runner-NativeSCAIL2", ComfyUI地址=ComfyUI地址)
+        from .adapters.scail2_native import is_native_scail2_available, build_native_prompt
+
+        if not is_native_scail2_available():
+            node_end("Runner-NativeSCAIL2", "未安装原生包")
+            return ("", "⚠ 原生 SCAIL-2 后端需要安装 comfyui_scail2_multi_cond 节点包并重启 ComfyUI。"
+                          "请先在 custom_nodes 安装该包，再选此后端。", False)
+
+        # 驱动视频（动作来源）
+        driving = (视频路径 or "").strip()
+        if not driving or not os.path.isfile(driving):
+            node_end("Runner-NativeSCAIL2", "缺少驱动视频")
+            return ("", "⚠ 原生 SCAIL-2(一镜到底动作模仿)需要驱动视频(动作)路径，"
+                          "请在『视频路径』传入源视频。", False)
+
+        # 参考图：优先连线 IMAGE，其次 input 目录文件名
+        ref_paths = []
+        if 参考图 is not None:
+            rp = self._save_ref_image(参考图)
+            if rp:
+                ref_paths.append(rp)
+        if not ref_paths and 人物参考图.strip():
+            cand = os.path.join(folder_paths.get_input_directory(), 人物参考图.strip())
+            if os.path.isfile(cand):
+                ref_paths.append(cand)
+        if not ref_paths:
+            node_end("Runner-NativeSCAIL2", "缺少参考图")
+            return ("", "⚠ 原生 SCAIL-2 需要至少 1 张参考图（连线『参考图』或填『人物参考图』文件名）。", False)
+
+        segs = getattr(plan, "segments", None) or []
+        total_frames = sum(int(getattr(s, "target_frames", 0) or 0) for s in segs) or 49
+
+        params = {
+            "driving_video": driving,
+            "reference_images": ref_paths,
+            "seed": 1, "cfg": 1.0, "mode": "replacement",
+            "max_frames": int(total_frames),
+            "overlap_frames": 5, "reference_count": len(ref_paths),
+            "color_correction": True, "cache_mode": "disk",
+            "steps": 4, "shift": 5, "sampler_name": "euler_ancestral", "scheduler": "beta",
+            "filename_prefix": "yunjii_native_scail2",
+        }
+
+        try:
+            prompt, out_node = build_native_prompt(plan, params)
+        except Exception as e:
+            node_end("Runner-NativeSCAIL2", "构造失败")
+            return ("", f"⚠ 构造原生 SCAIL-2 工作流失败: {e}", False)
+
+        info("Runner-NativeSCAIL2", "prompt 构造完成: %d 节点, 输出节点=%s, 驱动=%s, 参考=%d张",
+             len(prompt), out_node, os.path.basename(driving), len(ref_paths))
+
+        adapter = DirectAdapter(folder_paths.get_output_directory())
+        adapter.init_executor()
+        try:
+            result = adapter.execute_inline(prompt, timeout=3600, primary_output_node=out_node)
+        finally:
+            adapter.cleanup_executor()
+
+        status = result.get("status", "")
+        if status == "success":
+            vp = result.get("video_path", "")
+            run_id = time.strftime("%Y%m%d_%H%M%S")
+            last = self._extract_last_frame(vp, run_id) if vp else ""
+            seg_result = SegmentResult(
+                segment_index=0, video_path=vp, last_frame_path=last,
+                status="success", prompt_id=result.get("prompt_id", ""),
+                duration_sec=0, overlap_prev=0, latent_path="")
+            results_json = json.dumps(
+                {"run_id": result.get("prompt_id", ""), "mode": plan.mode,
+                 "backend": BACKEND_SCAIL2_NATIVE,
+                 "segments": [seg_result.to_dict()]},
+                ensure_ascii=False, indent=2)
+            log = f"✅ 原生 SCAIL-2 一镜到底生成完成: {vp}"
+            info("Runner-NativeSCAIL2", "完成: %s", vp)
+            node_end("Runner-NativeSCAIL2", "OK")
+            return (results_json, log, True)
+        else:
+            err = result.get("error", "unknown")
+            error("Runner-NativeSCAIL2", "执行失败: %s", err)
+            node_end("Runner-NativeSCAIL2", "FAIL")
+            return ("", f"⚠ 原生 SCAIL-2 执行失败: {err}", False)
 
     @staticmethod
     def _ensure_api_format(workflow_raw):

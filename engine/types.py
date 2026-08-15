@@ -218,6 +218,7 @@ CONTINUITY_LABEL_TO_VALUE.update({value: value for value, _ in CONTINUITY_LABELS
 # 生成后端标识（SegmentPlan.backend）
 BACKEND_WANVIDEO = "wanvideo"   # 骨骼路线：4k+1 帧规则
 BACKEND_SCAIL2 = "scail2"       # SCAIL-2 路线：每段 81 帧、重叠 5、有效步进 76
+BACKEND_SCAIL2_NATIVE = "scail2_native"  # 原生 SCAIL-2 长视频节点(一镜到底动作模仿)：comfyui_scail2_multi_cond
 
 REF_STRATEGY_USER_IMAGE = "user_image"
 REF_STRATEGY_PREV_LAST_FRAME = "prev_last_frame"
