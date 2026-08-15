@@ -21,7 +21,8 @@ from .runner import YunjiiSegmentRunner
 from .stitcher import YunjiiSegmentStitcher, _build_output_ui, _make_cover, XFADE_NAME_MAP
 from .types import (
     SEGMENT_MODE_ONE_SHOT, STITCH_HARD_CUT, STITCH_SEAMLESS, STITCH_SEAMLESS_BLEND,
-    STITCH_LATENT_BLEND, STITCH_CROSS_DISSOLVE, STITCH_TRANSITION, STITCH_LABELS, STITCH_LABEL_TO_VALUE,
+    STITCH_LATENT_BLEND, STITCH_CROSS_DISSOLVE, STITCH_TRANSITION, STITCH_AUTO,
+    STITCH_LABELS, STITCH_LABEL_TO_VALUE, STITCH_DEFAULT,
     CONTINUITY_MULTI_SEG, CONTINUITY_SINGLE_PASS, CONTINUITY_WARM_START,
     SEAMLESS_PLAN_A, SEAMLESS_PLAN_B, SEAMLESS_PLAN_C, SEAMLESS_PLAN_AUTO,
 )
@@ -88,7 +89,7 @@ class YunjiiVideoImitator:
                 "最大重试": ("INT", {"default": 3, "min": 0, "max": 10}),
                 "拼接模式": (
                     _STITCH_MODES,
-                    {"default": "ffmpeg转场", "tooltip": "硬切=直接拼接(一镜到底会被防呆回退重叠混合); 交叉淡化=像素级平滑过渡; 自动=根据内容选择(一镜到底落重叠混合); 无缝一镜到底(零转场)=硬切去重零转场; 无缝一镜到底(重叠混合)=接缝短窗交叉溶解软化跳变; ffmpeg转场=视频级高级转场(选「转场类型」生效，一镜到底可用作0.5s平滑接缝)"},
+                    {"default": "自动(跟随方案最优)", "tooltip": "默认「自动」即可：分段规划选完后自动跟随后端选最优——SCAIL-2 路线→真·零转场一镜到底；骨骼路线→交叉淡化平滑过渡。无需再选第二次。其余选项为手动覆盖：无缝一镜到底(零转场)=硬切去重零转场; 交叉淡化=像素级平滑过渡[转场]; 潜空间交叉淡化=latent 层转场[转场]; 硬切=直接拼接; ffmpeg转场=视频级高级转场(选「转场类型」生效，一镜到底可用作0.5s平滑接缝)"},
                 ),
                 "淡化帧数": ("INT", {"default": 8, "min": 2, "max": 30, "step": 1,
                     "tooltip": "交叉淡化过渡帧数（仅 交叉淡化 模式生效）"}),
@@ -127,9 +128,13 @@ class YunjiiVideoImitator:
 
         # —— 拼接模式中文标签 → 英文值归一（兼容旧 saved 英文值）——
         _raw_mode = 拼接模式
-        拼接模式 = STITCH_LABEL_TO_VALUE.get(拼接模式, 拼接模式)
-        if _raw_mode != 拼接模式:
+        # 旧工作流若残留空串/非法值，兜底为「自动(跟随方案最优)」，避免静默回退到首个可用值。
+        拼接模式 = STITCH_LABEL_TO_VALUE.get(拼接模式, STITCH_DEFAULT)
+        if 拼接模式 == STITCH_LABEL_TO_VALUE.get(_raw_mode, _raw_mode) and _raw_mode not in ("", None):
+            # 命中了中文标签或旧英文值中的某一个，记录归一轨迹
             info("Imitator", "拼接模式归一: '%s' → '%s'", _raw_mode, 拼接模式)
+        elif _raw_mode in ("", None):
+            info("Imitator", "拼接模式为空，兜底为「自动(跟随方案最优)」")
 
         # —— 一镜到底：生成模式即「零转场连续长镜头」，拼接必须走 seamless(去重硬切) ——
         # 否则 auto 会在段边界连续(差异<30)时误选交叉淡化，产生可见溶解转场，违背一镜到底本意。
@@ -160,11 +165,25 @@ class YunjiiVideoImitator:
             _plan_single_pass = False
             _plan_seamless = ""
             _plan_precision = "fp8"
+        # —— 自动(跟随方案最优)：显式解析，依据 后端/连贯方案/一镜到底 选最优拼接 ——
+        # 用户在「分段规划」选完 A/B/暖启动后，本节点保持「自动」即可，无需二次选择：
+        #   · SCAIL-2 路线 多段（生成侧已连续 reference_latent 续写）→ 真·零转场一镜到底(硬切去重)。
+        #   · 骨骼路线 多段（独立去噪、无生成侧连续）→ 交叉淡化像素平滑过渡（不依赖段间重叠）。
+        # 其余显式选择（无缝一镜到底/交叉淡化/潜空间/硬切/ffmpeg转场）一律尊重，不覆盖。
+        _continuity_capable = (生成后端 == "SCAIL-2 路线")
+        if 拼接模式 == STITCH_AUTO:
+            if (not _plan_single_pass) and _continuity_capable:
+                info("Imitator", "自动：SCAIL-2 路线多段(生成侧已连续) → 真·零转场一镜到底")
+                拼接模式 = STITCH_SEAMLESS
+            elif (not _plan_single_pass) and (not _continuity_capable):
+                info("Imitator", "自动：骨骼路线多段(独立去噪) → 交叉淡化像素平滑过渡")
+                拼接模式 = STITCH_CROSS_DISSOLVE
+            # 单遍(_plan_single_pass) 无需拼接，下方直接成片，拼接模式留 auto 无害。
+
         # —— 一镜到底：拼接模式防呆（仅拦截真正破坏连贯的「硬切」）——
         # 一镜到底=连续长镜头；硬切会暴露段边界跳变，故强制回退 重叠混合。
         # ffmpeg转场(xfade 真·交叉溶解) 与 交叉淡化 本质都是「平滑过渡」，恰是一镜到底想要的丝滑，
         # 故放行（用户选 ffmpeg转场+淡入淡出 即恢复此前最喜欢的 0.5s 平滑接缝）。
-        # 自动(auto) 已落 seamless_blend；零转场/重叠混合 均为用户显式基线，保留。
         if _plan_mode == SEGMENT_MODE_ONE_SHOT and 拼接模式 == STITCH_HARD_CUT:
             info("Imitator", "生成模式=一镜到底，硬切会暴露段边界跳变，强制回退「无缝一镜到底(重叠混合)」")
             拼接模式 = STITCH_SEAMLESS_BLEND
@@ -176,7 +195,6 @@ class YunjiiVideoImitator:
         #   多段处于同一条去噪轨迹，硬切丢重叠帧即无感衔接 = 真·零转场一镜到底。
         # 故：仅骨骼路线多段、或所有路线的 latent_blend，升级为交叉淡化；
         #     SCAIL-2 路线多段 + STITCH_SEAMLESS(零转场硬切) 一律尊重用户显式选择（真无缝）。
-        _continuity_capable = (生成后端 == "SCAIL-2 路线")
         if (not _plan_single_pass) and (not _continuity_capable) and 拼接模式 in (STITCH_SEAMLESS, STITCH_LATENT_BLEND):
             info("Imitator", "骨骼路线多段独立去噪：硬切/潜空间混合会暴露段边界，升级为「交叉淡化」平滑过渡")
             拼接模式 = STITCH_CROSS_DISSOLVE

@@ -183,6 +183,9 @@ STITCH_SEAMLESS_BLEND = "seamless_blend"
 # 显示用中文，比较/存储仍用英文值；旧已保存的英文值（auto/transition...）仍兼容。
 # 📌 标签后缀标注 [转场] 以直观提示用户：凡标 [转场] 的都是事后混合、非真无缝。
 STITCH_LABELS = [
+    # 自动放首位并作默认：跟随后端/连贯方案自动选最优（详见 composer._continuity_capable 分支），
+    # 用户在「分段规划」选完 A/B/暖启动后，这里保持「自动」即可，不必再选第二次。
+    (STITCH_AUTO,           "自动(跟随方案最优)"),
     # 真·零转场一镜到底：配合 SCAIL-2 路线的生成侧连续(reference_latent 续写)，多段硬切丢重叠帧即无感衔接。
     (STITCH_SEAMLESS,       "无缝一镜到底(零转场·硬切)"),
     (STITCH_CROSS_DISSOLVE, "交叉淡化[转场]"),
@@ -190,7 +193,6 @@ STITCH_LABELS = [
     # 旧称「真·一镜到底（潜空间拼接）⭐推荐」是误导——它本质是 latent 层交叉淡化(转场)，并非真无缝；改名并去⭐。
     (STITCH_LATENT_BLEND,   "潜空间交叉淡化(转场)"),
     (STITCH_HARD_CUT,       "硬切"),
-    (STITCH_AUTO,           "自动"),
     (STITCH_TRANSITION,     "ffmpeg转场"),
 ]
 STITCH_LABEL_TO_VALUE = {label: value for value, label in STITCH_LABELS}
@@ -199,8 +201,12 @@ STITCH_LABEL_TO_VALUE.update({value: value for value, _ in STITCH_LABELS})  # �
 _LEGACY_STITCH_LABELS = {
     "真·一镜到底（潜空间拼接）⭐推荐[转场]": STITCH_LATENT_BLEND,
     "无缝一镜到底(零转场·硬切)":           STITCH_SEAMLESS,  # 曾用同名微调，稳妥兼容
+    "自动":                               STITCH_AUTO,  # 旧「自动」标签仍归一，避免旧工作流断链
 }
 STITCH_LABEL_TO_VALUE.update(_LEGACY_STITCH_LABELS)
+
+# 拼接模式默认项（下拉首项「自动(跟随方案最优)」），单一入口跟随后端选最优，用户无需二次选择。
+STITCH_DEFAULT = STITCH_AUTO
 
 SEGMENT_MODE_ONE_SHOT = "一镜到底"
 SEGMENT_MODE_SMART_SPLIT = "智能分段"
