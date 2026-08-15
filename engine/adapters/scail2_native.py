@@ -22,14 +22,14 @@ FaboroHacks 工作流证明，原生 `comfyui_scail2_multi_cond` 包里的长视
 类名与端口均来自 2026-08-15 对仓库 nodes.py 的源码核对（raw.githubusercontent 抓取）：
 - `SCAIL2SegmentPlanBuilder`  INPUT: segment_count(INT) + 动态 segment_{i}_frames/reference/prompt/
   negative/boundary_overlap  OUTPUT: ("segment_plan"(STRING), "summary"(STRING))
-- `SCAIL2ScheduledLongVideo`(主调度器, 外部 mask 版)  REQUIRED: model/clip/vae/sampler/sigmas/
-  clip_vision(MODEL/CLIP/VAE/SAMPLER/SIGMAS/CLIP_VISION), pose_video(IMAGE), segment_plan(STRING),
-  seed/cfg(FLOAT), mode(["replacement","animation"]), max_frames/max_chunk_frames(17~81,step4)/
-  overlap_frames(INT), reference_count(INT,max8), color_correction(BOOLEAN), cache_mode(["disk","off"])
-  OPTIONAL: pose_video_mask(IMAGE), reference_{i}(IMAGE), reference_{i}_mask(IMAGE)
+- `SCAIL2ScheduledLongVideoWithSAM`(FaboroHacks 实际使用的生成器, SCAIL2ScheduledLongVideo 子类, 自动出 SAM 遮罩)
+  REQUIRED: 与基类同(model/clip/vae/sampler/sigmas/clip_vision/pose_video/segment_plan/seed/cfg/mode/
+  max_frames/max_chunk_frames/overlap_frames/reference_count/color_correction) + 专有必填
+  object_indices(STRING)/reference_object_indices(STRING)/sort_by(["none","left_to_right","area"])/
+  sam_detection_threshold(FLOAT)/sam_max_objects(INT)/sam_detect_interval(INT)；OPTIONAL: sam_model(MODEL)/
+  sam_conditioning(CONDITIONING)/reference_{i}(IMAGE)；**无** pose_video_mask(由 SAM 自动生成)。
   OUTPUT: ("frames"(IMAGE), "used_pose_video_mask", "used_reference_mask_timeline", "summary")
-- `SCAIL2ScheduledLongVideoInternalSAM`(内置 SAM 便捷变体, 自动出 mask；类名依截断推断, 切换前需本机
-  在 nodes.py 再核对一次) —— 优先评估，因它免去手绘 mask。
+- `SCAIL2ScheduledLongVideo`(基类, 外部 mask 版)：与 WithSAM 同构但需手绘 pose_video_mask / reference_{i}_mask。
 
 loader(model/clip/vae/sampler/sigmas/clip_vision) 不在本适配器臆测：由 `ctx` 注入已构建的
 loader 节点引用，原生生成链路本身用上列真实端口名写死。
@@ -40,10 +40,10 @@ from __future__ import annotations
 # 默认关闭：现有 yunjii 自有管线仍是主路径，原生节点切换需本机验证后再开。
 SCAIL2_NATIVE_ENABLED = False
 
-# 原生包里与「一镜到底动作模仿」相关的节点类名（2026-08-15 源码核对，非猜测）。
-NATIVE_NODE_CLASS = "SCAIL2ScheduledLongVideo"                       # 主调度器(外部 mask 版)
-NATIVE_INTERNAL_SAM_VARIANT = "SCAIL2ScheduledLongVideoInternalSAM"  # 内置 SAM 便捷变体(优先评估)
-NATIVE_PLAN_BUILDER_CLASS = "SCAIL2SegmentPlanBuilder"               # 由分段参数生成 segment_plan 字符串
+# 原生包里与「一镜到底动作模仿」相关的节点类名（2026-08-15 安装后源码核对，确证）。
+NATIVE_NODE_CLASS = "SCAIL2ScheduledLongVideoWithSAM"   # FaboroHacks 实际使用的生成器(自动出 SAM 遮罩, SCAIL2ScheduledLongVideo 子类)
+NATIVE_BASE_NODE_CLASS = "SCAIL2ScheduledLongVideo"     # 基类(外部 mask 版, 需手绘 pose_video_mask / reference_{i}_mask)
+NATIVE_PLAN_BUILDER_CLASS = "SCAIL2SegmentPlanBuilder"  # 由分段参数生成 segment_plan 字符串(RETURN_NAMES=segment_plan)
 
 # 包内常量(依据源码 MAX_REFERENCES=8, 段数/参考数上限)
 MAX_REFERENCES = 8
@@ -74,7 +74,7 @@ def describe_native_scail2_wiring(plan=None) -> dict:
     """返回把 yunjii SegmentPlan 接进原生 SCAIL-2 长视频节点的接线配方（源码级端口名）。"""
     recipe = {
         "native_node": NATIVE_NODE_CLASS,
-        "preferred_variant": NATIVE_INTERNAL_SAM_VARIANT,
+        "base_node": NATIVE_BASE_NODE_CLASS,
         "plan_builder": NATIVE_PLAN_BUILDER_CLASS,
         "inputs": {
             "pose_video": "驱动视频的姿态序列(IMAGE)——动作模仿的核心输入，来自 ctx['pose_video']",
@@ -147,18 +147,20 @@ def _builder_inputs_from_plan(plan) -> dict:
 def build_native_graph(plan, ctx):
     """构造原生 SCAIL-2 长视频节点图（ComfyUI prompt dict）。
 
-    接线（源码级准确，类名/端口来自 2026-08-15 nodes.py 核对）：
+    接线（源码级准确，类名/端口来自 2026-08-15 安装后核对）：
       ① SCAIL2SegmentPlanBuilder  ← 由 plan 翻译的分段参数  →  segment_plan(STRING)
-      ② SCAIL2ScheduledLongVideo  ← loaders(ctx) + pose_video(ctx)
-                                     + segment_plan[①,0] + reference_i(ctx) + masks
-                                     →  frames(IMAGE) 等
+      ② SCAIL2ScheduledLongVideoWithSAM  ← loaders(ctx) + pose_video(ctx)
+                                     + segment_plan[①,0] + reference_i(ctx) + SAM 专有必填项
+                                     →  frames(IMAGE) 等（SAM 自动出遮罩，无需 pose_video_mask）
 
     ⚠️ 未启用前不得被调用：SCAIL2_NATIVE_ENABLED 必须为 True，且本机已装包、并经 GPU 实跑验证。
     ctx 必须提供：
       model/clip/vae/sampler/sigmas/clip_vision : loader 节点引用(node_id 或 [node_id, idx])
       pose_video                                : 驱动视频帧(IMAGE) 节点引用
       references                                : 参考图列表(每个为节点引用)
-      reference_masks (可选)                    : 参考图遮罩列表(每个为节点引用)
+    可选 ctx：seed/cfg/mode/max_frames/max_chunk_frames/overlap_frames/color_correction/cache_mode/
+      object_indices/reference_object_indices/sort_by/sam_detection_threshold/sam_max_objects/
+      sam_detect_interval/sam_model/sam_conditioning
     返回标准 ComfyUI prompt dict（含 nodes 与链接元组）。
     """
     if not SCAIL2_NATIVE_ENABLED:
@@ -175,7 +177,6 @@ def build_native_graph(plan, ctx):
         raise ValueError(f"build_native_graph: ctx 缺少必要键: {missing}")
 
     references = ctx.get("references") or []
-    ref_masks = ctx.get("reference_masks") or []
     ref_count = max(len(references), 1)
     ref_count = min(ref_count, MAX_REFERENCES)
 
@@ -186,7 +187,7 @@ def build_native_graph(plan, ctx):
             "class_type": NATIVE_PLAN_BUILDER_CLASS,
             "inputs": _builder_inputs_from_plan(plan),
         },
-        # ② 主调度器
+        # ② 主生成器（FaboroHacks 使用的 SCAIL2ScheduledLongVideoWithSAM，自动出 SAM 遮罩）
         "scail2_scheduled_long_video": {
             "class_type": NATIVE_NODE_CLASS,
             "inputs": {
@@ -206,18 +207,24 @@ def build_native_graph(plan, ctx):
                 "overlap_frames": int(ctx.get("overlap_frames", OVERLAP_FRAMES_DEFAULT) or OVERLAP_FRAMES_DEFAULT),
                 "reference_count": ref_count,
                 "color_correction": bool(ctx.get("color_correction", True)),
+                # —— SCAIL2ScheduledLongVideoWithSAM 专有必填项（默认空/推荐值）——
+                "object_indices": str(ctx.get("object_indices", "") or ""),
+                "reference_object_indices": str(ctx.get("reference_object_indices", "") or ""),
+                "sort_by": ctx.get("sort_by", "left_to_right"),
+                "sam_detection_threshold": float(ctx.get("sam_detection_threshold", 0.5) or 0.5),
+                "sam_max_objects": int(ctx.get("sam_max_objects", 2) or 2),
+                "sam_detect_interval": int(ctx.get("sam_detect_interval", 2) or 2),
                 "cache_mode": ctx.get("cache_mode", "disk"),
-                # optional：驱动视频遮罩
-                "pose_video_mask": _seg_link(ctx["pose_video_mask"]) if ctx.get("pose_video_mask") else None,
+                # optional：SAM 模型（留空则由节点内部处理）
+                "sam_model": _seg_link(ctx["sam_model"]) if ctx.get("sam_model") else None,
+                "sam_conditioning": _seg_link(ctx["sam_conditioning"]) if ctx.get("sam_conditioning") else None,
             },
         },
     }
-    # 注入参考图与遮罩（reference_1..N / reference_1_mask..N）
+    # 注入参考图（reference_1..N，WithSAM 的 optional 端口）
     gen_inputs = prompt["scail2_scheduled_long_video"]["inputs"]
     for i in range(1, ref_count + 1):
         gen_inputs[f"reference_{i}"] = _seg_link(references[i - 1])
-        if i - 1 < len(ref_masks) and ref_masks[i - 1]:
-            gen_inputs[f"reference_{i}_mask"] = _seg_link(ref_masks[i - 1])
     return prompt
 
 
