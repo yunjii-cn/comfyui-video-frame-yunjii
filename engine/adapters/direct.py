@@ -10,7 +10,7 @@ from typing import Optional
 from .base import GenerationAdapter
 from ..types import NodeMap
 from ..debug_log import info, warn, error as log_error
-from .frontend_registry import register_video_to_history
+from ..frontend_registry import register_video_to_history
 
 
 class DirectAdapter(GenerationAdapter):
