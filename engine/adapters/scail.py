@@ -33,7 +33,7 @@ import folder_paths
 
 from .direct import DirectAdapter
 from ..debug_log import info, warn, error as log_error
-from ..types import SEAMLESS_PLAN_C
+from ..types import SEAMLESS_PLAN_A, SEAMLESS_PLAN_B, SEAMLESS_PLAN_C
 
 # 官方子流程用到的 class_type
 SCAIL_REF_EMBEDS = "WanVideoAddSCAILReferenceEmbeds"
@@ -315,13 +315,15 @@ class SCAILAdapter(DirectAdapter):
                     node["inputs"]["value"] = target
                     info("SCAILAdapter", "尺寸常量 INTConstant %s -> %d", cid, target)
 
-        # 6) 采样种子：每段可复现
+        # 6) 采样种子：每段随机（用户要求），避免固定种子导致的重复/模板化运动
+        seed = -1
         if node_map.sampler:
-            seed = (1234567 + seg.index * 101) & 0xFFFFFFFF
+            import random as _rnd
+            seed = _rnd.randint(1, 0xFFFFFFFF)
             self._set(wf, node_map.sampler, "seed", seed)
 
         info("SCAILAdapter", "核心参数: width=%d, height=%d, num_frames=%d, seed=%d",
-             w, h, n, (1234567 + seg.index * 101) & 0xFFFFFFFF)
+             w, h, n, seed)
 
         # 蒸馏 LoRA 路线：固定 4 步快速（步数蒸馏 LoRA 为 4 步设计，高步数反而崩坏）。
         # 同时把模型/LoRA 显式钉到本机真实存在的文件，避免模板错位文件(不存在的
@@ -564,11 +566,16 @@ class SCAILAdapter(DirectAdapter):
 
         n = seg.target_frames or 0
         context_frames = 81
-        if n <= context_frames:
-            return wf
+        _coherent_multiseg = seamless_plan in (SEAMLESS_PLAN_A, SEAMLESS_PLAN_B)
+        # 关键修复(2026-08-15)：多段无缝(A/B)必须保证 context_options 节点存在，作为
+        # 跨段 reference_latent 续写的载体，否则续写被下文 `if node_map.context_options`
+        # 短路、永不生效 → 段间退化成弱像素锚定(4步蒸馏抹掉锚点)→ 边界跳变
+        # （用户实测「短视频多段不连贯」正是此因）。即便每段≤81帧(窗内无可滑)也要建节点；
+        # 窗口参数 WanVideo 自动 clamp 到可用帧，单窗=等同无窗，段内画质不变。
+        if n <= context_frames and not _coherent_multiseg:
+            return wf  # 非连贯多段且短段：不建节点，行为等同旧版
         if seamless_plan == SEAMLESS_PLAN_C:
             # C 方案(单遍兜底)：不注入 context 滑窗，整片一次去噪 → >5s 画质软，仅作对比/兜底。
-            # B 方案同样 single_pass 但会注入滑窗(真无缝)；A 多段每段≤81 自然不滑窗。
             info("SCAILAdapter", "跳过ContextOptions注入(C方案兜底: 不滑窗, 整片一次去噪)")
             return wf
 

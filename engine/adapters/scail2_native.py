@@ -301,6 +301,7 @@ def build_native_prompt(plan, params=None):
         raise RuntimeError("SCAIL2_NATIVE_ENABLED=False：原生节点图未启用。")
 
     p = dict(params or {})
+    import random as _rnd
     driving = (p.get("driving_video") or "").strip()
     if not driving:
         raise ValueError("build_native_prompt: params['driving_video'] 必填（动作驱动视频路径）")
@@ -371,7 +372,7 @@ def build_native_prompt(plan, params=None):
         "sampler": ["8", 0], "sigmas": ["9", 0], "clip_vision": ["6", 0],
         "pose_video": ["12", 0],
         "segment_plan": seg_plan,
-        "seed": int(p.get("seed", 1)),
+        "seed": int(p.get("seed") or 0) or _rnd.randint(1, 0xFFFFFFFF),
         "cfg": float(p.get("cfg", 1.0)),
         "mode": p.get("mode", "replacement"),
         "max_frames": int(total_frames),
