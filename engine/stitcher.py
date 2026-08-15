@@ -723,3 +723,9 @@ class YunjiiSegmentStitcher:
         dst = os.path.join(yunjii_dir, output_name)
         shutil.copy2(src_path, dst)
         return dst
+
+
+# 模块级别名：composer.py 以 `from .stitcher import _make_cover` 方式引用，
+# 而 _make_cover 定义在 YunjiiSegmentStitcher 内为 @staticmethod。此处暴露为模块级，
+# 同时类内 `self._make_cover(...)` 调用（staticmethod 经实例访问）依旧有效。
+_make_cover = YunjiiSegmentStitcher._make_cover
