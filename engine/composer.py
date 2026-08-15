@@ -19,6 +19,7 @@ import os
 
 from .runner import YunjiiSegmentRunner
 from .stitcher import YunjiiSegmentStitcher, _build_output_ui, _make_cover, XFADE_NAME_MAP
+from .frontend_registry import register_video_to_history
 from .types import (
     SEGMENT_MODE_ONE_SHOT, STITCH_HARD_CUT, STITCH_SEAMLESS, STITCH_SEAMLESS_BLEND,
     STITCH_LATENT_BLEND, STITCH_CROSS_DISSOLVE, STITCH_TRANSITION, STITCH_AUTO,
@@ -263,6 +264,12 @@ class YunjiiVideoImitator:
                             warn("Imitator", "单遍音频混流失败(不影响成片): %s", e)
                     info("Imitator", "一镜到底单次超长成片(方案C): %s (单次生成无需拼接)", _final)
                     node_end("Imitator", "单次超长完成")
+                    # 内联执行会改写外层 prompt 历史上下文，节点 return ui 落不进「已生成」；
+                    # 故最终成片显式登记一条独立历史条目（与段视频同源通道）。
+                    try:
+                        register_video_to_history(_final)
+                    except Exception as _e:
+                        warn("Imitator", "方案C 最终成片前端历史补登失败(不影响出片): %s", _e)
                     _first, _cover = _make_cover(_final)
                     return {"ui": _build_output_ui(_final, _first),
                             "result": (_final, f"{执行日志}\n---\n✅ 一镜到底单次超长生成，单段即成片，无需拼接", True, _cover)}
@@ -276,6 +283,12 @@ class YunjiiVideoImitator:
             音频源=音频源, 效果模块=effects,
             转场类型=转场类型, 转场时长=转场时长,
         )
+        # 内联执行会改写外层 prompt 历史上下文，节点 return ui 落不进「已生成」；
+        # 故最终成片显式登记一条独立历史条目（与段视频同源通道），确保稳定可见。
+        try:
+            register_video_to_history(最终视频路径)
+        except Exception as _e:
+            warn("Imitator", "最终成片前端历史补登失败(不影响出片): %s", _e)
 
         if not 最终视频路径:
             node_error("Imitator", "拼接阶段未产出视频")

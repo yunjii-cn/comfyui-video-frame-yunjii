@@ -10,6 +10,7 @@ from typing import Optional
 from .base import GenerationAdapter
 from ..types import NodeMap
 from ..debug_log import info, warn, error as log_error
+from .frontend_registry import register_video_to_history
 
 
 class DirectAdapter(GenerationAdapter):
@@ -318,108 +319,12 @@ class DirectAdapter(GenerationAdapter):
     def _register_frontend(self, server, prompt_id, video_path, workflow_dict, execute_outputs):
         """把内联执行的结果注册进前端历史，让资产出现在「已生成/历史」里。
 
-        内联执行绕过了 API 队列，默认不写 prompt_queue.history，因此前端画廊/历史
-        看不到产出。这里手动补齐：按 VHS_VideoCombine 的 gifs 输出格式写入历史，并
-        广播 executed / queue_updated，使前端即时显示。失败仅告警，不影响出片。
+        委托给统一的 register_video_to_history（与完美模仿最终成片共用同一通道），
+        避免重复实现。内联执行绕过 API 队列默认不写 history，故每个输出节点各登记
+        一条独立历史条目，schema 对齐 VHS。失败仅告警，不影响出片。
         """
-        try:
-            import folder_paths
-            out_dir = folder_paths.get_output_directory()
-            fname = os.path.basename(video_path)
-            d = os.path.dirname(video_path)
-            rel = os.path.relpath(d, out_dir) if d.startswith(out_dir) else ""
-            subfolder = "" if rel in (".", "") else rel.replace(os.sep, "/")
-
-            # 对齐 VHS 黄金标准：video/h264-mp4 + 实际 fps + 首帧封面 + 同时返回 gifs/videos，
-            # 与 _build_output_ui 保持完全一致，避免画廊/历史里视频同样不渲染。
-            _fps = None
-            _first = ""
-            try:
-                import cv2 as _cv2
-                _cap = _cv2.VideoCapture(video_path)
-                _fps = _cap.get(_cv2.CAP_PROP_FPS)
-                _cap.release()
-            except Exception:
-                pass
-            # 首帧封面：ffmpeg 稳健抽取（画廊只认 images；cv2 抽帧在 ffmpeg 编码的
-            # 成片上可能失败，导致画廊空白）。cv2 仅作兜底。
-            try:
-                from ..poster import extract_poster_png
-                _first = extract_poster_png(video_path)
-            except Exception:
-                _first = ""
-            preview = {
-                "filename": fname,
-                "subfolder": subfolder,
-                "type": "output",
-                "format": "video/h264-mp4",
-                "frame_rate": float(_fps) if _fps and _fps > 0 else 16.0,
-                "workflow": os.path.basename(_first) if _first else None,
-                "fullpath": video_path,
-            }
-            # images 是画廊(底部 Queue Gallery)唯一消费的字段；对齐 _build_output_ui，
-            # 让内联执行出片也以标准输出节点形态出现在画廊里。
-            images = []
-            if _first and os.path.isfile(_first):
-                images.append({"filename": os.path.basename(_first),
-                               "subfolder": subfolder, "type": "output"})
-            node_ui = {"gifs": [preview], "videos": [preview], "images": images}
-            outputs = {}
-            for onid in execute_outputs:
-                outputs[onid] = node_ui
-
-            pq = getattr(server, "prompt_queue", None)
-            if pq is not None and hasattr(pq, "history"):
-                import time as _time
-                now_ms = int(_time.time() * 1000)
-                extra_data = {"client_id": None, "extra_pnginfo": {}}
-                # 重要：本 HeiHe fork 的 normalize_history_item 期望 history['prompt']
-                # 是 5 元组 (priority, _, prompt_dict, extra_data, _)。若直接传 dict，
-                # get_jobs 解包会报 "too many values to unpack (expected 5)"，导致
-                # 前端「已生成/历史」面板拉取历史时崩溃。务必按 5 元组写入。
-                pq.history[prompt_id] = {
-                    "prompt": (0, None, workflow_dict, extra_data, None),
-                    "outputs": outputs,
-                    "status": {
-                        "status_str": "success",
-                        "messages": [
-                            ["execution_start", {"prompt_id": prompt_id, "timestamp": now_ms}],
-                            ["execution_success", {"prompt_id": prompt_id, "timestamp": now_ms}],
-                        ],
-                    },
-                }
-                try:
-                    server.queue_updated()
-                except Exception:
-                    pass
-            # 实时广播：executed 仅更新画布节点预览；真正让 Gallery/Queue-History
-            # 画廊刷新的信号是 execution_success（配合前端「Auto-refresh after
-            # generation」开关，本 fork 已默认打开）。两者都发，确保内联出片后
-            # 视频立即出现在前端资产画廊，而无需手动刷新/重载页面。
-            try:
-                server.send_sync("execution_success", {
-                    "prompt_id": prompt_id,
-                }, None)
-            except Exception:
-                pass
-            # 对照 execution.py:577-578 标准格式：executed 的 output 必须是「单个节点」的
-            # ui 字典({"gifs":[...],"videos":[...]})，而非按节点分组的 history 结构。
-            # 先前误发 outputs(={onid:{...}}) → 前端 msg.output.gifs 为 undefined → 节点/画廊全白。
-            # 每个输出节点各发一条 executed，使画布预览与画廊都能正确渲染。
-            for onid in execute_outputs:
-                try:
-                    server.send_sync("executed", {
-                        "prompt_id": prompt_id,
-                        "node": onid,
-                        "display_node": onid,
-                        "output": node_ui,
-                    }, None)
-                except Exception:
-                    pass
-            info("DirectAdapter", "已注册结果到前端历史 prompt_id=%s file=%s subfolder=%s",
-                 prompt_id, fname, subfolder)
-        except Exception as e:
-            warn("DirectAdapter", "注册前端历史失败(不影响出片): %s", e)
+        for onid in execute_outputs:
+            register_video_to_history(video_path, workflow_dict, onid)
 
     def _resolve_output_file(self, filename: str, subfolder: str = "", file_type: str = "output") -> str:
         import folder_paths
