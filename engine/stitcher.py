@@ -226,11 +226,8 @@ class YunjiiSegmentStitcher:
             output_path = self._copy_to_output(videos[0], 输出文件名, run_id)
             info("Stitcher", "仅1段视频，直接复制: %s", output_path)
             node_end("Stitcher", f"输出: {output_path}")
-            first_png, cover = self._make_cover(output_path)
-            return {
-                "ui": _build_output_ui(output_path, first_png),
-                "result": (output_path, f"✅ 仅1段视频，无需拼接\n输出: {output_path}", cover),
-            }
+            _, cover = self._make_cover(output_path)
+            return (output_path, f"✅ 仅1段视频，无需拼接\n输出: {output_path}", cover)
 
         report_lines = []
         report_lines.append(f"🎬 开始拼接 {len(videos)} 个视频片段")
@@ -312,11 +309,8 @@ class YunjiiSegmentStitcher:
         report_lines.append(f"\n✅ 最终输出: {output_path}")
         info("Stitcher", "拼接完成: %s", output_path)
         node_end("Stitcher", f"输出: {output_path}")
-        first_png, cover = self._make_cover(output_path)
-        return {
-            "ui": _build_output_ui(output_path, first_png),
-            "result": (output_path, "\n".join(report_lines), cover),
-        }
+        _, cover = self._make_cover(output_path)
+        return (output_path, "\n".join(report_lines), cover)
 
     def _stitch_videos(self, video_items, mode, fade_frames, output_prefix, report, run_id="",
                        xfade="", xfade_duration=0.5):
