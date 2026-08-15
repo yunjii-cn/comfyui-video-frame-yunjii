@@ -10,7 +10,7 @@ import folder_paths
 from .types import (
     SegmentResult,
     STITCH_HARD_CUT, STITCH_CROSS_DISSOLVE, STITCH_AUTO, STITCH_SEAMLESS,
-    STITCH_SEAMLESS_BLEND, STITCH_LATENT_BLEND, STITCH_TRANSITION,
+    STITCH_FRAME_ANCHOR, STITCH_SEAMLESS_BLEND, STITCH_LATENT_BLEND, STITCH_TRANSITION,
     STITCH_LABELS, STITCH_LABEL_TO_VALUE,
 )
 
@@ -268,16 +268,23 @@ class YunjiiSegmentStitcher:
                     xfade_duration = 0.5
             info("Stitcher", "已应用效果模块: %s", effect_pipeline.describe())
 
-        # 自动模式：若各段 latent 已落盘（潜空间拼接可用），优先升级为真·一镜到底（潜空间），
-        # 过渡最自然；否则沿用像素级无缝近似（_stitch_videos 内部 STITCH_AUTO 逻辑）。
+        # 自动模式：各段 latent 已落盘(SCAIL/AnimatePlus 路线) → 升级为「帧锚定一镜到底」
+        # （丢弃生成侧重叠头帧 + 下一段首帧硬等于上一段尾帧）。潜空间续写在 4 步蒸馏下名不副实，
+        # 故不再默认 latent_blend，改为拼接阶段确定性帧锚定，保证真无缝。
+        # 无 latent(骨骼路线) → 留 auto，由 _stitch_videos 内部按边界差异选 交叉淡化/硬切。
         if 拼接模式 == STITCH_AUTO:
             _latents = [vi.get("latent_path", "") or "" for vi in video_items]
             if _latents and all(_latents):
-                info("Stitcher", "自动模式: 各段 latent 可用，升级为真·一镜到底（潜空间拼接）")
-                拼接模式 = STITCH_LATENT_BLEND
+                info("Stitcher", "自动模式: 各段 latent 可用(SCAIL路线)，升级为帧锚定一镜到底(首帧=尾帧·真无缝)")
+                拼接模式 = STITCH_FRAME_ANCHOR
 
         try:
-            if 拼接模式 == STITCH_LATENT_BLEND:
+            if 拼接模式 in (STITCH_FRAME_ANCHOR, STITCH_SEAMLESS):
+                # 帧锚定一镜到底（⭐推荐真无缝）：拼接阶段确定性像素锚定，
+                # 硬保证「下一段首帧=上一段尾帧」，不再依赖生成侧不可靠的 latent 续写。
+                output_path = self._stitch_videos_frame_anchor(
+                    video_items, 输出文件名, report_lines, run_id, blend_frames=淡化帧数)
+            elif 拼接模式 == STITCH_LATENT_BLEND:
                 # 潜空间拼接：加载各段 latent → 接缝交叉淡化 → 合并解码，过渡最自然。
                 # 任意失败(缺 latent/解码异常)自动回退像素重叠混合，保证不丢输出。
                 output_path = self._stitch_videos_latent(
@@ -358,24 +365,6 @@ class YunjiiSegmentStitcher:
                         mode = STITCH_CROSS_DISSOLVE
                     report.append(f"📊 段间差异: {diff:.1f}, 自动选择: {mode}")
 
-        # —— 真·一镜到底：硬切 + 丢弃后续段头部重叠帧 ——
-        if mode == STITCH_SEAMLESS:
-            all_frames = []
-            for i, v in enumerate(video_items):
-                frames = self._read_all_frames(v["path"], width, height)
-                report.append(f"  段{i}: {len(frames)}帧, {os.path.basename(v['path'])}")
-                if i == 0:
-                    all_frames.extend(frames)
-                else:
-                    drop = min(int(v.get("overlap_prev", 0)), max(0, len(frames) - 1))
-                    if drop > 0:
-                        all_frames.extend(frames[drop:])
-                        report.append(f"  ↳ 去重重叠 {drop} 帧（一镜到底）")
-                    else:
-                        all_frames.extend(frames)
-            report.append(f"  总帧数: {len(all_frames)}, 时长: {len(all_frames) / fps:.1f}s")
-            return self._write_frames(all_frames, output_path, fps, width, height)
-
         # —— 一镜到底(重叠混合)：接缝处短窗交叉溶解，软化位置跳变 ——
         # 段i保留完整；段i+1 丢弃头部重叠帧后，用「前段尾 b 帧」与「本段新头 b 帧」做交叉溶解，
         # 把生硬硬切变成几帧的平滑过渡（b=min(重叠帧数, 淡化帧数)）。仅缓解位置不连续；
@@ -431,6 +420,62 @@ class YunjiiSegmentStitcher:
                 else:
                     all_frames.extend(frames)
 
+        report.append(f"  总帧数: {len(all_frames)}, 时长: {len(all_frames) / fps:.1f}s")
+        return self._write_frames(all_frames, output_path, fps, width, height)
+
+    def _stitch_videos_frame_anchor(self, video_items, output_prefix, report, run_id="", blend_frames=4):
+        """帧锚定一镜到底（⭐推荐真无缝）：
+
+        在拼接阶段用**确定性像素锚定**硬保证「下一段首帧 = 上一段尾帧」，彻底不再依赖
+        生成侧不可靠的 reference_latent 续写（实测其本质只是 i2v 首帧弱偏置、被 4 步蒸馏洗掉）。
+
+        步骤：
+          1) 丢弃下一段头部 overlap_prev 帧（生成侧那次失败的重叠尝试，本就与上层不连续）；
+          2) 把下一段首帧硬替换为上一段尾帧（像素级相等 → 边界连续）；
+          3) 向后做 blend_frames 帧短窗交叉淡化，从上一段尾帧缓入本段自身运动，避免 1 帧静止感。
+        结果：段边界像素级连续、硬切即无缝；纯离线、可验证，无需 GPU。
+        """
+        video_paths = [v["path"] for v in video_items]
+        output_dir = folder_paths.get_output_directory()
+        sub_dir = run_id if run_id else time.strftime("%Y%m%d_%H%M%S")
+        yunjii_dir = os.path.join(output_dir, "yunjii_v2v", sub_dir)
+        os.makedirs(yunjii_dir, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        output_path = os.path.join(yunjii_dir, f"{output_prefix}_{timestamp}.mp4")
+
+        ref_cap = cv2.VideoCapture(video_paths[0])
+        fps = ref_cap.get(cv2.CAP_PROP_FPS) or 16.0
+        width = int(ref_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(ref_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        ref_cap.release()
+
+        all_frames = []
+        for i, v in enumerate(video_items):
+            frames = self._read_all_frames(v["path"], width, height)
+            report.append(f"  段{i}: {len(frames)}帧, {os.path.basename(v['path'])}")
+            if i == 0:
+                all_frames.extend(frames)
+                continue
+            # 1) 丢弃生成侧重叠头帧（模型那次失败的重叠尝试）
+            O = int(v.get("overlap_prev", 0) or 0)
+            if O > 0 and len(frames) > O:
+                head = frames[O:]
+                report.append(f"  ↳ 丢弃生成侧重叠头 {O} 帧")
+            else:
+                head = list(frames)
+            if not head:
+                report.append(f"  ⚠ 段{i} 丢弃重叠后无剩余帧，跳过")
+                continue
+            # 2) 硬锚定：下一段首帧 = 上一段尾帧（像素级相等）
+            prev_last = all_frames[-1]
+            head[0] = prev_last.copy()
+            # 3) 软化：从上一段尾帧向本段自身运动做 B 帧交叉淡化，避免 1 帧静止感
+            B = max(1, min(int(blend_frames), len(head) - 1))
+            for j in range(1, B + 1):
+                alpha = j / (B + 1)
+                head[j] = cv2.addWeighted(prev_last, 1.0 - alpha, head[j], alpha, 0)
+            all_frames.extend(head)
+            report.append(f"  ↳ 帧锚定: 首帧←上段尾帧, 软化 {B} 帧")
         report.append(f"  总帧数: {len(all_frames)}, 时长: {len(all_frames) / fps:.1f}s")
         return self._write_frames(all_frames, output_path, fps, width, height)
 

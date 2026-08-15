@@ -158,15 +158,18 @@ class NodeMap:
         return bool(self.animate_embeds and self.sampler and self.text_encode)
 
 
-# ⚠️ 拼接模式本质澄清（2026-08-12 用户反馈后纠正）：
+# ⚠️ 拼接模式本质澄清（2026-08-15 用户实测反馈后再次纠正）：
 #   用户实测并明确指出——以下三种**事后混合**模式，无论像素层还是 latent 层，
 #   本质都只是在「两段视频的两端之间做转场/淡化」，**不是真正的连贯无缝拼接**：
 #     · STITCH_LATENT_BLEND   = 潜空间 latent 交叉淡化（= latent 层面的淡入淡出转场）
 #     · STITCH_SEAMLESS_BLEND = 段间像素级短窗交叉溶解
 #     · STITCH_CROSS_DISSOLVE = 像素交叉淡化
-#   真正的「无感一镜到底」必须**在生成侧就让多段天然连续**（context_options 滑动窗口 +
-#   跨段 reference_latent 续写），拼接阶段只需 STITCH_SEAMLESS 硬切丢重叠帧即可看不出接缝。
-#   故：本机推荐拼接模式 = STITCH_SEAMLESS（零混合硬切），配合上方『无缝连贯方案』使用。
+#   而且实测证实：生成侧「跨段 reference_latent 续写」在本节点里本质只是 i2v 首帧弱偏置，
+#   被 4 步蒸馏洗掉、名不副实，多段仍不连贯。故真无缝不能只靠生成侧。
+#   真正可靠的真无缝 = 拼接阶段的「帧锚定」：丢弃生成侧重叠头帧后，**硬把下一段首帧
+#   替换为上一段尾帧(像素级相等)**，再短窗交叉淡化软化 → 100% 保证「下一段首帧=上一段尾帧」，
+#   段边界像素级连续、硬切即无缝，且可离线验证。对应 STITCH_FRAME_ANCHOR（⭐推荐）。
+#   STITCH_SEAMLESS 现等价帧锚定（兼容旧标签）；自动模式在 SCAIL 路线默认即走帧锚定。
 STITCH_HARD_CUT = "hard_cut"
 STITCH_CROSS_DISSOLVE = "cross_dissolve"
 STITCH_LATENT_BLEND = "latent_blend"
@@ -176,6 +179,11 @@ STITCH_AUTO = "auto"
 # 与「无缝连贯方案（生成侧连续）」配合时，段边界本身连续，硬切即看不出接缝。
 # 注意：若生成侧未做连续（旧多段独立生成），硬切反而会暴露跳变——此时才是上三种混合的「兜底化妆」。
 STITCH_SEAMLESS = "seamless"
+# 帧锚定一镜到底（⭐推荐真无缝）：拼接阶段确定性像素锚定——丢弃生成侧重叠头帧后，
+# 硬把下一段首帧替换为上一段尾帧(像素级相等)，再向后做短窗交叉淡化软化。
+# 与依赖生成侧 reference_latent 续写(被 4 步蒸馏洗掉、名不副实)不同，本模式在拼接阶段
+# 100% 保证「下一段首帧=上一段尾帧」，段边界像素级连续、硬切即无缝，且可离线验证。
+STITCH_FRAME_ANCHOR = "frame_anchor"
 # 兼容别名：旧 UI 里称为「重叠混合」的拼接模式，本质仍是转场（见上方澄清），保留以防旧工作流断链。
 STITCH_SEAMLESS_BLEND = "seamless_blend"
 
@@ -186,8 +194,10 @@ STITCH_LABELS = [
     # 自动放首位并作默认：跟随后端/连贯方案自动选最优（详见 composer._continuity_capable 分支），
     # 用户在「分段规划」选完 A/B/暖启动后，这里保持「自动」即可，不必再选第二次。
     (STITCH_AUTO,           "自动(跟随方案最优)"),
-    # 真·零转场一镜到底：配合 SCAIL-2 路线的生成侧连续(reference_latent 续写)，多段硬切丢重叠帧即无感衔接。
-    (STITCH_SEAMLESS,       "无缝一镜到底(零转场·硬切)"),
+    # ⭐推荐真无缝：拼接阶段确定性像素锚定(下一段首帧=上一段尾帧)，不依赖生成侧 latent 链。
+    (STITCH_FRAME_ANCHOR,   "帧锚定一镜到底(首帧=尾帧)⭐"),
+    # 零转场硬切：现同样在拼接阶段做首帧锚定(等价于帧锚定)，保留作兼容性标签。
+    (STITCH_SEAMLESS,       "无缝一镜到底(零转场·首帧锚定)"),
     (STITCH_CROSS_DISSOLVE, "交叉淡化[转场]"),
     (STITCH_SEAMLESS_BLEND, "无缝一镜到底(重叠混合)[转场]"),
     # 旧称「真·一镜到底（潜空间拼接）⭐推荐」是误导——它本质是 latent 层交叉淡化(转场)，并非真无缝；改名并去⭐。
