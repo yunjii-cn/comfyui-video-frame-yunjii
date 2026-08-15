@@ -183,16 +183,24 @@ STITCH_SEAMLESS_BLEND = "seamless_blend"
 # 显示用中文，比较/存储仍用英文值；旧已保存的英文值（auto/transition...）仍兼容。
 # 📌 标签后缀标注 [转场] 以直观提示用户：凡标 [转场] 的都是事后混合、非真无缝。
 STITCH_LABELS = [
-    (STITCH_LATENT_BLEND,   "真·一镜到底（潜空间拼接）⭐推荐[转场]"),
+    # 真·零转场一镜到底：配合 SCAIL-2 路线的生成侧连续(reference_latent 续写)，多段硬切丢重叠帧即无感衔接。
     (STITCH_SEAMLESS,       "无缝一镜到底(零转场·硬切)"),
+    (STITCH_CROSS_DISSOLVE, "交叉淡化[转场]"),
+    (STITCH_SEAMLESS_BLEND, "无缝一镜到底(重叠混合)[转场]"),
+    # 旧称「真·一镜到底（潜空间拼接）⭐推荐」是误导——它本质是 latent 层交叉淡化(转场)，并非真无缝；改名并去⭐。
+    (STITCH_LATENT_BLEND,   "潜空间交叉淡化(转场)"),
     (STITCH_HARD_CUT,       "硬切"),
     (STITCH_AUTO,           "自动"),
-    (STITCH_SEAMLESS_BLEND, "无缝一镜到底(重叠混合)[转场]"),
-    (STITCH_CROSS_DISSOLVE, "交叉淡化[转场]"),
     (STITCH_TRANSITION,     "ffmpeg转场"),
 ]
 STITCH_LABEL_TO_VALUE = {label: value for value, label in STITCH_LABELS}
 STITCH_LABEL_TO_VALUE.update({value: value for value, _ in STITCH_LABELS})  # 旧英文值也能归一
+# 旧版标签 → 当前值：改名前的误导标签串需仍能归一，避免旧工作流静默回退默认。
+_LEGACY_STITCH_LABELS = {
+    "真·一镜到底（潜空间拼接）⭐推荐[转场]": STITCH_LATENT_BLEND,
+    "无缝一镜到底(零转场·硬切)":           STITCH_SEAMLESS,  # 曾用同名微调，稳妥兼容
+}
+STITCH_LABEL_TO_VALUE.update(_LEGACY_STITCH_LABELS)
 
 SEGMENT_MODE_ONE_SHOT = "一镜到底"
 SEGMENT_MODE_SMART_SPLIT = "智能分段"

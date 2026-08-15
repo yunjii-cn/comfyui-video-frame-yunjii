@@ -168,15 +168,24 @@ class YunjiiVideoImitator:
         if _plan_mode == SEGMENT_MODE_ONE_SHOT and 拼接模式 == STITCH_HARD_CUT:
             info("Imitator", "生成模式=一镜到底，硬切会暴露段边界跳变，强制回退「无缝一镜到底(重叠混合)」")
             拼接模式 = STITCH_SEAMLESS_BLEND
-        elif (not _plan_single_pass) and 拼接模式 in (STITCH_SEAMLESS, STITCH_LATENT_BLEND):
-            # 多段(A/B)默认零转场硬切会把段边界跳变暴露给用户(实测：硬切+画面跳)。
-            # 真·潜空间交叉淡化(STITCH_LATENT_BLEND)只在段间真正重叠(overlap_prev>0,
-            # 即连续生成)时才淡化；多段独立去噪时各段 overlap_prev=0 → 直接 torch.cat 硬切。
-            # 故多段默认改为「交叉淡化」：用 淡化帧数 在接缝处做像素级交叉溶解，不依赖段间重叠，
-            # 对任意独立生成段都能平滑过渡(驱动视频姿态连续时接缝近乎无感)。这才是多段自然连贯的可靠路径。
-            # (STITCH_LATENT_BLEND 仍保留为显式选项：当用户确用连续重叠段时效果更佳。)
-            info("Imitator", "多段拼接默认暴露段边界，升级为「交叉淡化」平滑过渡(不依赖段间重叠)")
+        # —— 零转场硬切尊重规则（08-12 起生成侧连续已生效，此处据后端能力分流）——
+        # 骨骼路线(WanVideo/DirectAdapter) 多段为独立去噪、无生成侧连续 → 硬切/潜空间混合
+        # 会暴露段边界跳变，故升级为「交叉淡化」像素级平滑过渡（不依赖段间重叠）。
+        # SCAIL-2 路线(SCAILAdapter/AnimatePlus) 多段已在生成侧启用 context_options 滑窗
+        #   + 跨段 reference_latent 续写（runner._seamless_on，08-12 根治）——
+        #   多段处于同一条去噪轨迹，硬切丢重叠帧即无感衔接 = 真·零转场一镜到底。
+        # 故：仅骨骼路线多段、或所有路线的 latent_blend，升级为交叉淡化；
+        #     SCAIL-2 路线多段 + STITCH_SEAMLESS(零转场硬切) 一律尊重用户显式选择（真无缝）。
+        _continuity_capable = (生成后端 == "SCAIL-2 路线")
+        if (not _plan_single_pass) and (not _continuity_capable) and 拼接模式 in (STITCH_SEAMLESS, STITCH_LATENT_BLEND):
+            info("Imitator", "骨骼路线多段独立去噪：硬切/潜空间混合会暴露段边界，升级为「交叉淡化」平滑过渡")
             拼接模式 = STITCH_CROSS_DISSOLVE
+        elif (not _plan_single_pass) and 拼接模式 == STITCH_LATENT_BLEND:
+            # latent_blend 仅在段间真正重叠(overlap_prev>0, 生成侧连续)时才有意义；
+            # 独立去噪段 overlap_prev=0 → 纯硬切。统一升级为交叉淡化，避免无重叠时裸硬切跳变。
+            info("Imitator", "多段 latent_blend 升级为「交叉淡化」平滑过渡")
+            拼接模式 = STITCH_CROSS_DISSOLVE
+        # SCAIL-2 路线多段 + STITCH_SEAMLESS(无缝一镜到底·零转场·硬切)：尊重用户选择，不覆盖。
 
         # —— 单一效果模块，份传给两侧（本节点核心价值）——
         effects = 效果模块 or ""
