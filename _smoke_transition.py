@@ -181,6 +181,67 @@ check("T3B 失配大总帧数=40(无丢帧)", n_b == 40, f"n={n_b}")
 check("T3B 自适应淡化兜底生效",
       any("尾帧续接淡化" in r for r in rep_b), "; ".join(rep_b))
 
+# --------------------------------- T4 runner 多段无缝(A) 自动切原生调度路线
+print("=" * 60)
+print("T4: runner 多段无缝(A)+SCAIL-2 → 自动切原生调度(接缝根治)")
+from engine import runner as runner_mod
+import engine.adapters.scail2_native as scail2_native_mod
+
+runner = runner_mod.YunjiiSegmentRunner()
+calls = {"native": 0}
+
+
+def fake_native(plan, *a, **kw):
+    calls["native"] += 1
+    return ("{}", "mock-native-ok", True)
+
+
+runner._run_native_scail2 = fake_native
+orig_avail = scail2_native_mod.is_native_scail2_available
+
+LABEL_A = "短视频·多段无缝（≤15秒，每段画质最好）⭐默认"
+LABEL_WARM = "暖启动·帧续写（上一段末帧接下一段，WanAnimatePlus）"
+
+# 原生包可用 + 多段无缝(A) → 自动切原生调度
+scail2_native_mod.is_native_scail2_available = lambda: True
+try:
+    res = runner.run(plan_json, "", "执行", 1,
+                     生成后端="SCAIL-2 路线", 连贯方案=LABEL_A)
+finally:
+    scail2_native_mod.is_native_scail2_available = orig_avail
+check("T4 原生可用+多段无缝→自动切原生调度", calls["native"] == 1,
+      f"calls={calls['native']}")
+check("T4 原生调度返回透传", res[1] == "mock-native-ok", str(res[1])[:40])
+
+# 原生包不可用 → 回退模板分段路线（不调原生）。
+# 回退后继续走真实模板生成链，测试环境无完整执行器（execution 导入链），
+# 异常预期内——断言只关心「是否误切原生」。
+calls["native"] = 0
+scail2_native_mod.is_native_scail2_available = lambda: False
+try:
+    try:
+        runner.run(plan_json, "", "执行", 1,
+                   生成后端="SCAIL-2 路线", 连贯方案=LABEL_A)
+    except Exception:
+        pass
+finally:
+    scail2_native_mod.is_native_scail2_available = orig_avail
+check("T4 原生不可用→回退模板路线(不调原生)", calls["native"] == 0,
+      f"calls={calls['native']}")
+
+# 暖启动策略 → 不切原生（保持 WanAnimatePlus 模板路线）
+calls["native"] = 0
+scail2_native_mod.is_native_scail2_available = lambda: True
+try:
+    try:
+        runner.run(plan_json, "", "执行", 1,
+                   生成后端="SCAIL-2 路线", 连贯方案=LABEL_WARM)
+    except Exception:
+        pass
+finally:
+    scail2_native_mod.is_native_scail2_available = orig_avail
+check("T4 暖启动策略不切原生", calls["native"] == 0, f"calls={calls['native']}")
+
 # ------------------------------------------------------------------ 汇总
 print("=" * 60)
 n_pass = sum(RESULTS)

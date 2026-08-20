@@ -249,6 +249,27 @@ class YunjiiSegmentRunner:
         is_std_scail_template = (SCAIL_NODE_MARKER in template_text)
 
         if 生成后端 == "SCAIL-2 路线":
+            # —— 多段无缝(A) 接缝根治（2026-08-20，对齐 FaboroHacks 参考工作流）——
+            # FaboroHacks 两个工作流（SCAIL-2 视频换脸/换装）的核心是
+            # SCAIL2SegmentPlanBuilder + SCAIL2ScheduledLongVideoWithSAM：
+            #   · 单节点内循环 chunk，previous_frames 尾帧锚定原生续写（生成长度=keep+overlap，
+            #     头部 overlap 帧被上块尾帧硬约束，接缝在去噪层面连续）；
+            #   · 解码后 discard_head 丢弃锚定头 → 无重复帧；
+            #   · 重叠区颜色校正(_match_chunk_color_like_original)消除段间色差漂移；
+            #   · torch.cat 张量层一次成片 → 根本不存在「分段视频文件再拼接」环节。
+            # 实参对齐：max_chunk_frames=81 / overlap_frames=5（FaboroHacks 验证值）。
+            # 本机已装包且 49 帧实跑验证（2026-08-15），故多段无缝默认走此路线；
+            # 未装包则回退既有模板分段路线（接缝退化为拼接侧帧锚定淡化）并告警。
+            if _strategy == CONTINUITY_MULTI_SEG:
+                from .adapters.scail2_native import is_native_scail2_available
+                if is_native_scail2_available():
+                    info("Runner", "多段无缝(A)+SCAIL-2: 切原生调度式长视频(FaboroHacks同款: "
+                                   "previous_frames尾帧锚定+张量层一次成片, 接缝根治, 无文件拼接环节)")
+                    return self._run_native_scail2(
+                        plan, 视频路径, 参考图, 人物参考图, _precision, 连贯方案,
+                        执行模式, 最大重试, ComfyUI地址)
+                warn("Runner", "未安装 comfyui_scail2_multi_cond, 多段无缝回退模板分段路线"
+                               "(接缝=拼接侧帧锚定淡化, 非根治)")
             # 未提供模板或提供的不是 SCAIL 工作流时，按策略选内置默认：
             # 暖启动(Tier2) 优先用 WanAnimatePlus 参考工作流；否则用标准 SCAIL 子流程。
             if not (is_ap_template or is_std_scail_template):
