@@ -30,8 +30,19 @@ import cv2
 from .scail import SCAILAdapter, DEFAULT_NEGATIVE
 from ..debug_log import info, warn, error as log_error
 
-# WanAnimatePlus SCAIL-2 Embeds 节点的两种 class_type（本机运行版本 vs 磁盘新版）
-AP_SCAIL_EMBEDS_VARIANTS = ("WanAnimatePlus SCAIL_2 Embeds", "WanAnimatePlusSCAIL2Embeds")
+# WanAnimatePlus Embeds 家族 class_type 变体：
+#   · "WanAnimatePlus SCAIL_2 Embeds" / "WanAnimatePlusSCAIL2Embeds"（本机运行版 vs 磁盘新版）
+#   · "WanAnimatePlus AnimateEmbeds"（WanVideoAnimateEmbeds，肥猴【分段队列】Wan2.2 Animate
+#     高配版同款——transition_video/prefix_frames 语义与 SCAIL_2 Embeds 完全同构：
+#     尾21帧嵌画布头、num_frames 自动 +21、Decode 按 canvas_expansion_px 自动裁，
+#     见 ComfyUI-WanAnimatePlus/nodes.py:1266/1420/2971）
+AP_SCAIL_EMBEDS_VARIANTS = (
+    "WanAnimatePlus SCAIL_2 Embeds", "WanAnimatePlusSCAIL2Embeds",
+    "WanAnimatePlus AnimateEmbeds", "WanVideoAnimateEmbeds",
+)
+# 肥猴 SegmentQueueRunner 调度节点（模板常自带）：OUTPUT_NODE=True，若残留在
+# API prompt 里会被 ComfyUI 执行 → 与本引擎分段循环双重调度冲突，必须删除。
+AP_SQR_NODE_TYPES = ("SegmentQueueRunner",)
 AP_SAMPLER_FROM_SETTINGS = "WanAnimatePlus SamplerFromSettings"
 AP_SAMPLER_SETTINGS = "WanAnimatePlus SamplerSettings"
 AP_SAMPLER = "WanAnimatePlus Sampler"
@@ -140,10 +151,15 @@ class AnimatePlusSCAILAdapter(SCAILAdapter):
         if nm.animate_embeds and nm.animate_embeds in workflow:
             nm.driving_video = self._trace_to_class(
                 workflow, nm.animate_embeds, "pose_images", AP_VHS_LOADVIDEO)
-        # 参考图：沿 embeds.ref_image 向上回溯，找第一个 LoadImage
+        # 参考图：沿 embeds 的参考图输入向上回溯，找第一个 LoadImage。
+        # 输入名兼容两家族：SCAIL_2 Embeds 用 "ref_image"（单数），
+        # AnimateEmbeds 用 "ref_images"（复数，肥猴 Animate 模板）。
         if nm.animate_embeds and nm.animate_embeds in workflow:
-            nm.ref_image = self._trace_to_class(
-                workflow, nm.animate_embeds, "ref_image", AP_LOADIMAGE)
+            for _ref_in in ("ref_image", "ref_images"):
+                nm.ref_image = self._trace_to_class(
+                    workflow, nm.animate_embeds, _ref_in, AP_LOADIMAGE)
+                if nm.ref_image:
+                    break
 
         nm.video_combine = self._select_primary_vhs(vhs_candidates)
         # 供 SCAILAdapter 潜空间落盘/解码复用：combine 取主成片 VHS，decode 取解码节点
@@ -196,6 +212,7 @@ class AnimatePlusSCAILAdapter(SCAILAdapter):
                 and ("class_type" in workflow_raw[first] or "type" in workflow_raw[first]):
             # 已是 API 格式
             api = self._prune_api_missing(dict(workflow_raw))
+            api = self._drop_sqr_nodes(api)
             self._sanitize_numeric_inputs(api)
             self._fix_model_names(api)
             return api
@@ -209,9 +226,31 @@ class AnimatePlusSCAILAdapter(SCAILAdapter):
         full = self._keep_main_chain(full)
         full = self._drop_bypassed(full)
         api = self._convert_full_to_api(full, self._node_class_mappings())
+        api = self._drop_sqr_nodes(api)
         self._sanitize_numeric_inputs(api)
         self._fix_model_names(api)
         info("AnimatePlusAdapter", "prepare_workflow: 整理后 %d 个节点", len(api))
+        return api
+
+    @staticmethod
+    def _drop_sqr_nodes(api):
+        """删除肥猴 SegmentQueueRunner 调度节点（防御双重调度）。
+
+        肥猴 Animate 模板自带 SQR 负责分段循环；本引擎的分段循环由
+        runner/adapter 接管（每段独立提交 prompt），SQR 若残留在 API
+        prompt 里会作为 OUTPUT_NODE 被 ComfyUI 执行，内部再提交分段
+        工作流 → 双重调度/双文件夹/输出错乱。SQR RETURN_TYPES=()，
+        无下游引用，直接 pop 安全。
+        """
+        if not isinstance(api, dict):
+            return api
+        sqr_ids = [nid for nid, nd in api.items()
+                   if isinstance(nd, dict)
+                   and (nd.get("class_type") or nd.get("type", "")) in AP_SQR_NODE_TYPES]
+        for nid in sqr_ids:
+            api.pop(nid, None)
+        if sqr_ids:
+            info("AnimatePlusAdapter", "已删除模板自带 SegmentQueueRunner ×%d（本引擎分段循环接管调度，防双重调度）", len(sqr_ids))
         return api
 
     # ------------------------------------------------------------------

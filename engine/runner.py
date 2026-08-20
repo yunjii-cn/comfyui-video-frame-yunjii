@@ -15,8 +15,10 @@ from .types import (
     SEGMENT_MODE_ONE_SHOT, REF_STRATEGY_PREV_LAST_FRAME,
     BACKEND_WANVIDEO, BACKEND_SCAIL2, BACKEND_SCAIL2_NATIVE,
     CONTINUITY_MULTI_SEG, CONTINUITY_SINGLE_PASS, CONTINUITY_WARM_START,
+    CONTINUITY_SQR, CONTINUITY_NATIVE,
     CONTINUITY_LABEL_TO_VALUE,
     SEAMLESS_PLAN_A, SEAMLESS_PLAN_B, SEAMLESS_PLAN_C, SEAMLESS_PLAN_AUTO,
+    SEAMLESS_PLAN_SQR, SEAMLESS_PLAN_NATIVE,
     SEAMLESS_PLAN_LABEL_TO_VALUE,
     UNIFIED_PLAN_LABELS, resolve_unified_plan,
 )
@@ -37,11 +39,18 @@ SCAIL_WORKFLOW_DEFAULT = os.path.join(
 )
 SCAIL_NODE_MARKER = "WanVideoAddSCAILReferenceEmbeds"
 
-# WanAnimatePlus SCAIL_2 家族标记（Tier 2 暖启动路线）
-AP_NODE_MARKER = "WanAnimatePlus SCAIL_2 Embeds"
+# WanAnimatePlus 家族标记（Tier 2 暖启动路线）：
+#   · SCAIL_2 Embeds（旧 Tier2 模板，本机实测画质崩坏已回退，仅兜底）
+#   · AnimateEmbeds（肥猴【分段队列】Wan2.2 Animate 高配版同款，transition_video
+#     硬冻结接段机制与本引擎 _inject_transition_video 同构，画质千万级验证）
+AP_NODE_MARKERS = ("WanAnimatePlus SCAIL_2 Embeds", "WanAnimatePlus AnimateEmbeds")
 # Tier 2 内置参考工作流（暖启动可不提供模板，自动用此文件）。
-# 来源：用户云集智能目录下同名丝滑工作流（含 WanAnimatePlus SCAIL_2 Embeds 节点），
-# 复制为 ASCII 命名以便稳定引用；prepare_workflow 会按需转 API 格式。
+# 优先 Animate 版（肥猴云集调优版复制而来，含 SegmentQueueRunner——适配器
+# prepare_workflow 会自动删除该调度节点，由本引擎分段循环接管）；
+# SCAIL_2 版仅兜底（本机实测画质崩坏，见 d77bd30 回滚记录）。
+AP_ANIMATE_WORKFLOW_DEFAULT = os.path.join(
+    PLUGIN_ROOT, "workflows", "Tier2_WanAnimatePlus_Animate_template.json"
+)
 AP_WORKFLOW_DEFAULT = os.path.join(
     PLUGIN_ROOT, "workflows", "Tier2_WanAnimatePlus_SCAIL2_template.json"
 )
@@ -89,12 +98,15 @@ class YunjiiSegmentRunner:
                     "tooltip": "可选效果管线模块列表(JSON数组或逗号分隔)，如 [\"mimic\"]。为空=不启用任何效果，行为与现状完全一致。支持: mimic, cinematic, enhance, creative（cinematic 可设 xfade 高级转场）"}),
                 "连贯方案": (
                     [label for _, label in UNIFIED_PLAN_LABELS],
-                    {"default": "A·标准多段无缝(≤15s) ⭐默认",
+                    {"default": UNIFIED_PLAN_LABELS[0][1],
                      "tooltip": "一镜到底动作模仿的连贯档位（单一入口，已合并旧『连贯策略』+『无缝连贯方案』两个下拉）：\n"
-                                "· A 标准多段无缝(默认)：一般≤15s，多段独立生成、接缝交叉溶解平滑；每段质量最高、可分段重试。\n"
-                                "· B 超长视频无缝：15~30s+，单遍连续采样+context滑窗覆盖全帧=真·零接缝、长视频不劣化(⭐长片推荐)；显存峰值更高、不可分段重试。\n"
-                                "· C 单遍兜底：整片一次去噪、不注入滑窗，>5s画质软，仅对比/兜底。\n"
-                                "· 暖启动(Tier2)：WanAnimatePlus多段+上段真实帧喂回prefix_frames（需SCAIL-2路线+WanAnimatePlus模板）。"},
+                                "· 长视频·单遍滑窗(⭐首选,已验证)：15~30s+，一次提交，整条片子同一条去噪轨迹滑窗生成（81帧一窗/重叠32潜空间融合），不断裂不劣化；不可分段重试。\n"
+                                "· 多段队列·硬冻结接段(肥猴同款)：外部分段，每段开画前把上段成片尾21帧硬冻结为画布头(transition_video)，下段被迫从上段尾帧续演化——生成侧硬保证接缝；可单段重试。\n"
+                                "· 长视频·原生调度无劣化(FaboroHacks同款)：驱动原生 SCAIL-2 长视频节点，节点内多块尾帧锚定、张量层一次成片，无拼接环节；需装 comfyui_scail2_multi_cond。\n"
+                                "· 暖启动·潜空间续写(Tier2)：WanAnimatePlus多段+上段真实帧喂回prefix_frames。\n"
+                                "· 短视频·多段拼接(A)：≤15s，各段独立生成+接缝淡化（事后化妆）；每段质量最高、可分段重试。\n"
+                                "· 兜底·单遍旧方案(C)：不滑窗，>5s画质软，仅对比/兜底。\n"
+                                "· 分段转场·重叠混合：段间叠化转场（非一镜到底）。"},
                 ),
                 "模型精度": (
                     ["fp8", "fp16"],
@@ -164,16 +176,29 @@ class YunjiiSegmentRunner:
             _precision = "fp8"
 
         # —— 统一「连贯方案」下拉归一（合并旧 连贯策略 / 无缝连贯方案 为一个）——
-        # 用户只面对一个选择：A 标准多段无缝 / B 超长视频无缝 / C 单遍兜底 / 暖启动(Tier2)。
+        # 用户只面对一个选择：B 单遍滑窗(首选) / SQR 多段队列 / NATIVE 原生调度 /
+        # 暖启动(Tier2) / A 多段拼接 / C 单遍兜底 / 智能分段。
         # 写回 plan 字段，使下游适配器/拼接按方案生效（即使 planner 未跑、直接拿旧 plan 也能生效）。
         _strategy_from_unified, _seamless, _mode_u = resolve_unified_plan(连贯方案)
-        if _seamless not in (SEAMLESS_PLAN_A, SEAMLESS_PLAN_B, SEAMLESS_PLAN_C, SEAMLESS_PLAN_AUTO):
+        if _seamless not in (SEAMLESS_PLAN_A, SEAMLESS_PLAN_B, SEAMLESS_PLAN_C, SEAMLESS_PLAN_AUTO,
+                             SEAMLESS_PLAN_SQR, SEAMLESS_PLAN_NATIVE):
             _seamless = SEAMLESS_PLAN_AUTO
         if _strategy_from_unified == CONTINUITY_WARM_START:
             _strategy = CONTINUITY_WARM_START
             plan.seamless_plan = SEAMLESS_PLAN_AUTO
             plan.long_video_mode = False
             info("Runner", "连贯方案=暖启动(Tier2): 分段 + 上段真实帧喂回 WanAnimatePlus prefix_frames")
+        elif _strategy_from_unified == CONTINUITY_SQR:
+            _strategy = CONTINUITY_SQR
+            plan.seamless_plan = SEAMLESS_PLAN_SQR
+            plan.long_video_mode = False
+            info("Runner", "连贯方案=多段队列·硬冻结接段(肥猴SQR): 外部分段 + 上段尾21帧注入 "
+                           "transition_video 硬冻结续写, 段间首尾相接")
+        elif _strategy_from_unified == CONTINUITY_NATIVE:
+            _strategy = CONTINUITY_NATIVE
+            plan.seamless_plan = SEAMLESS_PLAN_NATIVE
+            plan.long_video_mode = True
+            info("Runner", "连贯方案=长视频·原生调度无劣化(FaboroHacks): 原生节点内多块锚定一次成片")
         elif _seamless == SEAMLESS_PLAN_A:
             _strategy = CONTINUITY_MULTI_SEG
             plan.seamless_plan = SEAMLESS_PLAN_A
@@ -195,7 +220,8 @@ class YunjiiSegmentRunner:
             # auto：沿用计划内 continuity_strategy / seamless_plan（兼容旧 plan JSON）
             _strategy = getattr(plan, "continuity_strategy", "") or CONTINUITY_MULTI_SEG
             _strategy = CONTINUITY_LABEL_TO_VALUE.get(_strategy, _strategy)
-            if _strategy not in (CONTINUITY_MULTI_SEG, CONTINUITY_SINGLE_PASS, CONTINUITY_WARM_START):
+            if _strategy not in (CONTINUITY_MULTI_SEG, CONTINUITY_SINGLE_PASS, CONTINUITY_WARM_START,
+                                CONTINUITY_SQR, CONTINUITY_NATIVE):
                 _strategy = CONTINUITY_MULTI_SEG
             plan.seamless_plan = getattr(plan, "seamless_plan", "") or SEAMLESS_PLAN_AUTO
         if _strategy == CONTINUITY_MULTI_SEG:
@@ -227,10 +253,15 @@ class YunjiiSegmentRunner:
                 summary += f"  段{seg.index}: 帧{seg.start_frame}-{seg.end_frame}, {seg.target_frames}帧, 参考={seg.ref_strategy}\n"
             return (段落计划, summary, True)
 
-        # —— 原生 SCAIL-2 长视频后端：直驱 comfyui_scail2_multi_cond 调度节点（一镜到底动作模仿）——
-        # 与既有「骨骼/SCAIL-2 路线」(模板工作流 + 分段循环) 完全正交：原生节点内部自行调度分段，
-        # 故不走下面的模板预处理/分段循环，单独构造自包含 prompt 后交给内联执行器。
-        if 生成后端 == "原生 SCAIL-2 长视频(一镜到底)":
+        # —— 原生 SCAIL-2 长视频：直驱 comfyui_scail2_multi_cond 调度节点（一镜到底动作模仿）——
+        # 两个显式入口（不再有隐式自动切换，方案边界清晰）：
+        #   ① 生成后端 = 「原生 SCAIL-2 长视频(一镜到底)」；
+        #   ② 连贯方案 = 「长视频·原生调度无劣化(FaboroHacks同款)」。
+        # 原生节点内部自行调度分段（previous_frames 尾帧锚定 + torch.cat 张量层
+        # 一次成片，无文件拼接环节），故不走下面的模板预处理/分段循环。
+        if 生成后端 == "原生 SCAIL-2 长视频(一镜到底)" or _strategy == CONTINUITY_NATIVE:
+            if _strategy == CONTINUITY_NATIVE and 生成后端 == "骨骼路线(WanVideo)":
+                info("Runner", "连贯方案=原生调度: 无视骨骼后端选择, 直驱原生 SCAIL-2 长视频节点")
             return self._run_native_scail2(
                 plan, 视频路径, 参考图, 人物参考图, _precision, 连贯方案, 执行模式, 最大重试, ComfyUI地址)
 
@@ -245,47 +276,34 @@ class YunjiiSegmentRunner:
             except Exception as e:
                 return ("", f"⚠ 无法读取模板文件 {工作流模板}: {e}", False)
         # 模板所含 SCAIL 家族判定（基于内容）
-        is_ap_template = (AP_NODE_MARKER in template_text)
+        is_ap_template = any(m in template_text for m in AP_NODE_MARKERS)
         is_std_scail_template = (SCAIL_NODE_MARKER in template_text)
 
         if 生成后端 == "SCAIL-2 路线":
-            # —— 多段无缝(A) 接缝根治（2026-08-20，对齐 FaboroHacks 参考工作流）——
-            # FaboroHacks 两个工作流（SCAIL-2 视频换脸/换装）的核心是
-            # SCAIL2SegmentPlanBuilder + SCAIL2ScheduledLongVideoWithSAM：
-            #   · 单节点内循环 chunk，previous_frames 尾帧锚定原生续写（生成长度=keep+overlap，
-            #     头部 overlap 帧被上块尾帧硬约束，接缝在去噪层面连续）；
-            #   · 解码后 discard_head 丢弃锚定头 → 无重复帧；
-            #   · 重叠区颜色校正(_match_chunk_color_like_original)消除段间色差漂移；
-            #   · torch.cat 张量层一次成片 → 根本不存在「分段视频文件再拼接」环节。
-            # 实参对齐：max_chunk_frames=81 / overlap_frames=5（FaboroHacks 验证值）。
-            # 本机已装包且 49 帧实跑验证（2026-08-15），故多段无缝默认走此路线；
-            # 未装包则回退既有模板分段路线（接缝退化为拼接侧帧锚定淡化）并告警。
-            if _strategy == CONTINUITY_MULTI_SEG:
-                from .adapters.scail2_native import is_native_scail2_available
-                if is_native_scail2_available():
-                    info("Runner", "多段无缝(A)+SCAIL-2: 切原生调度式长视频(FaboroHacks同款: "
-                                   "previous_frames尾帧锚定+张量层一次成片, 接缝根治, 无文件拼接环节)")
-                    return self._run_native_scail2(
-                        plan, 视频路径, 参考图, 人物参考图, _precision, 连贯方案,
-                        执行模式, 最大重试, ComfyUI地址)
-                warn("Runner", "未安装 comfyui_scail2_multi_cond, 多段无缝回退模板分段路线"
-                               "(接缝=拼接侧帧锚定淡化, 非根治)")
             # 未提供模板或提供的不是 SCAIL 工作流时，按策略选内置默认：
-            # 暖启动(Tier2) 优先用 WanAnimatePlus 参考工作流；否则用标准 SCAIL 子流程。
+            # 暖启动(Tier2)/多段队列(SQR) 用 WanAnimatePlus 家族；否则标准 SCAIL 子流程。
             if not (is_ap_template or is_std_scail_template):
-                # 仅暖启动(Tier2) 默认用 WanAnimatePlus 家族模板（prefix_frames 帧续写）。
-                # 多段无缝(A) 一律走标准官方 SCAIL 子流程——2026-08-20 实测回归教训：
-                # 内置 Tier2 模板在本机画质崩坏(无动作迁移/画面粗糙)且输出目录不同
-                # (yunjii_tier2 vs yunjii_v2v 造成双文件夹)，不得作为多段默认。
-                # transition_video 尾帧硬冻结(animateplus._inject_transition_video)保留，
-                # 仅当用户显式提供 WanAnimatePlus 家族模板/暖启动路线时生效。
-                if _strategy == CONTINUITY_WARM_START and os.path.isfile(AP_WORKFLOW_DEFAULT):
+                # 2026-08-20 升级：AP 家族默认模板优先 Animate 版（肥猴【分段队列】
+                # Wan2.2 Animate 高配版-云集调优同款基座，AnimateEmbeds 的
+                # transition_video 硬冻结接段与本引擎 _inject_transition_video 同构，
+                # 画质经肥猴用户群验证）；旧 SCAIL_2 版仅兜底（本机实测画质崩坏，
+                # 见 d77bd30 回滚记录）。多段拼接(A) 一律走标准官方 SCAIL 子流程——
+                # 不得作为其默认（双文件夹教训）。
+                if _strategy in (CONTINUITY_WARM_START, CONTINUITY_SQR):
+                    _tier2_tpl = (AP_ANIMATE_WORKFLOW_DEFAULT
+                                  if os.path.isfile(AP_ANIMATE_WORKFLOW_DEFAULT)
+                                  else AP_WORKFLOW_DEFAULT)
+                else:
+                    _tier2_tpl = ""
+                if _tier2_tpl and os.path.isfile(_tier2_tpl):
                     try:
-                        with open(AP_WORKFLOW_DEFAULT, "r", encoding="utf-8") as f:
+                        with open(_tier2_tpl, "r", encoding="utf-8") as f:
                             template_text = f.read()
-                        info("Runner", "暖启动(Tier2): 使用内置 WanAnimatePlus 参考工作流 %s", AP_WORKFLOW_DEFAULT)
+                        info("Runner", "%s: 使用内置 WanAnimatePlus 参考工作流 %s",
+                             "多段队列(SQR)" if _strategy == CONTINUITY_SQR else "暖启动(Tier2)",
+                             _tier2_tpl)
                     except Exception as e:
-                        return ("", f"⚠ 无法读取内置 Tier2 模板 {AP_WORKFLOW_DEFAULT}: {e}", False)
+                        return ("", f"⚠ 无法读取内置 Tier2 模板 {_tier2_tpl}: {e}", False)
                     is_ap_template = True
                 elif os.path.isfile(SCAIL_WORKFLOW_DEFAULT):
                     try:
@@ -298,24 +316,30 @@ class YunjiiSegmentRunner:
                 elif not template_text:
                     return ("", "⚠ SCAIL-2 路线缺少工作流模板，请粘贴 ComfyUI 工作流JSON或输入JSON文件路径", False)
             # 重判模板家族（若上面填了默认，或用户直接粘贴内容）
-            is_ap_template = (AP_NODE_MARKER in template_text)
+            is_ap_template = any(m in template_text for m in AP_NODE_MARKERS)
             is_std_scail_template = (SCAIL_NODE_MARKER in template_text)
             # 显式『生成质量模式』开关：默认『标准 SCAIL 真骨架』= 强制真骨架多段
             # (禁用暖启动续写)。仅当模板为 WanAnimatePlus 家族且用户显式选
-            # 『WanAnimatePlus 暖启动(Tier2)』时才允许暖启动；用户真实 WanAnimatePlus
-            # 模板选默认即走真骨架多段(高保真,非 Tier2 续写)。
+            # 『WanAnimatePlus 暖启动(Tier2)』/『多段队列(SQR)』时才允许续写类策略；
+            # 用户真实 WanAnimatePlus 模板选默认即走真骨架多段(高保真,非续写)。
             _quality = 生成质量模式 or "标准 SCAIL 真骨架（推荐）"
-            if _quality == "标准 SCAIL 真骨架（推荐）" and is_ap_template:
+            if _quality == "标准 SCAIL 真骨架（推荐）" and is_ap_template \
+                    and _strategy not in (CONTINUITY_WARM_START, CONTINUITY_SQR):
                 _strategy = CONTINUITY_MULTI_SEG
-            if _strategy == CONTINUITY_WARM_START and not (is_ap_template or is_std_scail_template):
-                # 暖启动两大家族均支持：
-                #  · WanAnimatePlus SCAIL_2 → prefix_frames 帧级硬冻结暖启动
-                #  · 标准 WanVideoWrapper SCAIL → WanVideoSamplerv2.samples latent 暖启动(D-A 方案)
-                # 两者都不是(非 SCAIL 模板)才拒绝，给出明确指引而非静默降级。
-                return ("", "⚠ 暖启动需要一个『SCAIL-2』工作流模板"
-                                "（WanAnimatePlus 含 prefix_frames 入口，或标准 WanVideoWrapper SCAIL 走 latent 暖启动）。"
-                                "请在『工作流模板』中粘贴对应工作流 JSON 或其文件路径，"
-                                "或确认已放置内置参考工作流。", False)
+            if _strategy in (CONTINUITY_WARM_START, CONTINUITY_SQR) and not is_ap_template:
+                # SQR 必须走 WanAnimatePlus 家族（transition_video 注入入口）；
+                # 暖启动两大家族均支持（WanAnimatePlus prefix_frames /
+                # 标准 WanVideoWrapper latent 暖启动 D-A 方案）。
+                if _strategy == CONTINUITY_SQR:
+                    return ("", "⚠ 多段队列·硬冻结接段(SQR) 需要『WanAnimatePlus』家族工作流模板"
+                                    "（AnimateEmbeds/SCAIL_2 Embeds 的 transition_video 入口）。"
+                                    "请在『工作流模板』中粘贴对应工作流 JSON 或其文件路径，"
+                                    "或确认内置参考工作流已放置。", False)
+                if not is_std_scail_template:
+                    return ("", "⚠ 暖启动需要一个『SCAIL-2』工作流模板"
+                                    "（WanAnimatePlus 含 prefix_frames 入口，或标准 WanVideoWrapper SCAIL 走 latent 暖启动）。"
+                                    "请在『工作流模板』中粘贴对应工作流 JSON 或其文件路径，"
+                                    "或确认已放置内置参考工作流。", False)
             if _strategy == CONTINUITY_SINGLE_PASS and is_ap_template:
                 warn("Runner", "单遍连贯(方案C) 在 WanAnimatePlus 家族不支持，回退为『多段无缝』运行该模板")
         elif not template_text:
@@ -485,13 +509,16 @@ class YunjiiSegmentRunner:
                     or (_quality == "标准 SCAIL 真骨架（推荐）")
                     or (_strategy == CONTINUITY_MULTI_SEG)
                 )
-                # 上段成片路径：仅暖启动(Tier2)策略传递（AnimatePlus 家族用于
-                # transition_video/prefix 续写）。多段无缝(A)不传——2026-08-20 回滚：
-                # 曾对 SCAIL 两大家族都传导致每段注入 latent 暖启动(reference_latent)，
-                # 叠加 Tier2 模板画质崩坏；多段无缝连续性由「重叠32 + 拼接侧帧锚定」
-                # 承担（3efa21f 验证基线）。骨骼路线(DirectAdapter)同样不传。
-                _prev_vp = prev_video_path if (seg.index > 0 and _strategy == CONTINUITY_WARM_START) else ""
-                _latent_warmstart = _seamless_on and seg.index > 0
+                # 上段成片路径：暖启动(Tier2)/多段队列(SQR) 传递（AnimatePlus 家族用于
+                # transition_video 硬冻结(主)/prefix 续写(兜底)）。多段拼接(A)不传——
+                # 2026-08-20 回滚教训：曾对 SCAIL 两大家族都传导致每段注入 latent
+                # 暖启动(reference_latent)，叠加 Tier2 模板画质崩坏；A 的连续性由
+                # 「重叠32 + 拼接侧帧锚定」承担（3efa21f 验证基线）。
+                # SQR 例外：段间重叠=0、连续性全靠 transition_video 硬冻结，
+                # 必须传上段成片；且禁用 latent 暖启动（与硬冻结机制冲突）。
+                _is_sqr = (_strategy == CONTINUITY_SQR)
+                _prev_vp = prev_video_path if (seg.index > 0 and _strategy in (CONTINUITY_WARM_START, CONTINUITY_SQR)) else ""
+                _latent_warmstart = _seamless_on and seg.index > 0 and not _is_sqr
                 wf = gen_adapter.modify_workflow_for_segment(
                     workflow, node_map, seg, current_ref, pose_dir, run_id,
                     user_ref_path=ref_image_path, prev_video_path=_prev_vp,

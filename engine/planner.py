@@ -9,8 +9,10 @@ from .types import (
     REF_STRATEGY_USER_IMAGE, REF_STRATEGY_PREV_LAST_FRAME, REF_STRATEGY_AUTO_SELECT,
     BACKEND_WANVIDEO, BACKEND_SCAIL2,
     CONTINUITY_MULTI_SEG, CONTINUITY_SINGLE_PASS, CONTINUITY_WARM_START,
+    CONTINUITY_SQR, CONTINUITY_NATIVE,
     CONTINUITY_AUTO, CONTINUITY_LABEL_TO_VALUE, CONTINUITY_LABELS,
     SEAMLESS_PLAN_A, SEAMLESS_PLAN_B, SEAMLESS_PLAN_C, SEAMLESS_PLAN_AUTO,
+    SEAMLESS_PLAN_SQR, SEAMLESS_PLAN_NATIVE,
     SEAMLESS_PLAN_LABELS, SEAMLESS_PLAN_LABEL_TO_VALUE,
     UNIFIED_PLAN_DEFAULT, UNIFIED_PLAN_LABELS, resolve_unified_plan,
 )
@@ -46,19 +48,21 @@ class YunjiiSegmentPlanner:
                 "运动提示词": ("STRING", {"default": "", "tooltip": "来自运动分析节点的运动提示词"}),
                 "连贯方案": (
                     [label for _, label in UNIFIED_PLAN_LABELS],
-                    {"default": "短视频·多段无缝（≤15秒，每段画质最好）⭐默认",
+                    {"default": UNIFIED_PLAN_LABELS[0][1],
                      "tooltip": "一镜到底动作模仿的连贯方案（唯一入口，已合并旧『生成模式/连贯策略/无缝连贯方案』三个下拉）。\n"
-                                "按你的视频长度和需求选一项即可：\n"
-                                "· 短视频·多段无缝（默认）：做 ≤15秒 的短片。分成几段各自生成、再无缝拼起来，每段画质最好，某段不满意还能单独重做。\n"
-                                "· 长视频·单遍真无缝：做 15~30秒以上 的长片。整段一次性生成，画面从头到尾真正连续、不断裂也不发糊（⭐长片推荐）。\n"
-                                "· 兜底·单遍旧方案：整片单遍生成＋81帧滑窗防劣化（画质与B一致）；超过「单遍时长上限」自动回退多段无缝。\n"
-                                "· 暖启动·帧续写：高级玩法，用上一段的最后一帧接着生成下一段（需 WanAnimatePlus 模板）。\n"
-                                "· 分段转场·重叠混合：每段独立生成、段与段之间做叠化转场，适合需要明显转场效果的视频（不是一镜到底连续）。"},
+                                "按你的视频长度和需求选一项即可（机制互不重叠，各管一摊）：\n"
+                                "· 长视频·单遍滑窗（⭐首选，已验证）：15~30秒+ 长片。一次提交，整条片子在同一条去噪轨迹上滑窗生成（81帧一窗/重叠32潜空间融合），全程不断裂不劣化。不可分段重试。\n"
+                                "· 多段队列·硬冻结接段（肥猴同款）：外部分段生成，每段开画前把上一段成片的最后21帧硬冻结为画布头（transition_video），下段被迫从上段尾帧继续演化——生成侧硬保证接缝连续。可单段重试。段间重叠自动锁0（首尾相接）。\n"
+                                "· 长视频·原生调度无劣化（FaboroHacks同款）：驱动原生 SCAIL-2 长视频节点，节点内部按81帧分块、上块尾帧在去噪层锚定下块头部，张量层一次成片——压根没有「分段文件再拼接」环节，接缝物理不存在。需已安装 comfyui_scail2_multi_cond。\n"
+                                "· 暖启动·潜空间续写（Tier2）：分段 + 上段末帧喂回 WanAnimatePlus，弱锚定，拼接侧淡化兜底。\n"
+                                "· 短视频·多段拼接：≤15秒短片。各段独立生成、接缝处淡化混合（事后化妆，非真连续），每段画质最好、可单独重做。\n"
+                                "· 兜底·单遍旧方案：不滑窗的单遍生成，长视频画质偏软，仅对比/兜底。\n"
+                                "· 分段转场·重叠混合：段间做叠化转场，适合要明显转场效果的视频（非一镜到底）。"},
                 ),
                 "每段最大帧数": ("INT", {"default": 81, "min": 9, "max": 257, "step": 4,
                     "tooltip": "4k+1格式: 41/61/81/85/89/121"}),
                 "重叠帧数": ("INT", {"default": 8, "min": 0, "max": 32, "step": 1,
-                    "tooltip": "段间重叠区域大小。SCAIL-2 路线自动锁定为32（8 latent帧，猴子工作流验证的自然连贯方案）；骨骼路线交叉淡化用"}),
+                    "tooltip": "段间重叠区域大小。智能分段(SCAIL-2)自动锁32；多段队列·硬冻结接段自动锁0（首尾相接，transition_video 时序前提）；骨骼路线交叉淡化用"}),
                 "目标分辨率": (
                     ["832x480", "480x832", "1280x720", "720x1280"],
                     {"default": "832x480"},
@@ -100,7 +104,8 @@ class YunjiiSegmentPlanner:
         _strategy_from_unified, seamless_plan, mode = resolve_unified_plan(连贯方案)
 
         backend = BACKEND_SCAIL2 if 生成后端 == "SCAIL-2 路线" else BACKEND_WANVIDEO
-        if backend == BACKEND_SCAIL2 and mode != SEGMENT_MODE_ONE_SHOT:
+        if backend == BACKEND_SCAIL2 and mode != SEGMENT_MODE_ONE_SHOT \
+                and _strategy_from_unified != CONTINUITY_SQR:
             # SCAIL-2 分块：每段固定 81 帧（沿用官方）。
             # 段间重叠锁定为 32 像素帧（对齐『三层楼的小肥猴』Wan2.2 Animate 工作流
             #   WanVideoContextOptions 的 context_overlap=32 → 8 latent 帧）；VAE 时间压缩≈4x
@@ -153,6 +158,22 @@ class YunjiiSegmentPlanner:
         if _strategy_from_unified == CONTINUITY_WARM_START:
             strategy = CONTINUITY_WARM_START
             info("Planner", "连贯方案=暖启动·帧续写: 分段 + 上段真实帧喂回 WanAnimatePlus prefix_frames")
+        elif _strategy_from_unified == CONTINUITY_SQR:
+            # 多段队列·硬冻结接段（肥猴SQR同款）：外部分段 + 上段成片尾21帧注入
+            # Embeds.transition_video 硬冻结续写。硬性要求：段间驱动时序**首尾相接
+            # （重叠=0）**，否则驱动信号「时间回跳」——transition 冻结的是上段尾帧，
+            # 若段间有重叠，本段驱动会从重叠区重新演一遍。
+            strategy = CONTINUITY_SQR
+            if backend == BACKEND_SCAIL2:
+                重叠帧数 = 0
+                info("Planner", "连贯方案=多段队列·硬冻结接段(肥猴SQR): 段间重叠锁0(首尾相接, "
+                               "transition_video硬冻结续写的时序前提)")
+        elif _strategy_from_unified == CONTINUITY_NATIVE:
+            # 原生调度式长视频（FaboroHacks同款）：runner 直驱原生节点内部调度分段，
+            # planner 段帧规则不影响其执行（原生节点 max_chunk_frames=81 自行切块），
+            # 此处仅透传策略标识，保持计划完整性（段数/总帧数供 max_frames 汇总）。
+            strategy = CONTINUITY_NATIVE
+            info("Planner", "连贯方案=长视频·原生调度无劣化(FaboroHacks): 原生节点内多块锚定一次成片")
         elif seamless_plan == SEAMLESS_PLAN_A:
             strategy = CONTINUITY_MULTI_SEG
             info("Planner", "连贯方案=短视频·多段无缝(默认): 分段各自生成+无缝拼接, 一般≤15s")

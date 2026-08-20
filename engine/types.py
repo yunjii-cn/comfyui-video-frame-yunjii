@@ -229,6 +229,13 @@ SEGMENT_MODE_SLIDING_WINDOW = "滑动窗口"
 CONTINUITY_MULTI_SEG = "multi_seg"
 CONTINUITY_SINGLE_PASS = "single_pass"
 CONTINUITY_WARM_START = "warm_start"
+# 多段队列·硬冻结接段（肥猴SQR同款）：外部分段 + 上段成片尾21帧注入
+# Embeds.transition_video 硬冻结续写，段间驱动时序首尾相接（重叠=0）。
+CONTINUITY_SQR = "sqr_queue"
+# 原生调度式长视频（FaboroHacks同款）：直驱 comfyui_scail2_multi_cond 的
+# SCAIL2ScheduledLongVideoWithSAM，节点内多chunk + previous_frames 尾帧锚定，
+# torch.cat 张量层一次成片（无文件拼接环节，接缝物理不存在）。
+CONTINUITY_NATIVE = "native_scheduled"
 CONTINUITY_AUTO = "auto"  # 兼容旧 单遍连贯模式 bool 的未显式选择态
 
 CONTINUITY_LABELS = [
@@ -267,10 +274,12 @@ REF_STRATEGY_AUTO_SELECT = "auto_select"
 # 注意：A/B 是主推互补路线（A 用于短、B 用于长），C 仅备选。三者都与「连贯策略(Warm_start/Tier2)」正交，
 #   Tier2 像素 prefix 冻结已证实弱于本机制，故本下拉默认即取代 Tier2 成为无缝主方案。
 SEAMLESS_PLAN_A = "seamless_A"        # 标准多段无缝（一般时长）
-SEAMLESS_PLAN_B = "seamless_B"        # 超长视频无缝（长程防漂移增强）
+SEAMLESS_PLAN_B = "seamless_B"        # 超长视频无缝（单遍滑窗，已实机验证）
 SEAMLESS_PLAN_C = "seamless_C"        # 单遍连贯（旧方案C，兜底）
 SEAMLESS_PLAN_AUTO = "seamless_auto"  # 兼容旧：按连贯策略归一
 SEAMLESS_PLAN_SMART_SPLIT = "seamless_smart_split"  # 智能分段(转场编排)：独立分段+重叠混合过渡
+SEAMLESS_PLAN_SQR = "seamless_sqr"    # 多段队列·硬冻结接段（肥猴SQR同款）
+SEAMLESS_PLAN_NATIVE = "seamless_native"  # 原生调度式长视频（FaboroHacks同款）
 
 SEAMLESS_PLAN_LABELS = [
     (SEAMLESS_PLAN_A, "A方案·标准多段无缝(独立生成+平滑过渡, ≤15s) ⭐默认"),
@@ -291,14 +300,23 @@ SEAMLESS_PLAN_LABEL_TO_VALUE.update({value: value for value, _ in SEAMLESS_PLAN_
 #   智能分段(转场编排) → multi_seg + seamless_A + mode=智能分段（独立分段+重叠混合过渡，明确要转场时用，非一镜到底）
 # 旧「生成模式」中文/英文值(一镜到底/智能分段/滑动窗口/one_shot/smart_split/sliding_window)由 resolve 归一：
 #   一镜到底/one_shot→A；智能分段/smart_split→智能分段；滑动窗口/sliding_window→B（滑窗无缝）。
-UNIFIED_PLAN_DEFAULT = SEAMLESS_PLAN_A
-# 显示名设计原则（面向小白）：① 以「身份词」开头，5 项一眼可区分；② 紧跟用途(时长/场景)；
+UNIFIED_PLAN_DEFAULT = SEAMLESS_PLAN_B
+# 显示名设计原则（面向小白）：① 以「身份词」开头，一眼可区分；② 紧跟用途(时长/场景)；
 # ③ 末尾点明关键特征或代价；④ 默认/推荐用 ⭐ 标注。内部值(SEAMLESS_PLAN_*)保持不变以兼容旧工作流。
+# 2026-08-20 方案矩阵定版（每项独当一面，机制互不重叠）：
+#   · 单遍滑窗(B)——引擎分段+滑窗latent融合，一次提交，已实机验证 → ⭐首选
+#   · 多段队列(SQR)——肥猴同款：外部分段生成+transition_video硬冻结接段，可单段重试
+#   · 原生调度(NATIVE)——FaboroHacks同款：节点内多块锚定一次成片，无拼接环节
+#   · 暖启动(Tier2)——WanAnimatePlus上段末帧喂回，弱锚定+拼接淡化
+#   · 多段拼接(A)——独立生成+接缝淡化（事后混合，仅化妆）
+#   · 单遍旧方案(C)——不滑窗，长视频画质软，兜底
 UNIFIED_PLAN_LABELS = [
-    (SEAMLESS_PLAN_A,           "短视频·多段无缝（≤15秒，每段画质最好）⭐默认"),
-    (SEAMLESS_PLAN_B,           "长视频·单遍真无缝（15~30秒+，全程不断裂不劣化）"),
+    (SEAMLESS_PLAN_B,           "长视频·单遍滑窗（一次提交全程连贯，已验证✓）⭐首选"),
+    (SEAMLESS_PLAN_SQR,         "多段队列·硬冻结接段（肥猴同款：外部分段+上段尾帧锚定续写）"),
+    (SEAMLESS_PLAN_NATIVE,      "长视频·原生调度无劣化（FaboroHacks同款：节点内多块锚定，一次成片）"),
+    (CONTINUITY_WARM_START,     "暖启动·潜空间续写（Tier2：WanAnimatePlus上段末帧喂回）"),
+    (SEAMLESS_PLAN_A,           "短视频·多段拼接（≤15秒，独立生成+接缝淡化）"),
     (SEAMLESS_PLAN_C,           "兜底·单遍旧方案（长视频画质偏软，不推荐）"),
-    (CONTINUITY_WARM_START,     "暖启动·帧续写（上一段末帧接下一段，WanAnimatePlus）"),
     (SEAMLESS_PLAN_SMART_SPLIT, "分段转场·重叠混合（每段独立，适合做转场效果）"),
 ]
 UNIFIED_PLAN_LABEL_TO_VALUE = {label: value for value, label in UNIFIED_PLAN_LABELS}
@@ -309,13 +327,18 @@ UNIFIED_PLAN_LABEL_TO_VALUE.update({value: value for value, _ in UNIFIED_PLAN_LA
 _LEGACY_UNIFIED_LABELS = {
     "A·标准多段无缝(≤15s) ⭐默认":                          SEAMLESS_PLAN_A,
     "A方案·标准多段无缝(独立生成+平滑过渡, ≤15s) ⭐默认":     SEAMLESS_PLAN_A,
+    "短视频·多段无缝（≤15秒，每段画质最好）⭐默认":           SEAMLESS_PLAN_A,
     "B·超长视频无缝(15~30s+ 单遍滑窗真·无缝)":              SEAMLESS_PLAN_B,
     "B方案·超长视频无缝(单遍滑窗真·无缝, 15~30s+ ⭐长片推荐)": SEAMLESS_PLAN_B,
+    "长视频·单遍真无缝（15~30秒+，全程不断裂不劣化）":        SEAMLESS_PLAN_B,
     "C·单遍兜底(不滑窗, >5s画质软)":                        SEAMLESS_PLAN_C,
     "C方案·单遍兜底(不滑窗, >5s画质软)":                    SEAMLESS_PLAN_C,
+    "兜底·单遍旧方案（长视频画质偏软，不推荐）":              SEAMLESS_PLAN_C,
     "暖启动(Tier2)·WanAnimatePlus上段末帧续写":             CONTINUITY_WARM_START,
+    "暖启动·帧续写（上一段末帧接下一段，WanAnimatePlus）":    CONTINUITY_WARM_START,
     "智能分段(转场编排)·独立分段+重叠混合过渡":              SEAMLESS_PLAN_SMART_SPLIT,
     "智能分段(转场编排)":                                   SEAMLESS_PLAN_SMART_SPLIT,
+    "分段转场·重叠混合（每段独立，适合做转场效果）":           SEAMLESS_PLAN_SMART_SPLIT,
 }
 UNIFIED_PLAN_LABEL_TO_VALUE.update(_LEGACY_UNIFIED_LABELS)
 
@@ -350,12 +373,16 @@ def resolve_unified_plan(value):
     v = UNIFIED_PLAN_LABEL_TO_VALUE.get(v, v)
     if v == CONTINUITY_WARM_START:
         return CONTINUITY_WARM_START, SEAMLESS_PLAN_AUTO, SEGMENT_MODE_ONE_SHOT
+    if v == SEAMLESS_PLAN_SQR:
+        return CONTINUITY_SQR, SEAMLESS_PLAN_SQR, SEGMENT_MODE_ONE_SHOT
+    if v == SEAMLESS_PLAN_NATIVE:
+        return CONTINUITY_NATIVE, SEAMLESS_PLAN_NATIVE, SEGMENT_MODE_ONE_SHOT
     if v == SEAMLESS_PLAN_SMART_SPLIT:
         return None, SEAMLESS_PLAN_A, SEGMENT_MODE_SMART_SPLIT
     if v == SEAMLESS_PLAN_B:
         return None, SEAMLESS_PLAN_B, SEGMENT_MODE_ONE_SHOT
     if v == SEAMLESS_PLAN_C:
         return None, SEAMLESS_PLAN_C, SEGMENT_MODE_ONE_SHOT
-    # 未知 / seamless_A / seamless_auto → 默认 A(一镜到底)
+    # 未知 / seamless_A / seamless_auto → A(一镜到底)
     return None, SEAMLESS_PLAN_A, SEGMENT_MODE_ONE_SHOT
 

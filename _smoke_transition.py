@@ -51,7 +51,7 @@ seg_info = "原始视频: 16fps, 总帧数: 200\n镜头1: 帧0-200\n"
 planner = YunjiiSegmentPlanner()
 plan_json, n_seg, _summary = planner.plan(
     分段信息=seg_info, 运动提示词="镜头1: 走路",
-    连贯方案="短视频·多段无缝（≤15秒，每段画质最好）⭐默认",
+    连贯方案="短视频·多段拼接（≤15秒，独立生成+接缝淡化）",
     每段最大帧数=81, 重叠帧数=8, 目标分辨率="832x480", 目标帧率=16,
     自适应参数=True, 生成后端="SCAIL-2 路线",
 )
@@ -181,9 +181,9 @@ check("T3B 失配大总帧数=40(无丢帧)", n_b == 40, f"n={n_b}")
 check("T3B 自适应淡化兜底生效",
       any("尾帧续接淡化" in r for r in rep_b), "; ".join(rep_b))
 
-# --------------------------------- T4 runner 多段无缝(A) 自动切原生调度路线
+# --------------------------------- T4 runner 方案矩阵路由（显式方案，无隐式切换）
 print("=" * 60)
-print("T4: runner 多段无缝(A)+SCAIL-2 → 自动切原生调度(接缝根治)")
+print("T4: runner 方案矩阵路由（A不隐式切原生 / NATIVE显式切 / SQR/WARM不切）")
 from engine import runner as runner_mod
 import engine.adapters.scail2_native as scail2_native_mod
 
@@ -199,25 +199,13 @@ def fake_native(plan, *a, **kw):
 runner._run_native_scail2 = fake_native
 orig_avail = scail2_native_mod.is_native_scail2_available
 
-LABEL_A = "短视频·多段无缝（≤15秒，每段画质最好）⭐默认"
-LABEL_WARM = "暖启动·帧续写（上一段末帧接下一段，WanAnimatePlus）"
+LABEL_A = "短视频·多段拼接（≤15秒，独立生成+接缝淡化）"
+LABEL_NATIVE = "长视频·原生调度无劣化（FaboroHacks同款：节点内多块锚定，一次成片）"
+LABEL_SQR = "多段队列·硬冻结接段（肥猴同款：外部分段+上段尾帧锚定续写）"
+LABEL_WARM = "暖启动·潜空间续写（Tier2：WanAnimatePlus上段末帧喂回）"
 
-# 原生包可用 + 多段无缝(A) → 自动切原生调度
+# 多段拼接(A) + 原生包可用 → 不再隐式切原生（方案边界清晰化后的核心断言）
 scail2_native_mod.is_native_scail2_available = lambda: True
-try:
-    res = runner.run(plan_json, "", "执行", 1,
-                     生成后端="SCAIL-2 路线", 连贯方案=LABEL_A)
-finally:
-    scail2_native_mod.is_native_scail2_available = orig_avail
-check("T4 原生可用+多段无缝→自动切原生调度", calls["native"] == 1,
-      f"calls={calls['native']}")
-check("T4 原生调度返回透传", res[1] == "mock-native-ok", str(res[1])[:40])
-
-# 原生包不可用 → 回退模板分段路线（不调原生）。
-# 回退后继续走真实模板生成链，测试环境无完整执行器（execution 导入链），
-# 异常预期内——断言只关心「是否误切原生」。
-calls["native"] = 0
-scail2_native_mod.is_native_scail2_available = lambda: False
 try:
     try:
         runner.run(plan_json, "", "执行", 1,
@@ -226,8 +214,30 @@ try:
         pass
 finally:
     scail2_native_mod.is_native_scail2_available = orig_avail
-check("T4 原生不可用→回退模板路线(不调原生)", calls["native"] == 0,
+check("T4 方案A不再隐式切原生", calls["native"] == 0, f"calls={calls['native']}")
+
+# 原生调度方案 → 显式切 _run_native_scail2
+calls["native"] = 0
+try:
+    res = runner.run(plan_json, "", "执行", 1,
+                     生成后端="SCAIL-2 路线", 连贯方案=LABEL_NATIVE)
+finally:
+    pass
+check("T4 原生调度方案→显式切原生", calls["native"] == 1,
       f"calls={calls['native']}")
+check("T4 原生调度返回透传", res[1] == "mock-native-ok", str(res[1])[:40])
+
+# 多段队列(SQR) → 不切原生（走 WanAnimatePlus 模板 + transition_video 注入）
+calls["native"] = 0
+try:
+    try:
+        runner.run(plan_json, "", "执行", 1,
+                   生成后端="SCAIL-2 路线", 连贯方案=LABEL_SQR)
+    except Exception:
+        pass
+finally:
+    pass
+check("T4 多段队列(SQR)不切原生", calls["native"] == 0, f"calls={calls['native']}")
 
 # 暖启动策略 → 不切原生（保持 WanAnimatePlus 模板路线）
 calls["native"] = 0
@@ -241,6 +251,34 @@ try:
 finally:
     scail2_native_mod.is_native_scail2_available = orig_avail
 check("T4 暖启动策略不切原生", calls["native"] == 0, f"calls={calls['native']}")
+
+# --------------------------------- T5 planner SQR 段间重叠锁0（首尾相接）
+print("=" * 60)
+print("T5: planner 多段队列(SQR) 段间重叠=0 + 方案解析")
+from engine.types import resolve_unified_plan, CONTINUITY_SQR, CONTINUITY_NATIVE
+st, sp, _md = resolve_unified_plan(LABEL_SQR)
+check("T5 SQR标签→strategy=sqr_queue", st == CONTINUITY_SQR, f"st={st}")
+check("T5 SQR标签→seamless_plan=seamless_sqr", sp == "seamless_sqr", f"sp={sp}")
+st2, sp2, _md2 = resolve_unified_plan(LABEL_NATIVE)
+check("T5 NATIVE标签→strategy=native_scheduled", st2 == CONTINUITY_NATIVE, f"st={st2}")
+check("T5 NATIVE标签→seamless_plan=seamless_native", sp2 == "seamless_native", f"sp={sp2}")
+
+# planner SQR 段间重叠=0：直接跑 plan()，检查各段 overlap_prev
+from engine.planner import YunjiiSegmentPlanner
+_pl = YunjiiSegmentPlanner()
+_seg_info = "原始视频: 16fps, 总帧数: 200\n镜头1: 帧0-200\n"
+_pj, _nf, _log = _pl.plan(_seg_info, "测试", LABEL_SQR, 81, 8,
+                          "832x480", 16, True,
+                          生成后端="SCAIL-2 路线")
+try:
+    _plan = json.loads(_pj)
+    _ovs = [s["overlap_prev"] for s in _plan["segments"]]
+    check("T5 SQR planner段间重叠全0(首尾相接)",
+          all(o == 0 for o in _ovs), f"ovs={_ovs}")
+    _st = _plan.get("continuity_strategy", "")
+    check("T5 SQR plan含sqr_queue策略", _st == "sqr_queue", f"st={_st}")
+except Exception as e:
+    check("T5 SQR planner段间重叠全0(首尾相接)", False, f"异常: {e}")
 
 # ------------------------------------------------------------------ 汇总
 print("=" * 60)
