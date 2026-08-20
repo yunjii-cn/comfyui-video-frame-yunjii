@@ -167,7 +167,7 @@ class YunjiiSegmentStitcher:
                     {"default": "自动(跟随方案最优)", "tooltip": "默认「自动」即可：SCAIL-2 路线多段→真·零转场一镜到底；骨骼路线多段→交叉淡化平滑过渡。无需再选第二次。其余为手动覆盖：无缝一镜到底(零转场)=硬切去重零转场; 交叉淡化=像素级平滑过渡[转场]; 潜空间交叉淡化=latent 层转场[转场]; 硬切=直接拼接; ffmpeg转场=视频级高级转场(选「转场类型」生效，一镜到底可用作0.5s平滑接缝)"},
                 ),
                 "淡化帧数": ("INT", {"default": 8, "min": 2, "max": 30, "step": 1,
-                    "tooltip": "交叉淡化过渡帧数（仅 交叉淡化 模式生效）"}),
+                    "tooltip": "交叉淡化/帧锚定软化窗的基准帧数。帧锚定模式会按接缝失配度自适应加宽(最多+8帧)，把段间突变摊平"}),
                 "转场类型": (list(XFADE_NAME_MAP.keys()), {"default": "淡入淡出",
                     "tooltip": "ffmpeg xfade 视频级转场类型（仅 ffmpeg转场 拼接模式生效）。自动=固定淡入淡出；随机=每个接缝随机抽一种；推荐：淡入淡出"}),
                 "转场时长": ("FLOAT", {"default": 0.5, "min": 0.1, "max": 2.0, "step": 0.1,
@@ -275,13 +275,14 @@ class YunjiiSegmentStitcher:
         if 拼接模式 == STITCH_AUTO:
             _latents = [vi.get("latent_path", "") or "" for vi in video_items]
             if _latents and all(_latents):
-                info("Stitcher", "自动模式: 各段 latent 可用(SCAIL路线)，升级为帧锚定一镜到底(首帧=尾帧·真无缝)")
+                info("Stitcher", "自动模式: 各段 latent 可用(SCAIL路线)，升级为帧锚定一镜到底(尾帧续接淡化·无重复帧)")
                 拼接模式 = STITCH_FRAME_ANCHOR
 
         try:
             if 拼接模式 in (STITCH_FRAME_ANCHOR, STITCH_SEAMLESS):
                 # 帧锚定一镜到底（⭐推荐真无缝）：拼接阶段确定性像素锚定，
-                # 硬保证「下一段首帧=上一段尾帧」，不再依赖生成侧不可靠的 latent 续写。
+                # 尾帧续接淡化（无重复帧静止顿挫）+ 按接缝失配自适应软化窗，
+                # 不依赖生成侧不可靠的 latent 续写。
                 output_path = self._stitch_videos_frame_anchor(
                     video_items, 输出文件名, report_lines, run_id, blend_frames=淡化帧数)
             elif 拼接模式 == STITCH_LATENT_BLEND:
@@ -426,14 +427,19 @@ class YunjiiSegmentStitcher:
     def _stitch_videos_frame_anchor(self, video_items, output_prefix, report, run_id="", blend_frames=4):
         """帧锚定一镜到底（⭐推荐真无缝）：
 
-        在拼接阶段用**确定性像素锚定**硬保证「下一段首帧 = 上一段尾帧」，彻底不再依赖
-        生成侧不可靠的 reference_latent 续写（实测其本质只是 i2v 首帧弱偏置、被 4 步蒸馏洗掉）。
+        在拼接阶段用**确定性像素锚定**保证接缝连续，不依赖生成侧不可靠的 reference_latent
+        续写（实测其本质只是 i2v 首帧弱偏置、被 4 步蒸馏洗掉）。
 
         步骤：
           1) 丢弃下一段头部 overlap_prev 帧（生成侧那次失败的重叠尝试，本就与上层不连续）；
-          2) 把下一段首帧硬替换为上一段尾帧（像素级相等 → 边界连续）；
-          3) 向后做 blend_frames 帧短窗交叉淡化，从上一段尾帧缓入本段自身运动，避免 1 帧静止感。
-        结果：段边界像素级连续、硬切即无缝；纯离线、可验证，无需 GPU。
+          2) 尾帧续接淡化（无重复帧版）：上段尾帧之后**立即**进入交叉淡化，
+             head[j] = (1-α)·prev_last + α·head[j], α=(j+1)/(B+1)。
+             旧版把 head[0] 硬替换成 prev_last 再淡化 → prev_last 连续出现 2 次，
+             16fps 下 ~62ms 静止顿挫（接缝"不自然"的主要来源）。现在 α 从 1/(B+1)
+             起步，边界跳变仅 ~11% 帧差（低于可感知阈值）且无静止帧，运动节奏连续；
+          3) 自适应软化窗 B：按接缝失配度（|prev_last - head[0]| 均值）加宽淡化窗——
+             两段生成差异/运动越大，把突变摊到更多帧；失配小则保持短窗保留运动清晰度。
+        结果：段边界连续、无静止帧、软化窗随失配自适应；纯离线、可验证，无需 GPU。
         """
         video_paths = [v["path"] for v in video_items]
         output_dir = folder_paths.get_output_directory()
@@ -466,16 +472,24 @@ class YunjiiSegmentStitcher:
             if not head:
                 report.append(f"  ⚠ 段{i} 丢弃重叠后无剩余帧，跳过")
                 continue
-            # 2) 硬锚定：下一段首帧 = 上一段尾帧（像素级相等）
+            # 2) 尾帧续接淡化（无重复帧）：上段尾帧后立即从 α=1/(B+1) 起步交叉淡化，
+            #    边界连续且不产生「同一帧播两遍」的静止顿挫。
             prev_last = all_frames[-1]
-            head[0] = prev_last.copy()
-            # 3) 软化：从上一段尾帧向本段自身运动做 B 帧交叉淡化，避免 1 帧静止感
-            B = max(1, min(int(blend_frames), len(head) - 1))
-            for j in range(1, B + 1):
-                alpha = j / (B + 1)
+            # 3) 自适应软化窗：接缝失配越大（两段生成差异/运动越快）→ 淡化窗越长，
+            #    把突变摊平到更多帧；失配小 → 保持用户设定短窗，保留运动清晰度。
+            mismatch = 0.0
+            try:
+                diff = cv2.absdiff(prev_last, head[0]).mean() / 255.0
+                mismatch = float(min(max(diff, 0.0), 1.0))
+            except Exception:
+                pass
+            base_B = max(1, min(int(blend_frames), len(head) - 1))
+            B = max(1, min(base_B + int(round(mismatch * 8.0)), base_B + 8, len(head) - 1))
+            for j in range(B):
+                alpha = (j + 1) / (B + 1)
                 head[j] = cv2.addWeighted(prev_last, 1.0 - alpha, head[j], alpha, 0)
             all_frames.extend(head)
-            report.append(f"  ↳ 帧锚定: 首帧←上段尾帧, 软化 {B} 帧")
+            report.append(f"  ↳ 帧锚定: 尾帧续接淡化 {B} 帧(基准{base_B}, 失配{mismatch:.2f}, 无重复帧)")
         report.append(f"  总帧数: {len(all_frames)}, 时长: {len(all_frames) / fps:.1f}s")
         return self._write_frames(all_frames, output_path, fps, width, height)
 

@@ -550,7 +550,7 @@ class SCAILAdapter(DirectAdapter):
         全长视频真正走滑窗；multi_seg 每段≤81 帧则不接（无窗口可滑，行为等同旧版）。
 
         仅当 target_frames > context_frames(81) 时接：
-          · 方案C 单遍：段覆盖全长(total_frames>121) → 必接 → 全长视频单轨迹滑窗真无缝。
+          · 方案B/C 单遍：段覆盖全长 → 必接 → 全长视频单轨迹滑窗，画质不随时长劣化。
           · 骨骼路线超长段(每段最大帧数>81) → 接 → 跨段 reference_latent 续写也可命中。
           · multi_seg(每条81) → 不接 → 不变。
         """
@@ -574,10 +574,10 @@ class SCAILAdapter(DirectAdapter):
         # 窗口参数 WanVideo 自动 clamp 到可用帧，单窗=等同无窗，段内画质不变。
         if n <= context_frames and not _coherent_multiseg:
             return wf  # 非连贯多段且短段：不建节点，行为等同旧版
-        if seamless_plan == SEAMLESS_PLAN_C:
-            # C 方案(单遍兜底)：不注入 context 滑窗，整片一次去噪 → >5s 画质软，仅作对比/兜底。
-            info("SCAILAdapter", "跳过ContextOptions注入(C方案兜底: 不滑窗, 整片一次去噪)")
-            return wf
+        # （2026-08-20）C 方案不再跳过滑窗：旧版「整片一次去噪」会让 >5s(>81帧) 的单段
+        # 长视频被长程混合稀释、画质发软（劣化根因）。现在 C 与 B 一致按 81 帧一窗、
+        # 重叠 32 帧潜空间 fuse —— 单遍连贯与画质兼得；C 与 B 的差异只剩
+        # 「单遍时长上限超限自动回退多段 seamless」这一保险丝。
 
         co_id = "yunjii_context_options"
         if co_id in wf:

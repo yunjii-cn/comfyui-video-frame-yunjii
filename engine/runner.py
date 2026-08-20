@@ -181,7 +181,7 @@ class YunjiiSegmentRunner:
             info("Runner", "连贯方案=A (标准多段无缝, 一般时长≤15s)")
         elif _seamless == SEAMLESS_PLAN_B:
             # B 方案：超长视频无缝 = 单遍连续采样(single_pass 规划) + context 滑窗。
-            # 与 C 同为 single_pass，但 B 注入滑窗(真无缝)、C 不注入(兜底劣化)。
+            # 与 C 同为 single_pass+滑窗；差异仅 B 无时长上限、C 超限自动回退多段。
             _strategy = CONTINUITY_SINGLE_PASS
             plan.seamless_plan = SEAMLESS_PLAN_B
             plan.long_video_mode = True
@@ -190,7 +190,7 @@ class YunjiiSegmentRunner:
             _strategy = CONTINUITY_SINGLE_PASS
             plan.seamless_plan = SEAMLESS_PLAN_C
             plan.long_video_mode = False
-            info("Runner", "连贯方案=C (单遍连贯·旧方案C兜底)")
+            info("Runner", "连贯方案=C (单遍+滑窗防劣化, 超上限自动回退多段)")
         else:
             # auto：沿用计划内 continuity_strategy / seamless_plan（兼容旧 plan JSON）
             _strategy = getattr(plan, "continuity_strategy", "") or CONTINUITY_MULTI_SEG

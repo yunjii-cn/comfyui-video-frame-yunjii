@@ -51,7 +51,7 @@ class YunjiiSegmentPlanner:
                                 "按你的视频长度和需求选一项即可：\n"
                                 "· 短视频·多段无缝（默认）：做 ≤15秒 的短片。分成几段各自生成、再无缝拼起来，每段画质最好，某段不满意还能单独重做。\n"
                                 "· 长视频·单遍真无缝：做 15~30秒以上 的长片。整段一次性生成，画面从头到尾真正连续、不断裂也不发糊（⭐长片推荐）。\n"
-                                "· 兜底·单遍旧方案：老方案，长视频画质会偏软，一般不用。\n"
+                                "· 兜底·单遍旧方案：整片单遍生成＋81帧滑窗防劣化（画质与B一致）；超过「单遍时长上限」自动回退多段无缝。\n"
                                 "· 暖启动·帧续写：高级玩法，用上一段的最后一帧接着生成下一段（需 WanAnimatePlus 模板）。\n"
                                 "· 分段转场·重叠混合：每段独立生成、段与段之间做叠化转场，适合需要明显转场效果的视频（不是一镜到底连续）。"},
                 ),
@@ -75,7 +75,7 @@ class YunjiiSegmentPlanner:
                      "tooltip": "SCAIL-2 路线自动改用「每段81帧/重叠5/步进76」的官方分块规则；需与执行节点的后端选择一致"},
                 ),
                 "单遍时长上限": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 30.0, "step": 0.5,
-                    "tooltip": "方案C单遍最大时长(秒)。>0 时超出则回退多段seamless以抑制长程稀释画质退化；0=不限制(整片单遍)"}),
+                    "tooltip": "单遍(方案B/C)最大时长(秒)。>0 时超出则回退多段seamless(显存/时长保险丝)；0=不限制。滑窗已防画质劣化，此值仅作出片时长兜底"}),
                 "模型精度": (
                     ["fp8", "fp16"],
                     {"default": "fp8", "tooltip": "SCAIL-2 扩散模型精度：fp8(默认,省显存,略软); fp16(更精细,吃显存,需本机有fp16权重或显存充足)"},
@@ -166,7 +166,7 @@ class YunjiiSegmentPlanner:
                 info("Planner", "连贯方案=长视频·单遍真无缝 退化为多段无缝(非一镜到底/非SCAIL2, 滑窗不适用)")
         elif seamless_plan == SEAMLESS_PLAN_C:
             strategy = CONTINUITY_SINGLE_PASS
-            info("Planner", "连贯方案=兜底·单遍旧方案(旧方案C, 长视频画质偏软)")
+            info("Planner", "连贯方案=兜底·单遍+滑窗(防长程稀释劣化, 超上限自动回退多段)")
 
         single_pass_requested = (
             strategy == CONTINUITY_SINGLE_PASS
@@ -182,15 +182,14 @@ class YunjiiSegmentPlanner:
         if seamless_plan == SEAMLESS_PLAN_B and strategy == CONTINUITY_SINGLE_PASS:
             single_pass = True
         if single_pass and cap > 0 and total_seconds > cap:
-            warn("Planner", "单遍被「单遍时长上限=%.1fs」截断(%d帧≈%.1fs)，回退多段seamless(平滑过渡)抑制画质退化",
+            warn("Planner", "单遍被「单遍时长上限=%.1fs」截断(%d帧≈%.1fs)，回退多段seamless(平滑过渡)",
                  cap, total_frames, total_seconds)
             single_pass = False
             strategy = CONTINUITY_MULTI_SEG  # 回退为 A 式多段平滑
         if single_pass:
-            info("Planner", "连贯方案=单遍：%s长视频(%d帧) 改为单次超长生成(%s)",
+            info("Planner", "连贯方案=单遍：%s长视频(%d帧) 改为单次超长生成(context滑窗真无缝, 画质不随时长劣化)",
                  "B超长" if seamless_plan == SEAMLESS_PLAN_B else "C",
-                 total_frames,
-                 "context滑窗真无缝" if seamless_plan != SEAMLESS_PLAN_C else "不滑窗·旧兜底(画质软)")
+                 total_frames)
         elif strategy == CONTINUITY_WARM_START:
             info("Planner", "暖启动(Tier2) 启用：分段 + 上段真实帧喂回 WanAnimatePlus prefix_frames（需SCAIL-2路线+WanAnimatePlus）")
 
@@ -202,7 +201,8 @@ class YunjiiSegmentPlanner:
 
         # 一镜到底长视频默认走「多段 seamless」(质量优先)：每段 81 帧(5s 原生)全质量生成，
         # composer 强制 seamless 硬切丢重叠帧 = 零转场、零重复帧，质量对齐好片。
-        # 仅当连贯策略=单遍连贯(方案C)时 is_single_pass=True → 整片一次连贯去噪(真连贯，画质代价)。
+        # 连贯策略=单遍连贯(方案B/C)时 is_single_pass=True → 整片单遍连续采样 + context
+        # 滑窗(81帧一窗/重叠32帧潜空间fuse)：真连贯且画质不随时长劣化。
         # 暖启动(Tier2) 仍为多段，但由适配器注入上段末帧作 prefix，段间连续+画质兼得。
         is_single_pass = single_pass
         plan = SegmentPlan(
@@ -239,9 +239,10 @@ class YunjiiSegmentPlanner:
                             "context_options跨段reference_latent续写 + SCAIL真骨架(逐帧姿态)承担", 重叠帧数)
         segments = []
 
-        # —— 方案C 单遍（仅当用户显式勾选「单遍连贯模式」时 single_pass=True）——
-        # 一镜到底长视频做成「单段覆盖全长」：整片一次连贯去噪，latent 天然连续 = 真·一镜到底无接缝。
-        # 代价：11s 长视频被长程重度混合稀释 → 画质下降(4步蒸馏)。多段 seamless 仍是默认质量优先路径。
+        # —— 方案B/C 单遍（用户选单遍连贯方案时 single_pass=True）——
+        # 一镜到底长视频做成「单段覆盖全长」：整片单遍连续采样，latent 天然连续 = 真·一镜到底无接缝。
+        # 生成侧 context 滑窗(81帧一窗/重叠32帧 fuse)接管 >81 帧部分 → 画质不随时长劣化
+        # （旧版不滑窗时长程稀释导致 >5s 发软，已修复）。多段 seamless 仍是默认质量优先路径。
         if single_pass and 生成模式 == SEGMENT_MODE_ONE_SHOT and backend == BACKEND_SCAIL2:
             full_start = min(s for s, _, _ in scenes) if scenes else 0
             full_end = max(e for _, e, _ in scenes) if scenes else 0
@@ -294,10 +295,18 @@ class YunjiiSegmentPlanner:
                 seg_frames = 每段最大帧数
                 num_sub = 1
             elif duration <= 每段最大帧数 * 1.5:
-                seg_frames = 每段最大帧数
+                # 略超一段（≤1.5×）：仍并成单段，但段长放宽到整段时长。
+                # 旧逻辑此处 seg_frames 仍=每段最大帧数，sub_end=min(start+81,end) 会把
+                # 81~121 帧的视频悄悄截断到 81 帧（丢最多 40 帧尾巴 = ~2.5s 内容）。
+                # 超 81 帧部分由生成侧 context 滑窗接管（窗口内仍是原生 81 帧画质，不劣化）。
+                seg_frames = max(每段最大帧数, duration)
                 num_sub = 1
             else:
-                num_sub = max(2, math.ceil(duration / seg_frames))
+                # num_sub 必须按「重叠后的实际步进」计算：每段前移 (seg_frames-重叠) 帧，
+                # 旧公式 ceil(duration/seg_frames) 假设步进=段长，在重叠=32(stride=49)时
+                # 会少算段数 → 尾部静默截断（200帧只覆盖到179帧，丢21帧尾巴）。
+                stride = max(1, seg_frames - 重叠帧数)
+                num_sub = max(2, math.ceil(max(0, duration - seg_frames) / stride) + 1)
 
             for sub_idx in range(num_sub):
                 sub_start = start + sub_idx * (seg_frames - 重叠帧数)

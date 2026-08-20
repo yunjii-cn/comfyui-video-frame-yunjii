@@ -168,14 +168,14 @@ class YunjiiVideoImitator:
             _plan_precision = "fp8"
         # —— 自动(跟随方案最优)：显式解析，依据 后端/连贯方案/一镜到底 选最优拼接 ——
         # 用户在「分段规划」选完 A/B/暖启动后，本节点保持「自动」即可，无需二次选择：
-        #   · SCAIL-2 路线 多段 → 帧锚定一镜到底(首帧=尾帧·真无缝)：拼接阶段硬保证连续，
-        #     不再依赖生成侧不可靠的 reference_latent 续写(实测被 4 步蒸馏洗掉、名不副实)。
+        #   · SCAIL-2 路线 多段 → 帧锚定一镜到底(尾帧续接淡化·无重复帧·真无缝)：拼接阶段
+        #     确定性连续，不再依赖生成侧不可靠的 reference_latent 续写(实测被 4 步蒸馏洗掉)。
         #   · 骨骼路线 多段（独立去噪、无生成侧连续）→ 交叉淡化像素平滑过渡。
         # 其余显式选择（帧锚定/无缝/交叉淡化/潜空间/硬切/ffmpeg转场）一律尊重，不覆盖。
         _continuity_capable = (生成后端 == "SCAIL-2 路线")
         if 拼接模式 == STITCH_AUTO:
             if (not _plan_single_pass) and _continuity_capable:
-                info("Imitator", "自动：SCAIL-2 路线多段 → 帧锚定一镜到底(首帧=尾帧·真无缝)")
+                info("Imitator", "自动：SCAIL-2 路线多段 → 帧锚定一镜到底(尾帧续接淡化·无重复帧)")
                 拼接模式 = STITCH_FRAME_ANCHOR
             elif (not _plan_single_pass) and (not _continuity_capable):
                 info("Imitator", "自动：骨骼路线多段(独立去噪) → 交叉淡化像素平滑过渡")
@@ -190,8 +190,9 @@ class YunjiiVideoImitator:
             info("Imitator", "生成模式=一镜到底，硬切会暴露段边界跳变，强制回退「无缝一镜到底(重叠混合)」")
             拼接模式 = STITCH_SEAMLESS_BLEND
         # —— 帧锚定尊重规则（2026-08-15 起拼接阶段确定性锚定已生效，据后端能力分流）——
-        # 帧锚定(STITCH_FRAME_ANCHOR / STITCH_SEAMLESS) 在拼接阶段硬保证「下一段首帧=上一段尾帧」，
-        # 与后端无关、对任一路线都生效 → 一律尊重用户显式选择（真无缝），不在防呆里降级。
+        # 帧锚定(STITCH_FRAME_ANCHOR / STITCH_SEAMLESS) 在拼接阶段做「尾帧续接淡化」
+        # （无重复帧 + 按接缝失配自适应软化窗），与后端无关、对任一路线都生效 →
+        # 一律尊重用户显式选择（真无缝），不在防呆里降级。
         # 仅 STITCH_LATENT_BLEND（潜空间事后混合，4 步蒸馏下名不副实）→ 多段时升级为交叉淡化，
         # 避免无真实生成侧连续时裸混合跳变。骨骼路线选了 latent_blend 同样走此降级。
         if (not _plan_single_pass) and (not _continuity_capable) and 拼接模式 == STITCH_LATENT_BLEND:
