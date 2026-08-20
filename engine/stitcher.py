@@ -425,10 +425,12 @@ class YunjiiSegmentStitcher:
         return self._write_frames(all_frames, output_path, fps, width, height)
 
     def _stitch_videos_frame_anchor(self, video_items, output_prefix, report, run_id="", blend_frames=4):
-        """帧锚定一镜到底（⭐推荐真无缝）：
+        """帧锚定一镜到底（安全网⭐）：
 
-        在拼接阶段用**确定性像素锚定**保证接缝连续，不依赖生成侧不可靠的 reference_latent
-        续写（实测其本质只是 i2v 首帧弱偏置、被 4 步蒸馏洗掉）。
+        2026-08-20 起，跨段连续主路径已上移到生成侧——`transition_video` 尾帧硬冻结
+        续写（肥猴SQR同款，见 animateplus._inject_transition_video）硬保证
+        「前段尾帧 = 后段起始」。本方法降级为**安全网**：仅当接缝失配明显
+        （transition 注入失败/回退路径/骨骼路线）时才做像素级修复。
 
         步骤：
           1) 丢弃下一段头部 overlap_prev 帧（生成侧那次失败的重叠尝试，本就与上层不连续）；
@@ -437,9 +439,10 @@ class YunjiiSegmentStitcher:
              旧版把 head[0] 硬替换成 prev_last 再淡化 → prev_last 连续出现 2 次，
              16fps 下 ~62ms 静止顿挫（接缝"不自然"的主要来源）。现在 α 从 1/(B+1)
              起步，边界跳变仅 ~11% 帧差（低于可感知阈值）且无静止帧，运动节奏连续；
-          3) 自适应软化窗 B：按接缝失配度（|prev_last - head[0]| 均值）加宽淡化窗——
-             两段生成差异/运动越大，把突变摊到更多帧；失配小则保持短窗保留运动清晰度。
-        结果：段边界连续、无静止帧、软化窗随失配自适应；纯离线、可验证，无需 GPU。
+          3) 自适应软化窗 B：接缝失配 <0.02（transition 硬冻结已生效）→ B=0 纯顺序
+             拼接（任何淡化都会把动作往回拖）；失配越大（两段生成差异/运动越快）
+             → 淡化窗越长，把突变摊到更多帧。
+        结果：transition 生效时零干预零损耗；失效时仍像素级兜底；纯离线、可验证。
         """
         video_paths = [v["path"] for v in video_items]
         output_dir = folder_paths.get_output_directory()
@@ -483,13 +486,23 @@ class YunjiiSegmentStitcher:
                 mismatch = float(min(max(diff, 0.0), 1.0))
             except Exception:
                 pass
+            # 新机制(2026-08-20)：生成侧 transition_video 尾帧硬冻结续写（肥猴SQR同款）
+            # 已保证 head[0] ≈ prev_last 的自然下一帧——失配极小时**跳过淡化纯顺序拼接**
+            # （任何淡化都会把动作往回拖、糊化运动）；仅失配明显（注入失败/回退路径）
+            # 时才启用软化窗兜底 → 拼接由「主修复手段」降级为「安全网」。
             base_B = max(1, min(int(blend_frames), len(head) - 1))
-            B = max(1, min(base_B + int(round(mismatch * 8.0)), base_B + 8, len(head) - 1))
-            for j in range(B):
-                alpha = (j + 1) / (B + 1)
-                head[j] = cv2.addWeighted(prev_last, 1.0 - alpha, head[j], alpha, 0)
+            if mismatch < 0.02:
+                B = 0
+            else:
+                B = max(1, min(base_B + int(round(mismatch * 8.0)), base_B + 8, len(head) - 1))
+            if B > 0:
+                for j in range(B):
+                    alpha = (j + 1) / (B + 1)
+                    head[j] = cv2.addWeighted(prev_last, 1.0 - alpha, head[j], alpha, 0)
+                report.append(f"  ↳ 帧锚定: 尾帧续接淡化 {B} 帧(基准{base_B}, 失配{mismatch:.2f}, 无重复帧)")
+            else:
+                report.append(f"  ↳ 帧锚定: 接缝失配{mismatch:.3f}<0.02(transition硬冻结已生效)，纯顺序拼接")
             all_frames.extend(head)
-            report.append(f"  ↳ 帧锚定: 尾帧续接淡化 {B} 帧(基准{base_B}, 失配{mismatch:.2f}, 无重复帧)")
         report.append(f"  总帧数: {len(all_frames)}, 时长: {len(all_frames) / fps:.1f}s")
         return self._write_frames(all_frames, output_path, fps, width, height)
 

@@ -168,14 +168,15 @@ class YunjiiVideoImitator:
             _plan_precision = "fp8"
         # —— 自动(跟随方案最优)：显式解析，依据 后端/连贯方案/一镜到底 选最优拼接 ——
         # 用户在「分段规划」选完 A/B/暖启动后，本节点保持「自动」即可，无需二次选择：
-        #   · SCAIL-2 路线 多段 → 帧锚定一镜到底(尾帧续接淡化·无重复帧·真无缝)：拼接阶段
-        #     确定性连续，不再依赖生成侧不可靠的 reference_latent 续写(实测被 4 步蒸馏洗掉)。
+        #   · SCAIL-2 路线 多段 → 帧锚定一镜到底(安全网)：跨段连续主路径已在生成侧
+        #     由 transition_video 尾帧硬冻结续写硬保证（肥猴SQR同款，前段尾帧=后段
+        #     起始）；接缝失配极小时拼接自动退化为纯顺序拼接，仅失配明显才淡化兜底。
         #   · 骨骼路线 多段（独立去噪、无生成侧连续）→ 交叉淡化像素平滑过渡。
         # 其余显式选择（帧锚定/无缝/交叉淡化/潜空间/硬切/ffmpeg转场）一律尊重，不覆盖。
         _continuity_capable = (生成后端 == "SCAIL-2 路线")
         if 拼接模式 == STITCH_AUTO:
             if (not _plan_single_pass) and _continuity_capable:
-                info("Imitator", "自动：SCAIL-2 路线多段 → 帧锚定一镜到底(尾帧续接淡化·无重复帧)")
+                info("Imitator", "自动：SCAIL-2 路线多段 → 帧锚定一镜到底(生成侧transition硬冻结为主·拼接淡化兜底)")
                 拼接模式 = STITCH_FRAME_ANCHOR
             elif (not _plan_single_pass) and (not _continuity_capable):
                 info("Imitator", "自动：骨骼路线多段(独立去噪) → 交叉淡化像素平滑过渡")

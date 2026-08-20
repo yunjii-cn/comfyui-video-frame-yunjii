@@ -252,11 +252,15 @@ class YunjiiSegmentRunner:
             # 未提供模板或提供的不是 SCAIL 工作流时，按策略选内置默认：
             # 暖启动(Tier2) 优先用 WanAnimatePlus 参考工作流；否则用标准 SCAIL 子流程。
             if not (is_ap_template or is_std_scail_template):
-                if _strategy == CONTINUITY_WARM_START and os.path.isfile(AP_WORKFLOW_DEFAULT):
+                # 多段无缝(A)与暖启动(Tier2) 默认用 WanAnimatePlus 家族模板——该家族
+                # 原生支持 transition_video 尾帧硬冻结续写（肥猴『分段队列』SQR 同款
+                # 接段机制），多段一镜到底的段间连续由此在生成侧硬保证。
+                # 单遍连贯(B/C) 仍走标准官方子流程（AP 家族不支持整片单遍去噪）。
+                if _strategy in (CONTINUITY_WARM_START, CONTINUITY_MULTI_SEG) and os.path.isfile(AP_WORKFLOW_DEFAULT):
                     try:
                         with open(AP_WORKFLOW_DEFAULT, "r", encoding="utf-8") as f:
                             template_text = f.read()
-                        info("Runner", "暖启动(Tier2): 使用内置 WanAnimatePlus 参考工作流 %s", AP_WORKFLOW_DEFAULT)
+                        info("Runner", "多段无缝/暖启动: 使用内置 WanAnimatePlus 参考工作流(原生 transition_video 接段) %s", AP_WORKFLOW_DEFAULT)
                     except Exception as e:
                         return ("", f"⚠ 无法读取内置 Tier2 模板 {AP_WORKFLOW_DEFAULT}: {e}", False)
                     is_ap_template = True
@@ -391,6 +395,12 @@ class YunjiiSegmentRunner:
         else:
             warn("Runner", "姿态图未通过IMAGE链接传入(=None)，请检查工作流中Node2(PoseExtractor)→Node21(Runner)的连线是否正确")
 
+        results = []
+        prev_context = SegmentContext(last_frame_path=ref_image_path)
+        all_success = True
+        prev_video_path = ""  # 上一段成片视频路径（Tier2: transition_video 尾帧硬冻结续写 / latent 暖启动回退）
+        prev_latent_path = ""  # 上一段落盘 latent 路径（根治 方案C：latent 视频续写跨段共享上下文）
+
         cp = CheckpointManager(plan.mode)
         if 执行模式 == "续跑":
             cp_data = cp.load()
@@ -399,13 +409,21 @@ class YunjiiSegmentRunner:
                 prev_frame = cp_data.get("prev_last_frame", "")
                 if prev_frame and os.path.isfile(prev_frame):
                     ref_image_path = prev_frame
+                # 恢复「上段成片/latent 路径」：续跑的第一段(段号>0)才能继续做
+                # transition_video 尾帧硬冻结续写 / latent 续写（否则该段接缝退化为独立生成）。
+                try:
+                    for _r in (cp_data.get("results") or []):
+                        if not isinstance(_r, dict):
+                            continue
+                        _vp = _r.get("video_path", "")
+                        if _vp and os.path.isfile(_vp):
+                            prev_video_path = _vp
+                        _lp = _r.get("latent_path", "")
+                        if _lp and os.path.isfile(_lp):
+                            prev_latent_path = _lp
+                except Exception:
+                    pass
                 log_lines.append(f"🔄 续跑模式: 从段{起始段}继续")
-
-        results = []
-        prev_context = SegmentContext(last_frame_path=ref_image_path)
-        all_success = True
-        prev_video_path = ""  # 上一段成片视频路径（暖启动 Tier2 用于 pixel prefix 注入）
-        prev_latent_path = ""  # 上一段落盘 latent 路径（根治 方案C：latent 视频续写跨段共享上下文）
 
         start_from = 起始段 if 起始段 > 0 else 0
 
@@ -444,7 +462,12 @@ class YunjiiSegmentRunner:
                     or (_quality == "标准 SCAIL 真骨架（推荐）")
                     or (_strategy == CONTINUITY_MULTI_SEG)
                 )
-                _prev_vp = prev_video_path if (seg.index > 0 and _strategy == CONTINUITY_WARM_START) else ""
+                # 上段成片路径：seg>0 时对 SCAIL 两大家族适配器都传递——
+                # AnimatePlus 家族用它做 transition_video 尾帧硬冻结续写（主路径），
+                # 标准家族用它做 latent 暖启动回退；骨骼路线(DirectAdapter)不传，
+                # 保持「独立分段 + 拼接淡化」现状。
+                _prev_vp = prev_video_path if (seg.index > 0 and isinstance(
+                    gen_adapter, (SCAILAdapter, AnimatePlusSCAILAdapter))) else ""
                 _latent_warmstart = _seamless_on and seg.index > 0
                 wf = gen_adapter.modify_workflow_for_segment(
                     workflow, node_map, seg, current_ref, pose_dir, run_id,

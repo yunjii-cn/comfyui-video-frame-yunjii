@@ -3,9 +3,11 @@ Tier 2 暖启动适配器（AnimatePlus SCAIL-2 路线）。
 
 设计目标：把 SCAIL-2 生成从 WanVideoWrapper 家族重包进 WanAnimatePlus 家族
 （复用用户现成的「分段队列」丝滑工作流），用其原生时序建模 + 多段重叠融合得到
-「连续 + 画质」兼得的真·一镜到底；并对 seg>0 把上段真实成片末 5 帧经
-`VHS_LoadVideo` 截帧后注入 `WanAnimatePlus SCAIL_2 Embeds.prefix_frames`，
-做跨段暖启动（硬冻结到本段 latent 开头，6 个 prefix latent 预置）。
+「连续 + 画质」兼得的真·一镜到底；跨段连续主路径（2026-08-20，对齐肥猴 SQR）：
+seg>0 把上段真实成片尾 21 帧经 `VHS_LoadVideo` 截帧后注入
+`WanAnimatePlus SCAIL_2 Embeds.transition_video` 做硬冻结续写（画布头扩 21 帧
+像素级锁定为上段尾帧、姿态条件置零、Decode 自动裁掉扩充值）→ 前段尾帧=后段
+起始在生成侧硬保证；latent 续写 / prefix_frames(末5帧) 降级为回退路径。
 
 复用：
 - SCAILAdapter 的全部静态手术（Set/Get 重连、Reroute 解析、未注册节点清理、
@@ -44,6 +46,9 @@ AP_CLIP_VISION_VARIANTS = ("WanAnimatePlus ClipVisionEncode V2", "WanVideoClipVi
 
 # prefix_frames 最多注入帧数（WanAnimatePlus 限制 ≤5，最多 17 帧 prefix）
 PREFIX_MAX_FRAMES = 5
+# transition_video 尾帧硬冻结续写的冻结帧数（对齐肥猴『分段队列』SQR 的
+# TRANSITION_FRAMES=21：Embeds 画布头扩 21 帧、Decode 自动裁掉，不进成片）。
+TRANSITION_FRAMES = 21
 
 
 class AnimatePlusNodeMap:
@@ -298,16 +303,23 @@ class AnimatePlusSCAILAdapter(SCAILAdapter):
             if "quantization" in ml:
                 ml["quantization"] = "disabled"
 
-        # 7) 跨段动作连续性（根治 方案C）：
-        #    · 『标准 SCAIL 真骨架(推荐)』模式(latent_warmstart=True)：改用 latent 视频续写
-        #      —— 直接加载上段落盘 latent 喂 WanAnimatePlus SamplerSettings.samples + add_noise，
-        #      与上段动作在采样时共享 latent 上下文，从架构层消除相位断裂(同 SCAILAdapter 机制)。
-        #      不再用会拖画质的像素 prefix_frames 末帧冻结。
-        #    · 仅 Tier2 暖启动模式(用户显式选 Tier2)保留像素 prefix_frames 冻结(原行为)。
-        if latent_warmstart and prev_latent_path and os.path.isfile(prev_latent_path):
-            self._inject_latent_warmstart_ap(wf, node_map, prev_latent_path, seg)
-        elif seg.index > 0 and prev_video_path and os.path.isfile(prev_video_path):
-            self._inject_prefix(wf, node_map, prev_video_path)
+        # 7) 跨段动作连续性（2026-08-20 对齐肥猴『分段队列』SQR 的 transition_video 机制）：
+        #    主路径：上段成片尾 21 帧 → Embeds.transition_video **硬冻结续写**——
+        #      Embeds 检测到该输入后把画布头自动扩 21 帧（4k+1 对齐），冻结帧像素级
+        #      =上段尾帧且姿态条件置零 → 采样被迫从上段尾帧继续演化；Decode 自动
+        #      裁掉扩充值 → 本段成片不含重复帧。**前段尾帧=后段起始**由此在生成侧
+        #      硬保证（用户实测「前段尾帧≠后段首帧→视觉断层」的根治手段）。
+        #    回退1：transition 不可用（无上段成片/模板占用/异常）→ 上段落盘 latent
+        #      续写(reference_latent / samples+noise，原「真骨架」路径)。
+        #    回退2：仍不可用 → prefix_frames 像素冻结（旧 Tier2 行为）。
+        _trans_ok = False
+        if seg.index > 0 and prev_video_path and os.path.isfile(prev_video_path):
+            _trans_ok = self._inject_transition_video(wf, node_map, prev_video_path, seg)
+        if not _trans_ok:
+            if latent_warmstart and prev_latent_path and os.path.isfile(prev_latent_path):
+                self._inject_latent_warmstart_ap(wf, node_map, prev_latent_path, seg)
+            elif seg.index > 0 and prev_video_path and os.path.isfile(prev_video_path):
+                self._inject_prefix(wf, node_map, prev_video_path)
 
         # 蒸馏 LoRA 路线：钉模型/LoRA 到本机真实文件（覆盖 WanAnimatePlus 系列节点
         # 的 model / lora_0..N 字段——用户直跑工作流用 WanAnimatePlus LoraSelectMulti
@@ -374,6 +386,68 @@ class AnimatePlusSCAILAdapter(SCAILAdapter):
             info("AnimatePlusAdapter", "prefix_frames 注入: 上段成片%s → 末%d帧暖启动", prev_video_path, n)
         except Exception as e:
             warn("AnimatePlusAdapter", "prefix_frames 注入异常(已跳过，不影响主生成): %s", str(e)[:200])
+
+    # ------------------------------------------------------------------
+    # transition_video 尾帧硬冻结续写（跨段连续主路径，对齐肥猴 SQR）
+    # ------------------------------------------------------------------
+    def _inject_transition_video(self, wf, node_map, prev_video_path, seg):
+        """把上段成片尾 TRANSITION_FRAMES(=21) 帧注入 Embeds.transition_video。
+
+        WanAnimatePlus SCAIL_2 Embeds 原生语义（ComfyUI-WanAnimatePlus/nodes.py 实测）：
+          · 检测到 transition_video → canvas_expansion_px=21，num_frames 自动 +21；
+          · 冻结画布[:21] = 上段尾帧（_take_tail_with_front_pad 取尾、不足前垫首帧），
+            freeze_frame_mask=1 且姿态条件置零 → 采样被硬约束从上段尾帧继续演化；
+          · WanAnimatePlus Decode 自动 images[:, canvas_expansion_px:] 裁掉扩充值
+            → 本段成片首帧即「上段尾帧之后的下一帧」，无重复帧、动作流连续。
+        配套要求：段间驱动时序首尾相接（planner 已把 SCAIL 段间重叠锁 0）。
+
+        best-effort：任何前置不满足/异常 → 返回 False，调用方回退 latent 续写/prefix。
+        """
+        try:
+            if seg.index <= 0:
+                return False
+            if not node_map.animate_embeds or node_map.animate_embeds not in wf:
+                return False
+            ae = wf[node_map.animate_embeds]
+            if ae.get("class_type", "") not in AP_SCAIL_EMBEDS_VARIANTS:
+                return False  # 未知 embeds 节点，不冒险注入
+            aei = ae.setdefault("inputs", {})
+            if aei.get("transition_video") is not None:
+                warn("AnimatePlusAdapter", "transition: 模板已占用 transition_video 输入，跳过注入")
+                return False
+
+            # 复制上段成片到 input 目录（与驱动视频同机制），VHS 只加载其尾部帧
+            fname = self._copy_to_input(prev_video_path)
+            if not fname:
+                warn("AnimatePlusAdapter", "transition: 复制上段成片失败，跳过注入")
+                return False
+            total = self._video_frame_count(prev_video_path)
+            if not total or total <= 0:
+                warn("AnimatePlusAdapter", "transition: 上段成片无有效帧，跳过注入")
+                return False
+            n = min(TRANSITION_FRAMES, total)
+
+            vhs_id = self._alloc_node_ids(wf, 1)[0]
+            wf[vhs_id] = {
+                "class_type": AP_VHS_LOADVIDEO,
+                "inputs": {
+                    "video": fname,
+                    "force_rate": 0,
+                    "custom_width": 0,
+                    "custom_height": 0,
+                    "frame_load_cap": n,
+                    "skip_first_frames": max(0, total - n),
+                    "select_every_nth": 1,
+                    "format": "AnimateDiff",
+                },
+            }
+            aei["transition_video"] = [vhs_id, 0]
+            info("AnimatePlusAdapter", "transition_video 硬冻结续写(肥猴SQR同款): 上段成片%s 尾%d帧 → Embeds.transition_video(画布头冻结, Decode自动裁)",
+                 os.path.basename(prev_video_path), n)
+            return True
+        except Exception as e:
+            warn("AnimatePlusAdapter", "transition_video 注入异常(回退旧续写): %s", str(e)[:200])
+            return False
 
     # ------------------------------------------------------------------
     # latent 视频续写（根治 方案C，替代像素 prefix 冻结）
