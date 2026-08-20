@@ -252,15 +252,17 @@ class YunjiiSegmentRunner:
             # 未提供模板或提供的不是 SCAIL 工作流时，按策略选内置默认：
             # 暖启动(Tier2) 优先用 WanAnimatePlus 参考工作流；否则用标准 SCAIL 子流程。
             if not (is_ap_template or is_std_scail_template):
-                # 多段无缝(A)与暖启动(Tier2) 默认用 WanAnimatePlus 家族模板——该家族
-                # 原生支持 transition_video 尾帧硬冻结续写（肥猴『分段队列』SQR 同款
-                # 接段机制），多段一镜到底的段间连续由此在生成侧硬保证。
-                # 单遍连贯(B/C) 仍走标准官方子流程（AP 家族不支持整片单遍去噪）。
-                if _strategy in (CONTINUITY_WARM_START, CONTINUITY_MULTI_SEG) and os.path.isfile(AP_WORKFLOW_DEFAULT):
+                # 仅暖启动(Tier2) 默认用 WanAnimatePlus 家族模板（prefix_frames 帧续写）。
+                # 多段无缝(A) 一律走标准官方 SCAIL 子流程——2026-08-20 实测回归教训：
+                # 内置 Tier2 模板在本机画质崩坏(无动作迁移/画面粗糙)且输出目录不同
+                # (yunjii_tier2 vs yunjii_v2v 造成双文件夹)，不得作为多段默认。
+                # transition_video 尾帧硬冻结(animateplus._inject_transition_video)保留，
+                # 仅当用户显式提供 WanAnimatePlus 家族模板/暖启动路线时生效。
+                if _strategy == CONTINUITY_WARM_START and os.path.isfile(AP_WORKFLOW_DEFAULT):
                     try:
                         with open(AP_WORKFLOW_DEFAULT, "r", encoding="utf-8") as f:
                             template_text = f.read()
-                        info("Runner", "多段无缝/暖启动: 使用内置 WanAnimatePlus 参考工作流(原生 transition_video 接段) %s", AP_WORKFLOW_DEFAULT)
+                        info("Runner", "暖启动(Tier2): 使用内置 WanAnimatePlus 参考工作流 %s", AP_WORKFLOW_DEFAULT)
                     except Exception as e:
                         return ("", f"⚠ 无法读取内置 Tier2 模板 {AP_WORKFLOW_DEFAULT}: {e}", False)
                     is_ap_template = True
@@ -462,12 +464,12 @@ class YunjiiSegmentRunner:
                     or (_quality == "标准 SCAIL 真骨架（推荐）")
                     or (_strategy == CONTINUITY_MULTI_SEG)
                 )
-                # 上段成片路径：seg>0 时对 SCAIL 两大家族适配器都传递——
-                # AnimatePlus 家族用它做 transition_video 尾帧硬冻结续写（主路径），
-                # 标准家族用它做 latent 暖启动回退；骨骼路线(DirectAdapter)不传，
-                # 保持「独立分段 + 拼接淡化」现状。
-                _prev_vp = prev_video_path if (seg.index > 0 and isinstance(
-                    gen_adapter, (SCAILAdapter, AnimatePlusSCAILAdapter))) else ""
+                # 上段成片路径：仅暖启动(Tier2)策略传递（AnimatePlus 家族用于
+                # transition_video/prefix 续写）。多段无缝(A)不传——2026-08-20 回滚：
+                # 曾对 SCAIL 两大家族都传导致每段注入 latent 暖启动(reference_latent)，
+                # 叠加 Tier2 模板画质崩坏；多段无缝连续性由「重叠32 + 拼接侧帧锚定」
+                # 承担（3efa21f 验证基线）。骨骼路线(DirectAdapter)同样不传。
+                _prev_vp = prev_video_path if (seg.index > 0 and _strategy == CONTINUITY_WARM_START) else ""
                 _latent_warmstart = _seamless_on and seg.index > 0
                 wf = gen_adapter.modify_workflow_for_segment(
                     workflow, node_map, seg, current_ref, pose_dir, run_id,

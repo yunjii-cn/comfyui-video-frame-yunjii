@@ -46,13 +46,13 @@ def make_video(path, frames):
 
 # ---------------------------------------------------------------- T1 planner
 print("=" * 60)
-print("T1: planner SCAIL 多段 → 首尾相接")
+print("T1: planner SCAIL 多段 → 重叠32基线（2026-08-20 回滚后）")
 seg_info = "原始视频: 16fps, 总帧数: 200\n镜头1: 帧0-200\n"
 planner = YunjiiSegmentPlanner()
 plan_json, n_seg, _summary = planner.plan(
     分段信息=seg_info, 运动提示词="镜头1: 走路",
     连贯方案="短视频·多段无缝（≤15秒，每段画质最好）⭐默认",
-    每段最大帧数=81, 重叠帧数=32, 目标分辨率="832x480", 目标帧率=16,
+    每段最大帧数=81, 重叠帧数=8, 目标分辨率="832x480", 目标帧率=16,
     自适应参数=True, 生成后端="SCAIL-2 路线",
 )
 pd = json.loads(plan_json)
@@ -60,13 +60,25 @@ segs = pd["segments"]
 check("T1 200帧切成多段(≥2)", len(segs) >= 2, f"n={len(segs)}")
 check("T1 每段≤81帧", all(s["target_frames"] <= 81 for s in segs),
       str([s["target_frames"] for s in segs]))
-check("T1 段间重叠=0(首尾相接)",
-      all(s.get("overlap_prev", 0) == 0 for s in segs),
+check("T1 多段无缝重叠=UI值8(3efa21f基线,不锁32)",
+      all(s.get("overlap_prev", 0) == 8 for s in segs[1:]),
       str([s.get("overlap_prev") for s in segs]))
-contig = all(segs[i]["end_frame"] == segs[i + 1]["start_frame"]
+contig = all(segs[i]["end_frame"] - 8 == segs[i + 1]["start_frame"]
              for i in range(len(segs) - 1))
-check("T1 边界连续 end[i]==start[i+1]", contig,
+check("T1 边界按重叠8交叠 end[i]-8==start[i+1]", contig,
       str([(s["start_frame"], s["end_frame"]) for s in segs]))
+
+# 智能分段(smart_split)模式 → 锁 32（猴子基线，与 3efa21f 一致）
+plan_json2, _, _ = planner.plan(
+    分段信息=seg_info, 运动提示词="镜头1: 走路",
+    连贯方案="分段转场·重叠混合（每段独立，适合做转场效果）",
+    每段最大帧数=81, 重叠帧数=8, 目标分辨率="832x480", 目标帧率=16,
+    自适应参数=True, 生成后端="SCAIL-2 路线",
+)
+segs2 = json.loads(plan_json2)["segments"]
+check("T1 智能分段锁重叠32", len(segs2) >= 2 and all(
+    s.get("overlap_prev", 0) == 32 for s in segs2[1:]),
+    str([s.get("overlap_prev") for s in segs2]))
 
 # ------------------------------------------------- T2 transition_video 注入
 print("=" * 60)

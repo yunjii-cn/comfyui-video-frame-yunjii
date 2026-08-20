@@ -58,7 +58,7 @@ class YunjiiSegmentPlanner:
                 "每段最大帧数": ("INT", {"default": 81, "min": 9, "max": 257, "step": 4,
                     "tooltip": "4k+1格式: 41/61/81/85/89/121"}),
                 "重叠帧数": ("INT", {"default": 8, "min": 0, "max": 32, "step": 1,
-                    "tooltip": "段间重叠区域大小（骨骼路线交叉淡化用）。SCAIL-2 路线自动改用「每段81帧/首尾相接(重叠0)」分块——段间连续由生成侧 transition_video 尾帧硬冻结续写承担，无需重叠"}),
+                    "tooltip": "段间重叠区域大小。SCAIL-2 路线自动锁定为32（8 latent帧，猴子工作流验证的自然连贯方案）；骨骼路线交叉淡化用"}),
                 "目标分辨率": (
                     ["832x480", "480x832", "1280x720", "720x1280"],
                     {"default": "832x480"},
@@ -100,19 +100,22 @@ class YunjiiSegmentPlanner:
         _strategy_from_unified, seamless_plan, mode = resolve_unified_plan(连贯方案)
 
         backend = BACKEND_SCAIL2 if 生成后端 == "SCAIL-2 路线" else BACKEND_WANVIDEO
-        if backend == BACKEND_SCAIL2:
-            # SCAIL-2 分块（2026-08-20 对齐肥猴『分段队列』SQR 接段机制）：
-            # 每段固定 81 帧（官方原生窗）；段间**首尾相接（重叠=0）**。
-            # 旧版锁重叠=32 的本意是「驱动重叠→事后混合接缝」，但生成侧并无硬锚定，
-            # 前段尾帧≠后段首帧 → 混合只能掩盖视觉断层（多段不自然的根因）。
-            # 现在段间连续由生成侧 transition_video 尾帧硬冻结续写承担
-            # （上段成片尾21帧冻结为下段画布头、输出自动裁掉），驱动时序必须
-            # 首尾相接才不会「时间回跳」，故重叠归零、拼接退化为纯顺序拼接。
+        if backend == BACKEND_SCAIL2 and mode != SEGMENT_MODE_ONE_SHOT:
+            # SCAIL-2 分块：每段固定 81 帧（沿用官方）。
+            # 段间重叠锁定为 32 像素帧（对齐『三层楼的小肥猴』Wan2.2 Animate 工作流
+            #   WanVideoContextOptions 的 context_overlap=32 → 8 latent 帧）；VAE 时间压缩≈4x
+            #   → 32/4=8 latent 帧。该值已在猴子工作流验证为自然连贯，故直接采用，
+            #   不再地板16（避免用户漏设时混合窗偏窄）。若 UI 设更高值仍尊重(clamp≤32)。
+            # 2026-08-20 回滚说明：曾试改「重叠0+生成侧 transition_video 硬冻结」(肥猴SQR)，
+            #   但该机制依赖 WanAnimatePlus 家族模板，本机 Tier2 模板画质崩坏(无动作迁移/
+            #   画面粗糙)且输出到 yunjii_tier2 造成双文件夹——多段默认已回滚标准官方模板，
+            #   故重叠同步恢复 32 基线；transition 代码保留，仅显式 AP 家族路线时生效。
             每段最大帧数 = 81
             _user_ov = 重叠帧数 if isinstance(重叠帧数, int) else 0
-            重叠帧数 = 0
-            if _user_ov != 0:
-                info("Planner", "SCAIL-2 路线：每段固定81帧；段间重叠=0(首尾相接)——连续性由生成侧 transition_video 尾帧硬冻结续写承担")
+            _new_ov = min(max(_user_ov, 32), 32)
+            重叠帧数 = _new_ov
+            if _user_ov < 32:
+                info("Planner", "SCAIL-2 路线：每段固定81帧；段间重叠锁定为32（对齐猴子工作流验证的自然连贯方案，8 latent帧）")
 
         node_start("Planner", 生成模式=mode, 每段最大帧数=每段最大帧数, 重叠帧数=重叠帧数,
                    目标分辨率=目标分辨率, 目标帧率=目标帧率, 生成后端=backend)
@@ -525,12 +528,12 @@ def replan_for_backend(plan, new_backend):
     """将已有 plan 按新后端重新切分（保留场景边界/提示词/分辨率/帧率/负面提示）。
 
     用于「用户切了执行后端、但 plan 是按另一后端规划的」场景：自动按新后端的
-    分块规则（SCAIL-2=81帧/首尾相接重叠0；骨骼=4k+1/重叠默认）重切，避免段边界
+    分块规则（SCAIL-2=81帧/重叠32；骨骼=4k+1/重叠默认）重切，避免段边界
     跳帧/重影，同时让单一开关即可切换路线，不必手动同步两个「生成后端」widget。
     """
     if new_backend == BACKEND_SCAIL2:
-        # SCAIL-2：81帧/首尾相接(重叠0)，连续性由生成侧 transition 尾帧硬冻结承担
-        每段最大帧数, 重叠帧数 = 81, 0
+        # SCAIL-2：81帧/重叠32（8 latent帧，猴子工作流验证基线；与 plan() 保持一致）
+        每段最大帧数, 重叠帧数 = 81, 32
     else:
         每段最大帧数, 重叠帧数 = 81, 8
 

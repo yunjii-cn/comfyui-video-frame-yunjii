@@ -13,6 +13,7 @@ from .types import (
     STITCH_FRAME_ANCHOR, STITCH_SEAMLESS_BLEND, STITCH_LATENT_BLEND, STITCH_TRANSITION,
     STITCH_LABELS, STITCH_LABEL_TO_VALUE,
 )
+from .frontend_registry import register_video_to_history
 
 # ffmpeg xfade 转场：中文显示名 -> ffmpeg transition 名（仅 ffmpeg转场 拼接模式生效）。
 # 这些均为 ffmpeg 原生 xfade 支持的 transition；若值非法，_stitch_videos_xfade 会回退到交叉淡化。
@@ -189,12 +190,12 @@ class YunjiiSegmentStitcher:
         if not 执行结果.strip():
             node_error("Stitcher", "未提供执行结果")
             node_end("Stitcher", "未提供执行结果")
-            return ("", "⚠ 未提供执行结果", self._make_cover("")[1])
+            return {"result": ("", "⚠ 未提供执行结果", self._make_cover("")[1])}
 
         try:
             results_data = json.loads(执行结果)
         except json.JSONDecodeError as e:
-            return ("", f"⚠ 解析执行结果失败: {e}", self._make_cover("")[1])
+            return {"result": ("", f"⚠ 解析执行结果失败: {e}", self._make_cover("")[1])}
 
         run_id = ""
         if isinstance(results_data, dict):
@@ -220,14 +221,23 @@ class YunjiiSegmentStitcher:
 
         if not videos:
             node_end("Stitcher", "没有成功生成的视频片段")
-            return ("", "⚠ 没有成功生成的视频片段可拼接", self._make_cover("")[1])
+            return {"result": ("", "⚠ 没有成功生成的视频片段可拼接", self._make_cover("")[1])}
 
         if len(videos) == 1:
             output_path = self._copy_to_output(videos[0], 输出文件名, run_id)
             info("Stitcher", "仅1段视频，直接复制: %s", output_path)
             node_end("Stitcher", f"输出: {output_path}")
-            _, cover = self._make_cover(output_path)
-            return (output_path, f"✅ 仅1段视频，无需拼接\n输出: {output_path}", cover)
+            _first, cover = self._make_cover(output_path)
+            # 官方输出标准：OUTPUT_NODE 返回 {"ui":..., "result":...} 才进「已生成」
+            # （execution.get_output_from_returns 只认 dict 形式的 'ui' 键）。
+            # 双保险：Runner 内联执行会破坏外层 history，return ui 可能丢失，
+            # 故再显式登记一条独立历史条目（与 Composer 最终成片同源通道）。
+            try:
+                register_video_to_history(output_path)
+            except Exception as _e:
+                info("Stitcher", "单段成片前端历史补登失败(不影响出片): %s", _e)
+            return {"ui": _build_output_ui(output_path, _first),
+                    "result": (output_path, f"✅ 仅1段视频，无需拼接\n输出: {output_path}", cover)}
 
         report_lines = []
         report_lines.append(f"🎬 开始拼接 {len(videos)} 个视频片段")
@@ -297,7 +307,7 @@ class YunjiiSegmentStitcher:
                 )
         except Exception as e:
             logger.error("Stitch failed: %s", e)
-            return ("", f"⚠ 拼接失败: {e}", self._make_cover("")[1])
+            return {"result": ("", f"⚠ 拼接失败: {e}", self._make_cover("")[1])}
 
         if output_path and 音频源 and os.path.isfile(音频源):
             try:
@@ -317,8 +327,14 @@ class YunjiiSegmentStitcher:
         report_lines.append(f"\n✅ 最终输出: {output_path}")
         info("Stitcher", "拼接完成: %s", output_path)
         node_end("Stitcher", f"输出: {output_path}")
-        _, cover = self._make_cover(output_path)
-        return (output_path, "\n".join(report_lines), cover)
+        _first, cover = self._make_cover(output_path)
+        # 官方输出标准 + 前端历史双登记（同 Composer），最终成片稳定进「已生成」。
+        try:
+            register_video_to_history(output_path)
+        except Exception as _e:
+            info("Stitcher", "最终成片前端历史补登失败(不影响出片): %s", _e)
+        return {"ui": _build_output_ui(output_path, _first),
+                "result": (output_path, "\n".join(report_lines), cover)}
 
     def _stitch_videos(self, video_items, mode, fade_frames, output_prefix, report, run_id="",
                        xfade="", xfade_duration=0.5):
