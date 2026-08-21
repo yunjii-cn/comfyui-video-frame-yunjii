@@ -277,12 +277,19 @@ class YunjiiVideoImitator:
                 warn("Imitator", "单次超长结果解析失败，回退拼接: %s", e)
 
         # 2) 拼接相位：调用无缝拼接，效果模块作用于成片（超分/插帧/调色等）
+        #    ⚠️ stitch() 已重构为返回 dict：{"ui":..., "result":(视频路径, 报告, cover)}，
+        #    不再返回裸 3 元组。直接解包 3 值会导致
+        #    ValueError: not enough values to unpack (expected 3, got 2)。
         stitcher = YunjiiSegmentStitcher()
-        最终视频路径, 拼接报告, _stitcher_cover = stitcher.stitch(
+        _stitch_ret = stitcher.stitch(
             执行结果, 拼接模式, 淡化帧数, 输出文件名,
             音频源=音频源, 效果模块=effects,
             转场类型=转场类型, 转场时长=转场时长,
         )
+        最终视频路径, 拼接报告, _stitcher_cover = _stitch_ret["result"]
+        # stitch 内部已做前端历史登记并返回 ui；透传给节点 return，
+        # 确保成片稳定进「已生成」（内联执行会改写外层 history）。
+        _stitch_ui = _stitch_ret.get("ui")
         # 内联执行会改写外层 prompt 历史上下文，节点 return ui 落不进「已生成」；
         # 故最终成片显式登记一条独立历史条目（与段视频同源通道），确保稳定可见。
         try:
@@ -300,7 +307,8 @@ class YunjiiVideoImitator:
         info("Imitator", "完美模仿完成: %s", 最终视频路径)
         node_end("Imitator", "完成")
         _first, _cover = _make_cover(最终视频路径)
+        _ui = _stitch_ui or _build_output_ui(最终视频路径, _first)
         return {
-            "ui": _build_output_ui(最终视频路径, _first),
+            "ui": _ui,
             "result": (最终视频路径, combined, True, _cover),
         }
