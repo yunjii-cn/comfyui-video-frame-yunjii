@@ -6437,7 +6437,7 @@
         "Node name for S&R": "WanAnimatePlus LoraSelect"
       },
       "widgets_values": [
-        "Wan-Enhance\\Scail-2_Remix_LoRA_non_Relighting_rank256.safetensors",
+        "Scail-2_Remix_LoRA_non_Relighting_rank256.safetensors",
         1,
         false,
         false
@@ -6642,8 +6642,8 @@
         1,
         "none",
         0,
-        "none",
-        0,
+        "Wan2.2 - I2V -Slop Bounce-Low-i2v-(弹跳lora不变脸).safetensors",
+        0.7,
         "none",
         0.8,
         false,
