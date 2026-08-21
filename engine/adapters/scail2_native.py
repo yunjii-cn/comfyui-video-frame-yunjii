@@ -354,7 +354,10 @@ def build_native_prompt(plan, params=None):
         "frame_load_cap": int(total_frames), "skip_first_frames": 0, "select_every_nth": 1})
     add(12, "ImageResizeKJv2", {
         "image": ["11", 0], "width": size, "height": size, "upscale_method": "nearest-exact",
-        "keep_proportion": "crop", "pad_color": "0, 0, 0", "crop_position": "center", "divisible_by": 2})
+        # 驱动视频(含完整人物动作)必须用 pad 保持比例，绝不可 crop——
+        # 竖屏人物视频(如 480x832) center-crop 到 736x736 会裁掉上下约 64%，
+        # 头部在顶部必被切掉（用户实测"头部被裁剪掉"根因）。
+        "keep_proportion": "pad", "pad_color": "0, 0, 0", "crop_position": "center", "divisible_by": 2})
     # ⑥ 参考图（每张 LoadImage + resize → reference_i）
     ref_nodes = []
     for i, rp in enumerate(refs[:MAX_REFERENCES]):
