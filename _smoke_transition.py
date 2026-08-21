@@ -4,6 +4,9 @@
 T1: planner SCAIL 多段 → 首尾相接(重叠0/每段≤81帧/边界连续)
 T2: animateplus _inject_transition_video → VHS 注入参数正确/接线正确/占用跳过/段0不注入
 T3: stitcher 帧锚定 → 接缝失配<0.02 纯顺序拼接(B=0)；失配大 → 自适应淡化兜底
+T6: sanitize COMBO 非法值 → 节点默认值（模板/节点包版本漂移兜底）
+T7: 文件名类 COMBO 绕过 sanitize + _fix_model_names 接管 lora_N（二测惨案）
+T8: 主输出VHS=吃Decode输出的成片节点，防选中骨骼预览（三测只出骨骼视频根因）
 运行: python_embeded/python.exe _smoke_transition.py
 """
 import sys
@@ -279,6 +282,206 @@ try:
     check("T5 SQR plan含sqr_queue策略", _st == "sqr_queue", f"st={_st}")
 except Exception as e:
     check("T5 SQR planner段间重叠全0(首尾相接)", False, f"异常: {e}")
+
+# --------------------------------- T6 COMBO 版本漂移兜底（SQR 首测崩溃根因）
+print("=" * 60)
+print("T6: sanitize COMBO 非法值 → 节点默认值（模板/节点包版本漂移兜底）")
+from engine.adapters.scail import SCAILAdapter
+
+# 结构对齐真实 /object_info：COMBO 声明首元素=选项列表，类型声明首元素=类型字符串
+_fake_oi = {
+    "BodyRatioMapperProportionTransfer": {
+        "input": {
+            "required": {"pose_keypoint": ["POSE_KEYPOINT"]},
+            "optional": {
+                "anchor_output_mode": (
+                    ["single_frame_multi_person", "multi_frame_single_person"],
+                    {"default": "single_frame_multi_person"}),
+                "confidence_threshold": ("FLOAT", {"default": 0.30}),
+            },
+        },
+    },
+    "KSampler": {
+        "input": {
+            "required": {
+                "sampler_name": (
+                    ["euler", "euler_ancestral", "uni_pc"],
+                    {"default": "euler"}),
+                "steps": ("INT", {"default": 20}),
+            },
+        },
+    },
+}
+_orig_oi = SCAILAdapter._OI_CACHE
+SCAILAdapter._OI_CACHE = _fake_oi
+try:
+    api = {
+        "1082": {"class_type": "BodyRatioMapperProportionTransfer",
+                 "inputs": {"anchor_output_mode": False,       # 版本漂移错位值
+                            "confidence_threshold": 0.3}},
+        "10": {"class_type": "KSampler",
+               "inputs": {"sampler_name": "euler", "steps": 20}},   # 合法，不动
+    }
+    out = SCAILAdapter._sanitize_combo_inputs(api)
+    check("T6 非法COMBO重置为默认",
+          out["1082"]["inputs"]["anchor_output_mode"] == "single_frame_multi_person",
+          str(out["1082"]["inputs"]["anchor_output_mode"]))
+    check("T6 合法COMBO不动",
+          out["10"]["inputs"]["sampler_name"] == "euler",
+          str(out["10"]["inputs"]["sampler_name"]))
+    check("T6 FLOAT输入不受影响",
+          out["1082"]["inputs"]["confidence_threshold"] == 0.3,
+          str(out["1082"]["inputs"]["confidence_threshold"]))
+finally:
+    SCAILAdapter._OI_CACHE = _orig_oi
+
+# --------------------------------- T7 文件名类 COMBO 不被 sanitize 重置 + lora_N 模糊匹配
+# （2026-08-20 SQR 二测惨案：sanitize 把模板 VAE 重置成 FLUX VAE、文本编码器
+#  重置成 Qwen-VL、LoRA 全置 none → 输出纯骨骼视频。文件名必须交给模糊匹配。）
+print("=" * 60)
+print("T7: 文件名类COMBO绕过sanitize + _fix_model_names接管lora_N")
+_fake_oi7 = {
+    "WanAnimatePlus VAELoader": {
+        "input": {"required": {
+            "model_name": (["FLUX.1\\UltraFlux-v1.safetensors",
+                            "WAN\\Wan2_1_VAE_bf16.safetensors"],),
+        }},
+    },
+    "WanAnimatePlus LoraSelectMulti": {
+        "input": {"required": {
+            "lora_1": (["none",
+                        "wan\\lightx2v_I2V_14B_480p_cfg_step_distill_rank256_bf16.safetensors",
+                        "wan\\Wan2.1 - Fun-14B-InP-HPS2.1.safetensors"],),
+            "strength_1": ("FLOAT", {"default": 1.0}),
+            "lora_4": (["none",
+                        "wan\\Wan2.2 - I2V -Slop Bounce-Low-i2v-(弹跳lora不变脸).safetensors"],),
+            "strength_4": ("FLOAT", {"default": 1.0}),
+        }},
+    },
+}
+_orig_oi7 = SCAILAdapter._OI_CACHE
+SCAILAdapter._OI_CACHE = _fake_oi7
+try:
+    api = {
+        "1242": {"class_type": "WanAnimatePlus VAELoader",
+                 "inputs": {"model_name": "Wan2_1_VAE_bf16.safetensors"}},  # 缺子目录前缀
+        "1240": {"class_type": "WanAnimatePlus LoraSelectMulti",
+                 "inputs": {
+                     "lora_1": "Wan-Lighting\\lightx2v_I2V_14B_480p_cfg_step_distill_rank128_bf16.safetensors",
+                     "strength_1": 1.0,
+                     "lora_4": "zzz_totally_unknown_lora.safetensors",  # 无近似 → none
+                     "strength_4": 1.0}},
+    }
+    # ① sanitize 不得动文件名类 COMBO（哪怕值不在选项列表）
+    out = SCAILAdapter._sanitize_combo_inputs(api)
+    check("T7 sanitize不碰VAE文件名",
+          out["1242"]["inputs"]["model_name"] == "Wan2_1_VAE_bf16.safetensors",
+          str(out["1242"]["inputs"]["model_name"]))
+    check("T7 sanitize不碰LoRA文件名",
+          out["1240"]["inputs"]["lora_1"].endswith("rank128_bf16.safetensors"),
+          str(out["1240"]["inputs"]["lora_1"]))
+    # ② _fix_model_names 接管：VAE 模糊匹配、lora_1 模糊匹配、lora_4 回退 none
+    SCAILAdapter._fix_model_names(out)
+    check("T7 VAE模糊匹配补前缀",
+          out["1242"]["inputs"]["model_name"] == "WAN\\Wan2_1_VAE_bf16.safetensors",
+          str(out["1242"]["inputs"]["model_name"]))
+    check("T7 lora_1模糊匹配distill",
+          out["1240"]["inputs"]["lora_1"] ==
+          "wan\\lightx2v_I2V_14B_480p_cfg_step_distill_rank256_bf16.safetensors",
+          str(out["1240"]["inputs"]["lora_1"]))
+    check("T7 lora_4无近似回退none",
+          out["1240"]["inputs"]["lora_4"] == "none",
+          str(out["1240"]["inputs"]["lora_4"]))
+    check("T7 strength不受影响",
+          out["1240"]["inputs"]["strength_1"] == 1.0,
+          str(out["1240"]["inputs"]["strength_1"]))
+finally:
+    SCAILAdapter._OI_CACHE = _orig_oi7
+
+# --------------------------------- T8 主输出VHS选真成片（SQR 三测惨案根因）
+# （2026-08-20 SQR 三测：模板 3 个骨骼/姿态预览 VHS 均为 save_output=True 且前缀
+#  'AnimateDiff' 不含姿态关键词，真成片 VHS(吃Decode输出)却 save_output=False →
+#  旧「前缀+save_output」规则选中骨骼预览 → 内联只执行骨骼渲染链，采样器/Decode
+#  根本没跑，成品=纯骨骼视频。修复：优先选 images 数据流来自 Decode 的 VHS。）
+print("=" * 60)
+print("T8: 主输出VHS=吃Decode输出的成片节点(防选中骨骼预览)")
+_adapter8 = AnimatePlusSCAILAdapter(folder_paths.get_output_directory())
+
+
+def _mk_api8(vhs312_images_src):
+    """复刻肥猴模板 Set/Get 重连后的 API 拓扑（骨骼预览VHS + 真成片VHS + Decode链）"""
+    return {
+        "312": {"class_type": "VHS_VideoCombine",
+                "inputs": {"images": vhs312_images_src, "audio": ["63", 1],
+                           "frame_rate": ["500", 0],
+                           "filename_prefix": "%date:yyyy-MM-dd%/x_Wanimate",
+                           "save_output": False}},
+        "1067": {"class_type": "VHS_VideoCombine",
+                 "inputs": {"images": ["1087", 0], "frame_rate": ["500", 0],
+                            "filename_prefix": "AnimateDiff", "save_output": True}},
+        "1071": {"class_type": "VHS_VideoCombine",
+                 "inputs": {"images": ["1092", 0], "frame_rate": ["500", 0],
+                            "filename_prefix": "AnimateDiff", "save_output": True}},
+        "1087": {"class_type": "BodyRatioMapperSDPoseRender",
+                 "inputs": {"pose_keypoint": ["1082", 0]}},
+        "1082": {"class_type": "BodyRatioMapperProportionTransfer",
+                 "inputs": {"pose_keypoint": ["1092", 0]}},
+        "1092": {"class_type": "PoseAndFaceDetection",
+                 "inputs": {"video": ["63", 0]}},
+        "1262": {"class_type": "WanAnimatePlus Decode",
+                 "inputs": {"samples": ["1260", 0], "vae": ["1242", 0]}},
+        "1260": {"class_type": "WanAnimatePlus SamplerFromSettings",
+                 "inputs": {"embeds": ["1263", 0], "model": ["1238", 0]}},
+        "1263": {"class_type": "WanAnimatePlus AnimateEmbeds",
+                 "inputs": {"pose_images": ["1092", 0], "ref_images": ["651", 0]}},
+        "1238": {"class_type": "WanAnimatePlus ModelLoader", "inputs": {}},
+        "1242": {"class_type": "WanAnimatePlus VAELoader", "inputs": {}},
+        "63": {"class_type": "VHS_LoadVideo", "inputs": {}},
+        "651": {"class_type": "LoadImage", "inputs": {}},
+        "500": {"class_type": "VHS_VideoInfoLoaded", "inputs": {}},
+    }
+
+
+# ① 直连：真成片 VHS.images 直接接 Decode
+nm8 = _adapter8.discover_nodes(_mk_api8(["1262", 0]))
+check("T8 直连Decode→选真成片VHS(312)",
+      nm8.video_combine == "312", f"got={nm8.video_combine}")
+check("T8 旧规则会误选骨骼预览(回归对照)",
+      _adapter8._select_primary_vhs(
+          [("312", "%date:yyyy-MM-dd%/x_Wanimate", False),
+           ("1067", "AnimateDiff", True),
+           ("1071", "AnimateDiff", True)]) == "1067",
+      "prefix规则应选1067(证明T8必要性)")
+
+# ② 间接：真成片 VHS.images 经 ImageResize 中转接 Decode
+api8b = _mk_api8(["900", 0])
+api8b["900"] = {"class_type": "ImageResizeKJv2", "inputs": {"image": ["1262", 0]}}
+nm8b = _adapter8.discover_nodes(api8b)
+check("T8 间接(经Resize)上溯Decode→选真成片VHS",
+      nm8b.video_combine == "312", f"got={nm8b.video_combine}")
+
+# ③ 回退：无 Decode 数据流 → 维持旧前缀规则（1067）
+api8c = _mk_api8(["1087", 0])  # 真成片VHS也吃骨骼渲染（异常拓扑）
+api8c.pop("1262"); api8c.pop("1260")
+nm8c = _adapter8.discover_nodes(api8c)
+check("T8 无Decode数据流→回退旧规则(1067)",
+      nm8c.video_combine == "1067", f"got={nm8c.video_combine}")
+
+# ④ 真实模板全链路：prepare(手术+Set/Get重连) + discover → 必须选中 312
+try:
+    _tpl = json.load(open(os.path.join(PLUGIN_ROOT, "workflows",
+                                       "Tier2_WanAnimatePlus_Animate_template.json"),
+                          encoding="utf-8"))
+    _wf8 = _adapter8.prepare_workflow(_tpl)
+    _nm8 = _adapter8.discover_nodes(_wf8)
+    check("T8 真模板discover选312(真成片,吃Decode)",
+          _nm8.video_combine == "312", f"got={_nm8.video_combine}")
+    check("T8 真模板driving/ref不回退",
+          _nm8.driving_video == "63" and _nm8.ref_image == "651",
+          f"dv={_nm8.driving_video}, ref={_nm8.ref_image}")
+except Exception as e:
+    check("T8 真模板discover选312(真成片,吃Decode)", False,
+          f"环境异常: {e}")
 
 # ------------------------------------------------------------------ 汇总
 print("=" * 60)
