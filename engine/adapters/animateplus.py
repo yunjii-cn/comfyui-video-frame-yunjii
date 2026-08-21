@@ -349,12 +349,18 @@ class AnimatePlusSCAILAdapter(SCAILAdapter):
             n = seg.target_frames
             aligned = max(9, ((n - 1) // 4) * 4 + 1)
             ae["inputs"]["num_frames"] = aligned
+            # ⚠️ 关键：frame_window_size 必须 < num_frames，否则
+            #   looping = effective_frames > frame_window_size 为 False
+            #   → process() 在 nodes.py:1606 把 pose_images 置 None → 动作条件完全丢弃！
+            #   （这正是"无动作迁移"的真凶：之前把它设成 ==aligned 等于亲手关掉动作。）
+            #   滑动窗口取 aligned-4（仍满足 4k+1 对齐：81→77），强制 looping=True。
             if "frame_window_size" in ae["inputs"]:
-                ae["inputs"]["frame_window_size"] = aligned
+                ae["inputs"]["frame_window_size"] = max(5, aligned - 4)
             # 【2026-08-21 修复】模板被新版 WanAnimatePlus 节点重新保存后
-            # widgets_values 与 INPUT_TYPES 顺序漂移，导致 pose_end_percent 等
-            # FLOAT 字段被写成 False/'disabled' → 姿态条件在 0% 即结束 →
-            # 输出只剩参考图定格（"没有动作迁移"）。按 input 名强制复位，
+            # widgets_values 与 INPUT_TYPES 顺序漂移，导致 pose/ref 的
+            # start/end_percent 等 FLOAT 字段被写成 False/'disabled'/字符串、
+            # ref_strength 被写成 0 → 姿态条件在 0% 即结束或参考图强度归零
+            # → 输出只剩参考图定格（"没有动作迁移"）。按 input 名强制复位，
             # 不依赖 widgets_values 顺序，版本漂移免疫。
             self._fix_scail2_embeds_semantics(ae["inputs"])
             info("AnimatePlusAdapter", "Embeds: num_frames=%d(aligned %d), 段索引=%d",
@@ -467,6 +473,13 @@ class AnimatePlusSCAILAdapter(SCAILAdapter):
                 inputs[k] = v
                 warn("AnimatePlusAdapter",
                      "Embeds 语义复位: '%s'=%r → %r (模板版本漂移)", k, cur, v)
+        # ref_strength：参考图身份强度，模板被写成 0 → 身份/参考条件归零，
+        # 同样导致输出"不像参考图、无驱动"。复位为 1.0。
+        cur_ref = inputs.get("ref_strength")
+        if not isinstance(cur_ref, (int, float)) or isinstance(cur_ref, bool):
+            inputs["ref_strength"] = 1.0
+            warn("AnimatePlusAdapter",
+                 "Embeds 语义复位: 'ref_strength'=%r → 1.0 (模板版本漂移)", cur_ref)
         # replacement_mode：旧版为字符串下拉('main_ref_image'等)，
         # 新版为 BOOLEAN(False=动画模式)。非 bool 一律复位为 False(动画模式)。
         if not isinstance(inputs.get("replacement_mode"), bool):
