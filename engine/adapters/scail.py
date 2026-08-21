@@ -1173,7 +1173,9 @@ class SCAILAdapter(DirectAdapter):
                 if isinstance(v, list):
                     continue  # 连线，不动
                 decl = inputs_decl.get(k)
-                if not (isinstance(decl, list) and decl):
+                # 声明既可能来自 HTTP object_info（JSON→list），也可能来自
+                # 进程内 INPUT_TYPES 原生写法（tuple），统一兼容。
+                if not (isinstance(decl, (list, tuple)) and decl):
                     continue
                 typ = decl[0]
                 if typ in ("FLOAT", "INT") and isinstance(v, str):
@@ -1196,6 +1198,75 @@ class SCAILAdapter(DirectAdapter):
                              nid, ct, k, v, default)
         if fixed:
             info("SCAILAdapter", "sanitize: 修正 %d 个非法数值输入", fixed)
+        return api
+
+    @staticmethod
+    def _sanitize_combo_inputs(api):
+        """COMBO 值校验（对齐 ComfyUI 前端加载行为的版本漂移兜底）。
+
+        模板与本机节点包版本漂移时，widgets_values 按位映射会把值串到错误输入：
+        例：肥猴 Animate 模板的 BodyRatioMapperProportionTransfer 保存于旧版节点
+        （旧版 widget 布局多两个布尔），本机新版按位消费 → anchor_output_mode
+        收到 False → 节点校验层 ValueError 崩溃（2026-08-20 SQR 首次 GPU 实测）。
+        ComfyUI 前端加载这种模板会静默把非法 COMBO 值重置为默认（所以 UI 里能跑），
+        无头转换必须复刻该兜底，否则『UI 能跑、引擎跑崩』。
+
+        【只管纯枚举，绝不碰文件名类 COMBO】(2026-08-20 SQR 二测教训)：
+        模板引用的模型/LoRA/VAE 文件名与本机目录布局（子目录前缀、变体命名）
+        不一致是常态，这类字段由紧随其后的 _fix_model_names 模糊匹配负责修正。
+        若在此按『值不在选项列表』重置为节点默认值，会命中『恰好存在的错误
+        文件』——模糊匹配见值已合法便放行 → 全程跑错模型。实测惨案：VAE 被
+        重置为 FLUX VAE、文本编码器被重置为 Qwen-VL、LoRA 全置 none，
+        采样"成功"但输出纯骨骼视频。
+        规则：
+        - 纯枚举 COMBO（选项无文件扩展名）：值不在选项列表 → 重置为节点
+          默认值（无默认取首项）并告警；
+        - 文件名类 COMBO（选项带扩展名）：字符串值一律不动（模糊匹配域）；
+          非字符串值（bool/None 等错位）仍按默认值兜底。"""
+        import re
+        _file_re = re.compile(
+            r"\.(safetensors|gguf|sft|pt|pth|ckpt|bin|onnx|xml|json|mp4|webm|mov|"
+            r"avi|mkv|png|jpg|jpeg|webp|bmp|gif|wav|mp3|flac|txt|csv|vtt|srt)$", re.I)
+        oi = SCAILAdapter._object_info()
+        fixed = 0
+        for nid, nd in api.items():
+            ct = nd.get("class_type")
+            spec = oi.get(ct, {}).get("input", {}) if oi else {}
+            inputs_decl = {}
+            for cat in ("required", "optional"):
+                inputs_decl.update(spec.get(cat, {}))
+            if not inputs_decl:
+                continue
+            for k, v in list(nd.get("inputs", {}).items()):
+                if isinstance(v, list):
+                    continue  # 连线值，不动
+                decl = inputs_decl.get(k)
+                # object_info 中 COMBO 声明形如 [["opt1","opt2"], {...}]：
+                # 首元素为选项列表（类型输入首元素是 "FLOAT" 等字符串）。
+                # 声明可能来自 HTTP object_info（list）或进程内 INPUT_TYPES（tuple），
+                # 选项列表同理，统一兼容两种序列类型。
+                if not (isinstance(decl, (list, tuple)) and decl
+                        and isinstance(decl[0], (list, tuple)) and decl[0]):
+                    continue
+                opts = decl[0]
+                # 文件名类 COMBO：字符串值交给 _fix_model_names 模糊匹配，不在此重置
+                if isinstance(v, str) and any(
+                        isinstance(o, str) and _file_re.search(o) for o in opts):
+                    continue
+                if v in opts:
+                    continue
+                default = opts[0]
+                try:
+                    if isinstance(decl[1], dict) and decl[1].get("default") in opts:
+                        default = decl[1]["default"]
+                except Exception:
+                    pass
+                nd["inputs"][k] = default
+                fixed += 1
+                warn("SCAILAdapter", "sanitize: 节点%s(%s) COMBO '%s' 非法值 %r → 默认值 %r (节点包版本漂移)",
+                     nid, ct, k, v, default)
+        if fixed:
+            info("SCAILAdapter", "sanitize: 修正 %d 个非法 COMBO 值(模板与节点包版本漂移兜底)", fixed)
         return api
 
     @staticmethod
@@ -1272,14 +1343,22 @@ class SCAILAdapter(DirectAdapter):
 
     @staticmethod
     def _fix_model_names(api):
-        """通用：凡 model_name / lora / lora_name 当前值不在本机该节点可用文件列表里，
-        自动选最相近的可用文件（difflib 模糊匹配, sim>0.6）。
+        """通用：凡 model_name / lora / lora_N / lora_name 当前值不在本机该节点
+        可用文件列表里，自动选最相近的可用文件（difflib 模糊匹配, sim>0.6）。
         选项来源直接用 /object_info 里『该 class_type + 该字段』的 COMBO 列表，
         避免 folder_paths.get_filename_list 在独立进程/代理环境下返回不准或触发重导入。
-        仅处理模型/LoRA 加载器，绝不碰扩散模型加载器的 'model' 字段。"""
+        仅处理模型/LoRA 加载器，绝不碰扩散模型加载器的 'model' 字段。
+
+        LoRA 家族扩展(2026-08-20)：WanAnimatePlus LoraSelectMulti 的字段是
+        lora_0..lora_4（旧实现只扫 lora/lora_name → 模板里缺失的肥猴 LoRA
+        裸传给节点 → get_full_path_or_raise 崩溃）。现额外覆盖 lora_N；
+        且 LoRA 类字段模糊匹配失败时回退 'none'（该类节点均支持，= 不挂载），
+        避免缺文件直接炸执行。"""
         import difflib
+        import re
         oi = SCAILAdapter._object_info()
         FIXABLE = ("model_name", "lora", "lora_name")
+        _lora_n = re.compile(r"^lora_\d+$")
         for nid, nd in api.items():
             ct = nd.get("class_type", "")
             oinfo = oi.get(ct)
@@ -1288,11 +1367,13 @@ class SCAILAdapter(DirectAdapter):
             meta = {}
             for cat in ("required", "optional"):
                 meta.update(oinfo.get("input", {}).get(cat, {}))
-            for field in FIXABLE:
-                if field not in nd.get("inputs", {}):
+            for field in list(nd.get("inputs", {}).keys()):
+                is_lora_field = field in ("lora", "lora_name") or _lora_n.match(field)
+                if field not in FIXABLE and not is_lora_field:
                     continue
                 cfg = meta.get(field)
-                if not (isinstance(cfg, list) and cfg and isinstance(cfg[0], list)):
+                if not (isinstance(cfg, (list, tuple)) and cfg
+                        and isinstance(cfg[0], (list, tuple))):
                     continue
                 opts = cfg[0]  # 该字段在本机的全部可用文件名
                 cur = nd["inputs"][field]
@@ -1326,6 +1407,12 @@ class SCAILAdapter(DirectAdapter):
                     nd["inputs"][field] = best
                     info("SCAILAdapter", "模型名模糊匹配 %s.%s: %r -> %r (sim=%.2f)",
                          nid, field, cur, best, bestr)
+                elif is_lora_field and "none" in opts:
+                    # LoRA 缺文件且无可信近似 → 置 none（不挂载），防止
+                    # get_full_path_or_raise 直接炸掉整段执行
+                    nd["inputs"][field] = "none"
+                    warn("SCAILAdapter", "LoRA缺文件且无近似: %s.%s %r -> none",
+                         nid, field, cur)
 
     @staticmethod
     def _fix_pose_images(api, driving_video_node=None):
@@ -1474,6 +1561,7 @@ class SCAILAdapter(DirectAdapter):
                 and ("class_type" in workflow_raw[first] or "type" in workflow_raw[first]):
             api = self._prune_api_missing(dict(workflow_raw))
             self._sanitize_numeric_inputs(api)
+            self._sanitize_combo_inputs(api)
             self._fix_model_names(api)
             self._fix_pose_images(api)
             return api
@@ -1496,6 +1584,7 @@ class SCAILAdapter(DirectAdapter):
         mappings = self._node_class_mappings()
         api = self._convert_full_to_api(full, mappings)
         self._sanitize_numeric_inputs(api)
+        self._sanitize_combo_inputs(api)
         missing = {nd["class_type"] for nd in api.values()
                    if nd["class_type"] not in mappings}
         if missing:

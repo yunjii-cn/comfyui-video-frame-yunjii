@@ -161,7 +161,19 @@ class AnimatePlusSCAILAdapter(SCAILAdapter):
                 if nm.ref_image:
                     break
 
-        nm.video_combine = self._select_primary_vhs(vhs_candidates)
+        # 主输出 VHS：优先「images 数据流来自 Decode」的成片节点（数据流为准）。
+        # 肥猴 Animate 模板自带 3 个骨骼/姿态预览 VHS（前缀 'AnimateDiff'，不含
+        # pose/skeleton 关键词，save_output=True），而真成片 VHS（吃 Decode 输出
+        # +原片音轨）save_output=False —— 纯「前缀+save_output」规则会误选骨骼
+        # 预览 → 内联执行只跑骨骼渲染链、采样器/Decode 根本不执行，成品=纯骨骼
+        # 视频（2026-08-20 SQR 实测只出骨骼视频根因）。找不到 Decode 数据流才回退旧规则。
+        _dec_vhs = self._select_decode_fed_vhs(workflow, vhs_candidates, nm.decode)
+        _fallback_vhs = self._select_primary_vhs(vhs_candidates)
+        nm.video_combine = _dec_vhs or _fallback_vhs
+        if _dec_vhs and _dec_vhs != _fallback_vhs:
+            info("AnimatePlusAdapter",
+                 "主输出VHS=%s（images 数据流来自 Decode %s，覆盖前缀规则（旧规则会误选骨骼预览 %s））",
+                 _dec_vhs, nm.decode, _fallback_vhs)
         # 供 SCAILAdapter 潜空间落盘/解码复用：combine 取主成片 VHS，decode 取解码节点
         nm.combine = nm.video_combine
         if not nm.is_valid():
@@ -200,6 +212,54 @@ class AnimatePlusSCAILAdapter(SCAILAdapter):
                     stack.append(v[0])
         return ""
 
+    @staticmethod
+    def _select_decode_fed_vhs(workflow, vhs_candidates, decode_id):
+        """从 VHS 候选里挑「images 数据流源自 Decode 输出」的成片节点。
+
+        API 格式下 inputs.images = [src_node_id, slot]；Set/Get 重连后真成片
+        VHS 的 images 直接（或经少量中间节点）挂在 Decode 输出上。命中即返回
+        节点 id，否则返回 ""（交由调用方回退 _select_primary_vhs）。
+        """
+        if not decode_id or not vhs_candidates:
+            return ""
+        for nid, _prefix, _save in vhs_candidates:
+            nd = workflow.get(nid)
+            if not isinstance(nd, dict):
+                continue
+            imgs = nd.get("inputs", {}).get("images")
+            if isinstance(imgs, list) and imgs and str(imgs[0]) == str(decode_id):
+                return nid
+            # 间接连接：images 上溯几跳内出现 Decode（如中间隔 ImageResize 等）
+            if AnimatePlusSCAILAdapter._upstream_has(
+                    workflow, nid, "images", str(decode_id)):
+                return nid
+        return ""
+
+    @staticmethod
+    def _upstream_has(workflow, start_node, start_input, target_id, max_depth=6):
+        """从 start_node.start_input 沿输入链上溯，判断 target_id 是否在祖先里。"""
+        node = workflow.get(start_node)
+        if not isinstance(node, dict):
+            return False
+        link = node.get("inputs", {}).get(start_input)
+        if not (isinstance(link, list) and link):
+            return False
+        seen, stack = set(), [str(link[0])]
+        while stack and len(seen) < max_depth + 1:
+            nid = stack.pop()
+            if nid in seen:
+                continue
+            seen.add(nid)
+            if nid == target_id:
+                return True
+            nd = workflow.get(nid)
+            if not isinstance(nd, dict):
+                continue
+            for v in nd.get("inputs", {}).values():
+                if isinstance(v, list) and len(v) == 2 and isinstance(v[0], str):
+                    stack.append(v[0])
+        return False
+
     # ------------------------------------------------------------------
     # 预处理（复用 SCAILAdapter 静态手术）
     # ------------------------------------------------------------------
@@ -214,6 +274,7 @@ class AnimatePlusSCAILAdapter(SCAILAdapter):
             api = self._prune_api_missing(dict(workflow_raw))
             api = self._drop_sqr_nodes(api)
             self._sanitize_numeric_inputs(api)
+            self._sanitize_combo_inputs(api)
             self._fix_model_names(api)
             return api
         # UI 完整格式：手术 + 转换（与 SCAILAdapter 同套通用清理，但不跑
@@ -228,6 +289,7 @@ class AnimatePlusSCAILAdapter(SCAILAdapter):
         api = self._convert_full_to_api(full, self._node_class_mappings())
         api = self._drop_sqr_nodes(api)
         self._sanitize_numeric_inputs(api)
+        self._sanitize_combo_inputs(api)
         self._fix_model_names(api)
         info("AnimatePlusAdapter", "prepare_workflow: 整理后 %d 个节点", len(api))
         return api
@@ -475,9 +537,8 @@ class AnimatePlusSCAILAdapter(SCAILAdapter):
                     "custom_width": 0,
                     "custom_height": 0,
                     "frame_load_cap": n,
-                    "skip_first_frames": max(0, total - n),
+                    "skip_first_frames":  max(0, total - n),
                     "select_every_nth": 1,
-                    "format": "AnimateDiff",
                 },
             }
             aei["transition_video"] = [vhs_id, 0]

@@ -44,10 +44,11 @@ SCAIL_NODE_MARKER = "WanVideoAddSCAILReferenceEmbeds"
 #   · AnimateEmbeds（肥猴【分段队列】Wan2.2 Animate 高配版同款，transition_video
 #     硬冻结接段机制与本引擎 _inject_transition_video 同构，画质千万级验证）
 AP_NODE_MARKERS = ("WanAnimatePlus SCAIL_2 Embeds", "WanAnimatePlus AnimateEmbeds")
-# Tier 2 内置参考工作流（暖启动可不提供模板，自动用此文件）。
-# 优先 Animate 版（肥猴云集调优版复制而来，含 SegmentQueueRunner——适配器
-# prepare_workflow 会自动删除该调度节点，由本引擎分段循环接管）；
-# SCAIL_2 版仅兜底（本机实测画质崩坏，见 d77bd30 回滚记录）。
+# Tier 2 内置参考工作流（暖启动 / 多段队列 SQR 可不提供模板，自动用此文件）。
+# 【关键约束】本机仅有 SCAIL_2 基座（20 通道），Wan2.2-Animate-14B（36 通道）不在盘上，
+# 故 SQR / 暖启动 一律以 SCAIL2 模板为准（WanAnimatePlus SCAIL_2 Embeds 同为 20 通道、
+# 原生支持 transition_video / prefix_frames 续写）；Animate 模板仅作最后兜底。
+# 旧「SCAIL_2 版画质崩坏」已随 4 步蒸馏 LoRA 路线（_enforce_min_sampling_steps 强制 4 步）修复。
 AP_ANIMATE_WORKFLOW_DEFAULT = os.path.join(
     PLUGIN_ROOT, "workflows", "Tier2_WanAnimatePlus_Animate_template.json"
 )
@@ -283,16 +284,18 @@ class YunjiiSegmentRunner:
             # 未提供模板或提供的不是 SCAIL 工作流时，按策略选内置默认：
             # 暖启动(Tier2)/多段队列(SQR) 用 WanAnimatePlus 家族；否则标准 SCAIL 子流程。
             if not (is_ap_template or is_std_scail_template):
-                # 2026-08-20 升级：AP 家族默认模板优先 Animate 版（肥猴【分段队列】
-                # Wan2.2 Animate 高配版-云集调优同款基座，AnimateEmbeds 的
-                # transition_video 硬冻结接段与本引擎 _inject_transition_video 同构，
-                # 画质经肥猴用户群验证）；旧 SCAIL_2 版仅兜底（本机实测画质崩坏，
-                # 见 d77bd30 回滚记录）。多段拼接(A) 一律走标准官方 SCAIL 子流程——
-                # 不得作为其默认（双文件夹教训）。
+                # 【2026-08-21 修复】本机仅有 SCAIL_2 基座（20 通道 patch_embedding），
+                # Wan2.2-Animate-14B（36 通道）不在盘上。若选 Animate 模板（36 通道
+                # AnimateEmbeds），适配器 _pin_distill_lora_and_model 会强钉成 SCAIL_2 →
+                # 卷积输入通道 36≠20 确定性崩溃（对齐当日日志节点1260）。故 SQR/暖启动
+                # 一律以 SCAIL2 模板为准：WanAnimatePlus SCAIL_2 Embeds 同为 20 通道、与
+                # SCAIL_2 基座配对，且原生支持 transition_video / prefix_frames 续写，
+                # 冻结接段机制等价「肥猴」方案。Animate 模板仅作最后兜底（若 SCAIL2 缺失）。
+                # 多段拼接(A) 一律走标准官方 SCAIL 子流程——不得作为其默认（双文件夹教训）。
                 if _strategy in (CONTINUITY_WARM_START, CONTINUITY_SQR):
-                    _tier2_tpl = (AP_ANIMATE_WORKFLOW_DEFAULT
-                                  if os.path.isfile(AP_ANIMATE_WORKFLOW_DEFAULT)
-                                  else AP_WORKFLOW_DEFAULT)
+                    _tier2_tpl = (AP_WORKFLOW_DEFAULT
+                                  if os.path.isfile(AP_WORKFLOW_DEFAULT)
+                                  else AP_ANIMATE_WORKFLOW_DEFAULT)
                 else:
                     _tier2_tpl = ""
                 if _tier2_tpl and os.path.isfile(_tier2_tpl):
