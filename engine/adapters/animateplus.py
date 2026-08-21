@@ -351,6 +351,12 @@ class AnimatePlusSCAILAdapter(SCAILAdapter):
             ae["inputs"]["num_frames"] = aligned
             if "frame_window_size" in ae["inputs"]:
                 ae["inputs"]["frame_window_size"] = aligned
+            # 【2026-08-21 修复】模板被新版 WanAnimatePlus 节点重新保存后
+            # widgets_values 与 INPUT_TYPES 顺序漂移，导致 pose_end_percent 等
+            # FLOAT 字段被写成 False/'disabled' → 姿态条件在 0% 即结束 →
+            # 输出只剩参考图定格（"没有动作迁移"）。按 input 名强制复位，
+            # 不依赖 widgets_values 顺序，版本漂移免疫。
+            self._fix_scail2_embeds_semantics(ae["inputs"])
             info("AnimatePlusAdapter", "Embeds: num_frames=%d(aligned %d), 段索引=%d",
                  n, aligned, seg.index)
 
@@ -441,6 +447,34 @@ class AnimatePlusSCAILAdapter(SCAILAdapter):
     # ------------------------------------------------------------------
     # prefix 注入（best-effort，任何异常都吞掉，保证工作流仍可跑）
     # ------------------------------------------------------------------
+    # 关键语义字段按 input 名强制复位（版本漂移免疫）：
+    # 模板被新版节点重保存后 widgets_values 顺序漂移，pose_end_percent 等
+    # FLOAT 字段变 False/'disabled' → 姿态条件 0% 即停 → 无动作迁移。
+    @staticmethod
+    def _fix_scail2_embeds_semantics(inputs):
+        if not isinstance(inputs, dict):
+            return
+        pct = {
+            "pose_start_percent": 0.0,
+            "pose_end_percent": 1.0,    # 核心：修复"没有动作迁移"
+            "ref_start_percent": 0.0,
+            "ref_end_percent": 1.0,
+        }
+        for k, v in pct.items():
+            cur = inputs.get(k)
+            # 仅当值不是合法 float（被写成 False / 'disabled' / 字符串）时复位
+            if not isinstance(cur, (int, float)) or isinstance(cur, bool):
+                inputs[k] = v
+                warn("AnimatePlusAdapter",
+                     "Embeds 语义复位: '%s'=%r → %r (模板版本漂移)", k, cur, v)
+        # replacement_mode：旧版为字符串下拉('main_ref_image'等)，
+        # 新版为 BOOLEAN(False=动画模式)。非 bool 一律复位为 False(动画模式)。
+        if not isinstance(inputs.get("replacement_mode"), bool):
+            inputs["replacement_mode"] = False
+            warn("AnimatePlusAdapter",
+                 "Embeds 语义复位: 'replacement_mode'=%r → False(动画模式)",
+                 inputs.get("replacement_mode"))
+
     def _inject_prefix(self, wf, node_map, prev_video_path):
         try:
             if not node_map.animate_embeds or node_map.animate_embeds not in wf:
